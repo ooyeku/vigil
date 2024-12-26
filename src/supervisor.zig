@@ -15,7 +15,6 @@ pub const SupervisorOptions = struct {
     max_seconds: u32,
 };
 
-
 pub const Supervisor = struct {
     allocator: Allocator,
     children: std.ArrayList(Process.ChildProcess),
@@ -181,6 +180,6 @@ test "supervisor restart strategies" {
     try std.testing.expect(supervisor.children.items.len == 2);
 
     supervisor.stopChildren();
-    try std.testing.expect(!supervisor.children.items[0].is_alive);
-    try std.testing.expect(!supervisor.children.items[1].is_alive);
+    try std.testing.expect(!supervisor.children.items[0].isAlive());
+    try std.testing.expect(!supervisor.children.items[1].isAlive());
 }

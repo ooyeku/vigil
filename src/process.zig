@@ -3,6 +3,7 @@ const Thread = std.Thread;
 const Mutex = std.Thread.Mutex;
 const Allocator = std.mem.Allocator;
 
+// error enums for ChildProcess
 pub const ProcessError = error{
     AlreadyRunning,
     StartFailed,
