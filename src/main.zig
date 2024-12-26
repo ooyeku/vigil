@@ -2,40 +2,36 @@ const std = @import("std");
 const vigil = @import("vigil.zig");
 const Allocator = std.mem.Allocator;
 
-// Global state
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const logger = std.log.scoped(.main);
-
 pub fn main() !void {
-    const allocator = gpa.allocator();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
-        const check = gpa.deinit();
-        if (check == .leak) {
-            @panic("Memory leak detected!");
-        }
+        const status = gpa.deinit();
+        if (status == .leak) @panic("Memory leak detected!");
     }
+
+    const allocator = gpa.allocator();
 
     // Create supervisor with options
     const options = vigil.SupervisorOptions{
         .stategy = .one_for_all,
-        .max_restarts = 5,
-        .max_seconds = 60,
+        .max_restarts = 3,
+        .max_seconds = 5,
     };
 
     var supervisor = vigil.Supervisor.init(allocator, options);
     defer supervisor.deinit();
 
-    // Add worker processes
+    // Add a single worker process
     try supervisor.addChild(.{
-        .id = "log_collector",
-        .start_fn = logCollector,
+        .id = "worker",
+        .start_fn = workerProcess,
         .restart_type = .permanent,
         .shutdown_timeout_ms = 1000,
     });
 
     // Start supervision
     try supervisor.start();
-    logger.info("System started", .{});
+    std.debug.print("System started\n", .{});
 
     // Keep main thread alive
     while (true) {
@@ -43,9 +39,9 @@ pub fn main() !void {
     }
 }
 
-fn logCollector() void {
+fn workerProcess() void {
     while (true) {
-        logger.info("Collecting logs...", .{});
-        std.time.sleep(2 * std.time.ns_per_s);
+        std.time.sleep(1 * std.time.ns_per_s);
+        std.debug.print("Worker process running...\n", .{});
     }
 }

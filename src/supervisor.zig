@@ -62,7 +62,7 @@ pub const Supervisor = struct {
         defer self.mutex.unlock();
 
         for (self.children.items) |*child| {
-            child.stop();
+            child.stop() catch {};
         }
     }
 
