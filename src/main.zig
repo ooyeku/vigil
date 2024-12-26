@@ -34,8 +34,18 @@ pub fn main() !void {
     std.debug.print("System started\n", .{});
 
     // Keep main thread alive
-    while (true) {
+    var i: usize = 0;
+    while (i < 10) {
         std.time.sleep(1 * std.time.ns_per_s);
+        std.debug.print("Main thread running...\n", .{});
+        if (supervisor.children.items.len == 0) {
+            break;
+        }
+        std.debug.print("Waiting for children to stop...\n", .{});
+        std.time.sleep(1 * std.time.ns_per_s);
+
+        supervisor.stopChildren();
+        i += 1;
     }
 }
 
