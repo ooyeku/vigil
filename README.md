@@ -1,6 +1,18 @@
-# Vigil - (WIP)
+# Vigil - Process Supervision Library
 
 A process supervision and management library for Zig, inspired by Erlang/OTP's supervisor model.
+
+## Installation
+
+Add Vigil to your `build.zig.zon`:
+
+```zig
+const vigil = .{
+    .url = "https://github.com/ooyeku/vigil.git",
+    .branch = "main",
+    .hash = "e8ee9ac2b55ee2e3358269f8606d75a9ed703b88",
+};
+```
 
 ## Features
 
@@ -42,5 +54,5 @@ Inter-process communication system.
 
 ## License
 
-[Add your chosen license]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
