@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     });
 
     // Make the library available as a package
-    _ = b.addModule("vigil", .{
+    _ = b.addModule("vigil_lib", .{
         .root_source_file = b.path("src/vigil.zig"),
     });
 
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.root_module.addImport("vigil", b.modules.get("vigil").?);
+    exe.root_module.addImport("vigil", b.modules.get("vigil_lib").?);
     b.installArtifact(exe);
 
     // Create run step for the example
