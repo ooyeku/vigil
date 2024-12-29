@@ -2,7 +2,10 @@ const std = @import("std");
 const vigil = @import("vigil");
 const Allocator = std.mem.Allocator;
 const ProcessState = vigil.ProcessState;
-const ProcessSignal = vigil.ProcessSignal;
+const Message = vigil.Message;
+const ProcessMailbox = vigil.ProcessMailbox;
+const MessagePriority = vigil.MessagePriority;
+const Signal = vigil.Signal;
 
 /// Example worker errors that might occur during operation
 const WorkerError = error{
@@ -56,6 +59,25 @@ const WorkerState = struct {
 
 var worker_state = WorkerState{};
 
+// Add mailbox for inter-process communication
+var system_mailbox: ?ProcessMailbox = null;
+
+fn initSystemMailbox(allocator: Allocator) !void {
+    system_mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 100,
+        .max_message_size = 1024 * 1024, // 1MB
+        .default_ttl_ms = 5000, // 5 seconds
+        .priority_queues = true,
+        .enable_deadletter = true,
+    });
+}
+
+fn deinitSystemMailbox() void {
+    if (system_mailbox) |*mailbox| {
+        mailbox.deinit();
+    }
+}
+
 pub fn main() !void {
     // Setup allocator with leak detection for development
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -64,6 +86,10 @@ pub fn main() !void {
         if (status == .leak) @panic("Memory leak detected!");
     }
     const allocator = gpa.allocator();
+
+    // Initialize system mailbox
+    try initSystemMailbox(allocator);
+    defer deinitSystemMailbox();
 
     // Create supervisor with one_for_all strategy
     const options = vigil.SupervisorOptions{
@@ -298,62 +324,97 @@ pub fn main() !void {
 
 /// System monitoring worker with critical priority
 fn systemMonitorWorker() void {
-    std.debug.print("System monitor started with critical priority\n", .{});
-    var memory_usage: usize = 2 * 1024 * 1024; // Start with 2MB
-    var iteration: usize = 0;
-    var peak_load: bool = false;
+    if (system_mailbox) |*mailbox| {
+        while (worker_state.shouldRun()) {
+            // Send health check messages to all processes
+            if (Message.init(
+                std.heap.page_allocator,
+                "health_check",
+                "system_monitor",
+                null,
+                Signal.healthCheck,
+                .critical,
+                1000,
+            )) |msg| {
+                mailbox.send(msg) catch {};
+            } else |_| {}
 
-    while (worker_state.shouldRun()) {
-        iteration += 1;
-        // Simulate system monitoring with periodic spikes
-        if (iteration % 3 == 0) {
-            memory_usage += 1024 * 1024; // Regular increase
-        }
-        if (iteration % 10 == 0) {
-            memory_usage += 5 * 1024 * 1024; // Periodic spike
-            peak_load = true;
-        }
-        if (peak_load and iteration % 2 == 0) {
-            memory_usage = @max(2 * 1024 * 1024, memory_usage - 3 * 1024 * 1024); // Gradual decrease
-            if (memory_usage <= 2 * 1024 * 1024) {
-                peak_load = false;
+            // Monitor memory usage
+            if (worker_state.memory_usage > 100 * 1024 * 1024) {
+                if (Message.init(
+                    std.heap.page_allocator,
+                    "memory_warning",
+                    "system_monitor",
+                    "Memory usage exceeds 100MB",
+                    Signal.memoryWarning,
+                    .high,
+                    1000,
+                )) |msg| {
+                    mailbox.send(msg) catch {};
+                } else |_| {}
             }
+
+            // Process incoming messages
+            while (mailbox.receive()) |msg_const| {
+                var msg = msg_const;
+                defer msg.deinit();
+                if (msg.signal) |signal| {
+                    switch (signal) {
+                        .healthCheck => {
+                            if (msg.payload) |response| {
+                                // Process health check response
+                                if (std.mem.eql(u8, response, "unhealthy")) {
+                                    worker_state.setHealth(false);
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            } else |err| switch (err) {
+                error.EmptyMailbox => {},
+                else => {},
+            }
+
+            std.time.sleep(1 * std.time.ns_per_s);
         }
-        worker_state.allocateMemory(memory_usage);
-        std.time.sleep(500 * std.time.ns_per_ms);
     }
 }
 
 /// Business logic worker with high priority
 fn businessLogicWorker() void {
-    std.debug.print("Business logic worker started with high priority\n", .{});
-    var memory_usage: usize = 8 * 1024 * 1024; // Start with 8MB
-    var iteration: usize = 0;
-    var processing_batch: bool = false;
+    if (system_mailbox) |*mailbox| {
+        while (worker_state.shouldRun()) {
+            // Process messages
+            while (mailbox.receive()) |msg_const| {
+                var msg = msg_const;
+                defer msg.deinit();
+                if (msg.signal) |signal| {
+                    switch (signal) {
+                        .healthCheck => {
+                            // Respond to health check
+                            if (msg.createResponse(
+                                std.heap.page_allocator,
+                                if (worker_state.isHealthy()) "healthy" else "unhealthy",
+                                Signal.healthCheck,
+                            )) |response| {
+                                mailbox.send(response) catch {};
+                            } else |_| {}
+                        },
+                        .memoryWarning => {
+                            // Handle memory warning
+                            worker_state.freeMemory(50 * 1024 * 1024);
+                        },
+                        else => {},
+                    }
+                }
+            } else |err| switch (err) {
+                error.EmptyMailbox => {},
+                else => {},
+            }
 
-    while (worker_state.shouldRun()) {
-        iteration += 1;
-        // Simulate business processing with batch operations
-        if (iteration % 5 == 0) {
-            processing_batch = true;
-            memory_usage += 15 * 1024 * 1024; // Start batch processing
+            std.time.sleep(100 * std.time.ns_per_ms);
         }
-        if (processing_batch) {
-            if (iteration % 2 == 0) {
-                memory_usage += 2 * 1024 * 1024; // Gradual increase during batch
-            }
-            if (iteration % 8 == 0) {
-                memory_usage = 8 * 1024 * 1024; // Batch complete, reset
-                processing_batch = false;
-            }
-        } else {
-            memory_usage += 512 * 1024; // Normal operation growth
-            if (memory_usage > 12 * 1024 * 1024) {
-                memory_usage = 8 * 1024 * 1024; // Regular cleanup
-            }
-        }
-        worker_state.allocateMemory(memory_usage);
-        std.time.sleep(750 * std.time.ns_per_ms);
     }
 }
 
