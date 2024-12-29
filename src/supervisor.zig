@@ -154,7 +154,7 @@ pub const Supervisor = struct {
             }
         }
 
-        const child = Process.ChildProcess.init(spec);
+        const child = Process.ChildProcess.init(self.allocator, spec);
         try self.children.append(child);
     }
 
