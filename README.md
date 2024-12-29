@@ -1,58 +1,136 @@
-# Vigil - Process Supervision Library
+# Vigil
 
-A process supervision and management library for Zig, inspired by Erlang/OTP's supervisor model.
-
-## Installation
-
-Add Vigil to your `build.zig.zon`:
-
-```zig
-const vigil = .{
-    .url = "https://github.com/ooyeku/vigil.git",
-    .branch = "main",
-    .hash = "e8ee9ac2b55ee2e3358269f8606d75a9ed703b88",
-};
-```
+A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications.
 
 ## Features
 
-- Process lifecycle management with configurable restart strategies
-- Flexiple child specification system
-- Comprehensive error handling and recovery mechanisms
-- Built-in support for distributed supervision and clustering
-- Thread-safe operations with minimal overhead
+### Process Supervision
+- One-for-all restart strategy
+- Configurable restart limits and timeframes
+- Graceful shutdown handling
+- Process state monitoring and health checks
 
-## API Documentation
+### Message Passing System
+- Priority-based message queues (5 priority levels)
+- Message TTL (Time-To-Live) support
+- Dead letter queue for undeliverable messages
+- Thread-safe mailbox operations
+- Message correlation and request-response patterns
+- Distributed tracing support via trace IDs
 
-### Supervisor
+### Message Types and Signals
+- Structured message format with metadata
+- Built-in signal types for common operations
+- Support for custom signals and payloads
+- Message size limits and capacity controls
+- Message expiration handling
 
-The main supervision component that manages child processes.
+### Performance Monitoring
+- Detailed mailbox statistics
+- Memory usage tracking
+- Message throughput metrics
+- Peak usage monitoring
+- Size-based metrics
 
-#### Types
+## Use Cases
 
-- `SupervisorOptions`: Configuration for supervisor behavior
-- `RestartStrategy`: Defines how processes are restarted (.one_for_one, .one_for_all, .rest_for_one)
+### Microservices Architecture
+- Process-to-process communication
+- Service health monitoring
+- Load balancing via priority queues
+- Request routing and correlation
+- Distributed tracing
 
-### Process
+### Background Job Processing
+- Priority-based job scheduling
+- Batch processing coordination
+- Worker pool management
+- Job status monitoring
+- Failed job handling via dead letter queue
 
-Represents a supervised process/thread.
+### System Monitoring
+- Health check implementation
+- Resource usage monitoring
+- Alert propagation
+- Metric collection
+- Log aggregation
 
-#### Types
+### Fault-Tolerant Systems
+- Process recovery
+- Message delivery guarantees
+- Error propagation
+- Graceful degradation
+- System state management
 
-- `ChildSpec`: Specification for child processes
-- `ProcessState`: Current state of a process (.initial, .running, .stopping, .stopped, .failed)
+## Getting Started
 
-### Messages
+```zig
+const std = @import("std");
+const vigil = @import("vigil");
 
-Inter-process communication system.
+// Initialize a mailbox
+var mailbox = vigil.ProcessMailbox.init(allocator, .{
+    .capacity = 100,
+    .max_message_size = 1024 * 1024, // 1MB
+    .default_ttl_ms = 5000, // 5 seconds
+    .priority_queues = true,
+    .enable_deadletter = true,
+});
+defer mailbox.deinit();
 
-#### Types
+// Send a high-priority message
+const msg = try vigil.Message.init(
+    allocator,
+    "status_update",
+    "worker_1",
+    "CPU usage high",
+    .cpuWarning,
+    .high,
+    5000, // 5 second TTL
+);
+try mailbox.send(msg);
 
-- `ProcessMailbox`: Thread-safe message queue
-- `Message`: Communication unit between processes
-- `Signal`: Pre-defined process signals
+// Process messages with priority handling
+while (mailbox.receive()) |received| {
+    defer received.deinit();
+    if (received.signal) |signal| {
+        switch (signal) {
+            .cpuWarning => handleCpuWarning(received),
+            .healthCheck => sendHealthStatus(),
+            else => handleOtherSignal(received),
+        }
+    }
+} else |err| switch (err) {
+    error.EmptyMailbox => break,
+    else => return err,
+}
+```
+
+## Installation
+
+Add as a dependency in your `build.zig.zon`:
+
+```zig
+.{
+    .name = "your_project",
+    .version = "0.1.0",
+    .dependencies = .{
+        .vigil = .{
+            .url = "https://github.com/your-username/vigil/archive/refs/tags/v0.1.0.tar.gz",
+            // TODO: Add hash after publishing
+        },
+    },
+}
+```
+
+## Requirements
+- Zig 0.13.0 or later
+- POSIX-compliant operating system
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT - see the [LICENSE](LICENSE) file for details.
 
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
