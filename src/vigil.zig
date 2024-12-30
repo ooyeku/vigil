@@ -9,11 +9,11 @@ pub const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 pub const Message = @import("messages.zig").Message;
 pub const MessagePriority = @import("messages.zig").MessagePriority;
 pub const Signal = @import("messages.zig").Signal;
-pub const MessageMetadata = @import("messages.zig").MessageMetadata;   
-
+pub const MessageMetadata = @import("messages.zig").MessageMetadata;
 
 test "vigil" {
     _ = @import("process.zig");
     _ = @import("messages.zig");
     _ = @import("supervisor.zig");
+    _ = @import("sup_tree.zig");
 }
