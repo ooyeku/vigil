@@ -15,6 +15,7 @@ test "vigil" {
     _ = @import("process.zig");
     _ = @import("messages.zig");
     _ = @import("supervisor.zig");
+    _ = @import("sup_tree.zig");
 }
 
 test "initialize mailbox" {
