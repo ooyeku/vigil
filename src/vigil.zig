@@ -77,6 +77,8 @@ pub const WorkerGroupConfig = struct {
     max_memory_mb: usize = 100,
     /// Health check interval in milliseconds
     health_check_interval_ms: u32 = 1000,
+    /// Pre-allocated worker names
+    worker_names: []const []const u8,
 };
 
 /// Create a new supervisor with common defaults and error handling
@@ -107,20 +109,11 @@ pub fn addWorkerGroup(
     supervisor: *Supervisor,
     config: WorkerGroupConfig,
 ) !void {
-    const allocator = supervisor.allocator;
-
     // Create and add workers
     var i: usize = 0;
     while (i < config.size) : (i += 1) {
-        const worker_name = try std.fmt.allocPrint(
-            allocator,
-            "worker_{d}",
-            .{i},
-        );
-        defer allocator.free(worker_name);
-
         try supervisor.addChild(.{
-            .id = worker_name,
+            .id = config.worker_names[i],
             .start_fn = genericWorker,
             .restart_type = .permanent,
             .shutdown_timeout_ms = 5000,

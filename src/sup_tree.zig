@@ -329,12 +329,12 @@ pub const SupervisorTree = struct {
 
         // Shutdown child supervisors first
         for (self.children.items) |*child| {
-            const remaining_time = @max(0, actual_timeout - @divFloor(timer.read(), std.time.ns_per_ms));
+            const remaining_time = @as(i64, @intCast(@max(0, actual_timeout - @divFloor(timer.read(), std.time.ns_per_ms))));
             try child.supervisor.shutdown(remaining_time);
         }
 
         // Shutdown main supervisor
-        const remaining_time = @max(0, actual_timeout - @divFloor(timer.read(), std.time.ns_per_ms));
+        const remaining_time = @as(i64, @intCast(@max(0, actual_timeout - @divFloor(timer.read(), std.time.ns_per_ms))));
         try self.main.supervisor.shutdown(remaining_time);
 
         if (timer.read() > actual_timeout * std.time.ns_per_ms) {
@@ -382,7 +382,7 @@ pub const SupervisorTree = struct {
     /// in the configuration.
     ///
     /// Returns: void or error if monitoring setup fails
-    fn startMonitoring(self: *SupervisorTree) !void {
+    pub fn startMonitoring(self: *SupervisorTree) !void {
         // Update tree-wide statistics
         self.stats.total_processes = self.main.supervisor.children.items.len;
         for (self.children.items) |child| {
@@ -425,8 +425,9 @@ pub const SupervisorTree = struct {
         stats.total_restarts += main_stats.total_restarts;
 
         // Collect stats from child supervisors
-        for (self.children.items) |child| {
-            const child_stats = child.supervisor.getStats();
+        for (self.children.items) |*child| {
+            var sup = &child.supervisor;
+            const child_stats = sup.getStats();
             stats.active_processes += child_stats.active_children;
             stats.total_restarts += child_stats.total_restarts;
         }

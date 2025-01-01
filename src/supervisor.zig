@@ -135,7 +135,16 @@ pub const Supervisor = struct {
     /// Clean up supervisor resources.
     /// This will attempt to gracefully shut down all child processes.
     pub fn deinit(self: *Supervisor) void {
+        // First stop monitoring and wait for thread to finish
         if (self.state != .stopped) {
+            self.mutex.lock();
+            self.is_shutting_down = true;
+            self.mutex.unlock();
+
+            if (self.monitor_thread) |thread| {
+                thread.join(); // Wait for monitor thread to finish
+                self.monitor_thread = null;
+            }
             self.shutdown(5000) catch {};
         }
         self.children.deinit();
@@ -186,11 +195,11 @@ pub const Supervisor = struct {
     /// This gracefully stops the monitoring thread.
     pub fn stopMonitoring(self: *Supervisor) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
-
         self.is_shutting_down = true;
+        self.mutex.unlock();
+
         if (self.monitor_thread) |thread| {
-            thread.detach();
+            thread.join(); // Wait for thread to finish
             self.monitor_thread = null;
         }
     }
@@ -319,13 +328,22 @@ pub const Supervisor = struct {
 
     /// Monitor thread function that continuously checks child processes
     fn monitorChildren(self: *Supervisor) !void {
-        while (!self.is_shutting_down) {
+        while (true) {
+            // Check shutdown flag without holding the main lock
+            self.mutex.lock();
+            const should_shutdown = self.is_shutting_down;
+            self.mutex.unlock();
+
+            if (should_shutdown) break;
+
+            // Sleep at the start to prevent tight loop
+            std.time.sleep(100 * std.time.ns_per_ms);
+
+            // Now check children with proper locking
             self.mutex.lock();
 
             // Check all children while holding the lock
             for (self.children.items) |*child| {
-                if (self.is_shutting_down) break;
-
                 const child_state = child.getState();
                 if (child_state == .failed and child.spec.restart_type != .temporary) {
                     // Handle failure according to restart strategy
@@ -348,45 +366,26 @@ pub const Supervisor = struct {
                     // Apply restart strategy with state verification
                     switch (self.options.strategy) {
                         .one_for_one => {
+                            child.stop() catch {};
                             try child.start();
-                            // Verify process reaches running state
-                            var attempts: u32 = 0;
-                            while (attempts < 10) : (attempts += 1) {
-                                if (child.getState() == .running) break;
-                                std.time.sleep(50 * std.time.ns_per_ms);
-                            }
-                            if (child.getState() == .running) {
-                                self.stats.total_restarts += 1;
-                            }
+                            self.stats.total_restarts += 1;
                         },
                         .one_for_all => {
-                            for (self.children.items) |*c| {
-                                c.stop() catch {};
-                                try c.start();
-                                // Verify each process reaches running state
-                                var attempts: u32 = 0;
-                                while (attempts < 10) : (attempts += 1) {
-                                    if (c.getState() == .running) break;
-                                    std.time.sleep(50 * std.time.ns_per_ms);
-                                }
+                            for (self.children.items) |*sibling| {
+                                sibling.stop() catch {};
+                                try sibling.start();
                             }
                             self.stats.total_restarts += 1;
                         },
                         .rest_for_one => {
                             var found_failed = false;
-                            for (self.children.items) |*c| {
-                                if (c == child) {
+                            for (self.children.items) |*sibling| {
+                                if (sibling == child) {
                                     found_failed = true;
                                 }
                                 if (found_failed) {
-                                    c.stop() catch {};
-                                    try c.start();
-                                    // Verify each restarted process reaches running state
-                                    var attempts: u32 = 0;
-                                    while (attempts < 10) : (attempts += 1) {
-                                        if (c.getState() == .running) break;
-                                        std.time.sleep(50 * std.time.ns_per_ms);
-                                    }
+                                    sibling.stop() catch {};
+                                    try sibling.start();
                                 }
                             }
                             self.stats.total_restarts += 1;
@@ -396,7 +395,6 @@ pub const Supervisor = struct {
             }
 
             self.mutex.unlock();
-            std.time.sleep(100 * std.time.ns_per_ms);
         }
     }
 };

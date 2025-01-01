@@ -6,6 +6,29 @@ const Message = vigil.Message;
 const ProcessMailbox = vigil.ProcessMailbox;
 const MessagePriority = vigil.MessagePriority;
 const Signal = vigil.Signal;
+const SupervisorTree = vigil.SupervisorTree;
+const TreeConfig = vigil.TreeConfig;
+const WorkerGroupConfig = vigil.WorkerGroupConfig;
+const Supervisor = vigil.Supervisor;
+
+/// Configuration constants for the demo
+const Config = struct {
+    /// Number of iterations to run the demo
+    const DEMO_ITERATIONS = 100;
+    /// Sleep duration between iterations in milliseconds
+    const SLEEP_DURATION_MS = 1;
+
+    /// Number of background workers to create
+    const BACKGROUND_WORKERS = 3;
+    /// Number of business logic workers
+    const BUSINESS_WORKERS = 20;
+    /// Demo duration in seconds
+    const DEMO_DURATION_SECS = 10;
+    /// Status update interval in milliseconds
+    const STATUS_UPDATE_MS = 50000;
+    /// Worker sleep duration in milliseconds
+    const WORKER_SLEEP_MS = 10;
+};
 
 /// Example worker errors that might occur during operation
 const WorkerError = error{
@@ -19,19 +42,30 @@ const WorkerError = error{
 const WorkerState = struct {
     should_run: bool = true,
     memory_usage: usize = 0,
+    peak_memory_bytes: usize = 0,
     is_healthy: bool = true,
+    total_process_count: usize = 0,
+    active_processes: usize = 0,
+    total_restarts: usize = 0,
     mutex: std.Thread.Mutex = .{},
 
     fn shouldRun(self: *WorkerState) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.should_run;
+        return self.should_run and self.total_process_count < 1000;
+    }
+
+    fn incrementProcessCount(self: *WorkerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.total_process_count += 1;
     }
 
     fn allocateMemory(self: *WorkerState, bytes: usize) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.memory_usage = bytes;
+        self.memory_usage += bytes;
+        self.peak_memory_bytes = @max(self.peak_memory_bytes, self.memory_usage);
     }
 
     fn freeMemory(self: *WorkerState, bytes: usize) void {
@@ -54,6 +88,26 @@ const WorkerState = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.is_healthy = healthy;
+    }
+
+    fn incrementActiveProcesses(self: *WorkerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.active_processes += 1;
+    }
+
+    fn decrementActiveProcesses(self: *WorkerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.active_processes > 0) {
+            self.active_processes -= 1;
+        }
+    }
+
+    fn incrementRestarts(self: *WorkerState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.total_restarts += 1;
     }
 };
 
@@ -87,408 +141,256 @@ pub fn main() !void {
     }
     const allocator = gpa.allocator();
 
-    // Initialize system mailbox
-    try initSystemMailbox(allocator);
+    // Initialize system mailbox with enhanced configuration
+    system_mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 100,
+        .max_message_size = 1024 * 1024, // 1MB
+        .default_ttl_ms = 5000, // 5 seconds
+        .priority_queues = true,
+        .enable_deadletter = true, // Enable dead letter queue for undeliverable messages
+    });
     defer deinitSystemMailbox();
 
-    // Create supervisor with one_for_all strategy
-    const options = vigil.SupervisorOptions{
+    // Create root supervisor with one_for_all strategy
+    const root_options = vigil.SupervisorOptions{
         .strategy = .one_for_all,
         .max_restarts = 5,
         .max_seconds = 10,
     };
 
-    var supervisor = vigil.Supervisor.init(allocator, options);
-    defer supervisor.deinit();
+    // Initialize supervision tree with monitoring
+    var tree = try SupervisorTree.init(allocator, Supervisor.init(allocator, root_options), "root", .{
+        .max_depth = 3,
+        .enable_monitoring = false,
+        .shutdown_timeout_ms = 10_000,
+        .propagate_signals = true,
+    });
+    defer tree.deinit();
 
-    // Add workers with different priorities and monitoring configurations
+    // Create worker supervisor for background tasks
+    var worker_sup = Supervisor.init(allocator, .{
+        .strategy = .one_for_one,
+        .max_restarts = 3,
+        .max_seconds = 5,
+    });
+    defer worker_sup.deinit();
 
-    // Critical system worker with strict resource limits
-    try supervisor.addChild(.{
+    // Add worker supervisor to tree with name
+    try tree.addChild(worker_sup, "worker_sup");
+
+    // Add worker group for background processing
+    try vigil.addWorkerGroup(&worker_sup, .{
+        .size = Config.BACKGROUND_WORKERS,
+        .worker_names = &[_][]const u8{ "background1", "background2", "batch_processor" } ** Config.BACKGROUND_WORKERS,
+        .priority = .low,
+        .max_memory_mb = 100,
+        .health_check_interval_ms = 1000,
+        .mailbox_capacity = 100,
+        .enable_monitoring = false,
+    });
+
+    // Add critical system workers to root supervisor
+    try tree.main.supervisor.addChild(.{
         .id = "system_monitor",
         .start_fn = systemMonitorWorker,
         .restart_type = .permanent,
         .shutdown_timeout_ms = 1000,
         .priority = .critical,
-        .max_memory_bytes = 10 * 1024 * 1024, // 10MB limit
-        .health_check_fn = checkSystemHealth,
+        .max_memory_bytes = 10 * 1024 * 1024,
         .health_check_interval_ms = 500,
     });
 
-    // High-priority business logic worker
-    try supervisor.addChild(.{
-        .id = "business_logic",
-        .start_fn = businessLogicWorker,
-        .restart_type = .permanent,
-        .shutdown_timeout_ms = 2000,
-        .priority = .high,
-        .max_memory_bytes = 50 * 1024 * 1024, // 50MB limit
-        .health_check_fn = checkBusinessHealth,
-        .health_check_interval_ms = 1000,
-    });
+    // Add high-priority business logic workers
+    if (Config.BUSINESS_WORKERS > 0) {
+        try tree.main.supervisor.addChild(.{
+            .id = "business_logic",
+            .start_fn = businessLogicWorker,
+            .restart_type = .permanent,
+            .shutdown_timeout_ms = 2000,
+            .priority = .high,
+            .max_memory_bytes = 50 * 1024 * 1024,
+            .health_check_fn = checkBusinessHealth,
+            .health_check_interval_ms = 1000,
+        });
+    }
 
-    // Background task worker
-    try supervisor.addChild(.{
-        .id = "background_tasks",
-        .start_fn = backgroundWorker,
-        .restart_type = .transient,
-        .shutdown_timeout_ms = 5000,
-        .priority = .low,
-        .max_memory_bytes = 100 * 1024 * 1024, // 100MB limit
-        .health_check_fn = checkBackgroundHealth,
-        .health_check_interval_ms = 2000,
-    });
-
-    // Batch processing worker
-    try supervisor.addChild(.{
-        .id = "batch_processor",
-        .start_fn = batchProcessorWorker,
-        .restart_type = .temporary,
-        .shutdown_timeout_ms = 10000,
-        .priority = .batch,
-        .max_memory_bytes = 200 * 1024 * 1024, // 200MB limit
-    });
-
-    // Start supervision tree and monitoring
-    try supervisor.start();
-    try supervisor.startMonitoring();
+    // Start the entire supervision tree
+    try tree.start();
 
     // ANSI color codes
     const reset = "\x1b[0m";
     const bold = "\x1b[1m";
-    const dim = "\x1b[2m";
     const green = "\x1b[32m";
     const yellow = "\x1b[33m";
     const blue = "\x1b[34m";
-    const magenta = "\x1b[35m";
-    const cyan = "\x1b[36m";
-    const red = "\x1b[31m";
 
-    // Process ID counter for display purposes
-    var next_pid: u32 = 1000;
-    var process_ids = std.AutoHashMap(*vigil.Process, u32).init(allocator);
-    defer process_ids.deinit();
+    std.debug.print("\n{s}╔═══ Vigil Process Supervision Demo ═══╗{s}\n", .{ bold, reset });
+    std.debug.print("║ Running demo for {d} iterations...      ║\n", .{10});
+    std.debug.print("╚═══════════════════════════════════╝\n\n", .{});
 
-    // Assign PIDs to all processes
-    for (supervisor.children.items) |*child| {
-        try process_ids.put(child, next_pid);
-        next_pid += 1;
-    }
+    // Simple loop that runs for a fixed number of iterations
+    var iterations: usize = 0;
+    const max_iterations = Config.DEMO_ITERATIONS;
 
-    std.debug.print("\n{s}╔═══ Vigil Enhanced Process Supervision Demo ═══╗{s}\n", .{ bold, reset });
-    std.debug.print("║ Started supervisor with {s}{d}{s} workers           ║\n", .{ green, supervisor.children.items.len, reset });
-    std.debug.print("╚════════════════════════════════════════════════╝\n\n", .{});
-
-    std.debug.print("{s}Demonstrating:{s}\n", .{ bold, reset });
-    std.debug.print("• Process priorities and health monitoring\n", .{});
-    std.debug.print("• Resource limits and usage tracking\n", .{});
-    std.debug.print("• Signal handling and state transitions\n", .{});
-    std.debug.print("• Statistics and performance monitoring\n", .{});
-
-    // Monitor system and demonstrate features
-    var timer = try std.time.Timer.start();
-    const demo_duration_ns = 60 * std.time.ns_per_s;
-
-    while (timer.read() < demo_duration_ns) {
-        const stats = supervisor.getStats();
-        const uptime_s = @divFloor(timer.read(), std.time.ns_per_s);
-
-        std.debug.print("\n{s}╔══ System Status at {d}s ══╗{s}\n", .{ bold, uptime_s, reset });
-        std.debug.print("║ Active processes: {s}{d}/{d}{s}     ║\n", .{
+    while (iterations < max_iterations) : (iterations += 1) {
+        std.debug.print("{s}System Status (Iteration: {d}/{d}){s}\n", .{ bold, iterations + 1, max_iterations, reset });
+        std.debug.print("├─ Active processes: {s}{d}/{d}{s}\n", .{
             green,
-            stats.active_children,
-            supervisor.children.items.len,
+            worker_state.active_processes,
+            Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1,
             reset,
         });
-        std.debug.print("║ Total restarts: {s}{d}{s}          ║\n", .{
-            if (stats.total_restarts > 0) yellow else green,
-            stats.total_restarts,
+        std.debug.print("├─ Total restarts: {s}{d}{s}\n", .{
+            if (worker_state.total_restarts > 0) yellow else green,
+            worker_state.total_restarts,
             reset,
         });
-        std.debug.print("╚═════════════════════════╝\n", .{});
+        std.debug.print("└─ Memory usage: {s}{d} KB{s}\n\n", .{
+            if (worker_state.memory_usage > 100 * 1024 * 1024) yellow else green,
+            worker_state.memory_usage / 1024,
+            reset,
+        });
 
-        // Display detailed process information
-        std.debug.print("\n{s}Process Details:{s}\n", .{ bold, reset });
-        for (supervisor.children.items) |*child| {
-            const process_stats = child.getStats();
-            const pid = process_ids.get(child) orelse 0;
-            const state_color = switch (child.getState()) {
-                .running => green,
-                .suspended => yellow,
-                .failed => red,
-                else => dim,
-            };
-            const priority_color = switch (child.spec.priority) {
-                .critical => red,
-                .high => magenta,
-                .normal => blue,
-                .low => cyan,
-                .batch => dim,
-            };
-
-            std.debug.print("├─ {s}[PID {d}] {s:<16}{s}\n", .{ bold, pid, child.spec.id, reset });
-            std.debug.print("│  {s}Status:{s} {s}{s:<10}{s} {s}Priority:{s} {s}{s:<8}{s}\n", .{
-                dim,
-                reset,
-                state_color,
-                @tagName(child.getState()),
-                reset,
-                dim,
-                reset,
-                priority_color,
-                @tagName(child.spec.priority),
-                reset,
-            });
-            std.debug.print("│  {s}Health:{s} {s}{d} failed checks{s}  {s}Memory:{s} {s}{d:>6} KB{s}\n", .{
-                dim,
-                reset,
-                if (process_stats.health_check_failures > 0) yellow else green,
-                process_stats.health_check_failures,
-                reset,
-                dim,
-                reset,
-                if (process_stats.peak_memory_bytes > 100 * 1024 * 1024) yellow else green,
-                process_stats.peak_memory_bytes / 1024,
-                reset,
-            });
-            std.debug.print("│  {s}Uptime:{s} {s}{d:>6} ms{s}\n", .{
-                dim,
-                reset,
-                blue,
-                process_stats.total_runtime_ms,
-                reset,
-            });
-        }
-
-        // Demonstrate different scenarios based on uptime
-        switch (uptime_s) {
-            10 => {
-                if (supervisor.findChild("background_tasks")) |worker| {
-                    const pid = process_ids.get(worker) orelse 0;
-                    std.debug.print("\n{s}╔═══ Event: Memory Pressure ═══╗{s}\n", .{ yellow, reset });
-                    std.debug.print("║ Process: [PID {d}] background_tasks\n", .{pid});
-                    std.debug.print("║ Action: Increasing memory usage to 150MB\n", .{});
-                    std.debug.print("╚════════════════════════════════╝\n", .{});
-                    worker_state.allocateMemory(150 * 1024 * 1024);
-                    worker.stats.peak_memory_bytes = worker_state.memory_usage;
-                }
-            },
-            20 => {
-                if (supervisor.findChild("batch_processor")) |worker| {
-                    const pid = process_ids.get(worker) orelse 0;
-                    std.debug.print("\n{s}╔═══ Event: Process Suspension ═══╗{s}\n", .{ yellow, reset });
-                    std.debug.print("║ Process: [PID {d}] batch_processor\n", .{pid});
-                    std.debug.print("║ Action: Suspending process\n", .{});
-                    std.debug.print("╚═════════════════════════════════╝\n", .{});
-                    try worker.sendSignal(.@"suspend");
-                }
-            },
-            25 => {
-                if (supervisor.findChild("batch_processor")) |worker| {
-                    const pid = process_ids.get(worker) orelse 0;
-                    std.debug.print("\n{s}╔═══ Event: Process Resume ═══╗{s}\n", .{ green, reset });
-                    std.debug.print("║ Process: [PID {d}] batch_processor\n", .{pid});
-                    std.debug.print("║ Action: Resuming process\n", .{});
-                    std.debug.print("╚══════════════════════════════╝\n", .{});
-                    try worker.sendSignal(.@"resume");
-                }
-            },
-            30 => {
-                std.debug.print("\n{s}╔═══ Event: Health Check Failure ═══╗{s}\n", .{ yellow, reset });
-                std.debug.print("║ Action: Simulating system-wide health failure\n", .{});
-                std.debug.print("╚═══════════════════════════════════╝\n", .{});
-                worker_state.setHealth(false);
-            },
-            40 => {
-                std.debug.print("\n{s}╔═══ Event: Health Restored ═══╗{s}\n", .{ green, reset });
-                std.debug.print("║ Action: Restoring system health\n", .{});
-                std.debug.print("╚════════════════════════════╝\n", .{});
-                worker_state.setHealth(true);
-            },
-            else => {},
-        }
-
-        std.time.sleep(1 * std.time.ns_per_s);
+        std.time.sleep(Config.SLEEP_DURATION_MS * std.time.ns_per_ms); // Sleep between updates
     }
 
     // Demonstrate graceful shutdown
     std.debug.print("\n{s}╔═══ Initiating Graceful Shutdown ═══╗{s}\n", .{ blue, reset });
     std.debug.print("║ Stopping all processes...           ║\n", .{});
     std.debug.print("╚═══════════════════════════════════╝\n", .{});
+
     worker_state.should_run = false;
-    try supervisor.shutdown(5000);
+    tree.shutdown(1000) catch |err| {
+        std.debug.print("Warning: Shutdown error: {}\n", .{err});
+    };
+
     std.debug.print("\n{s}╔═══ Demo Completed Successfully ═══╗{s}\n", .{ green, reset });
     std.debug.print("║ All processes terminated cleanly    ║\n", .{});
     std.debug.print("╚═══════════════════════════════════╝\n", .{});
+
+    // Example of message broadcasting
+    const broadcast_msg = try Message.init(
+        allocator,
+        "broadcast_status",
+        "system_monitor",
+        "System status update",
+        .info,
+        .normal,
+        5000,
+    );
+
+    var recipients = std.ArrayList(*ProcessMailbox).init(allocator);
+    defer recipients.deinit();
+
+    // Collect mailboxes for broadcasting
+    if (system_mailbox) |*mailbox| {
+        try recipients.append(mailbox);
+    }
+
+    // Broadcast message to all recipients
+    try vigil.broadcast(recipients.items, broadcast_msg, allocator);
 }
 
 /// System monitoring worker with critical priority
 fn systemMonitorWorker() void {
-    if (system_mailbox) |*mailbox| {
-        while (worker_state.shouldRun()) {
-            // Send health check messages to all processes
-            if (Message.init(
-                std.heap.page_allocator,
-                "health_check",
-                "system_monitor",
-                null,
-                Signal.healthCheck,
-                .critical,
-                1000,
-            )) |msg| {
-                mailbox.send(msg) catch {};
-            } else |_| {}
+    std.debug.print("\nSystem monitor started\n", .{});
+    worker_state.incrementActiveProcesses();
+    var counter: usize = 0;
+    const min_processes = (Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1) / 2;
 
-            // Monitor memory usage
-            if (worker_state.memory_usage > 100 * 1024 * 1024) {
-                if (Message.init(
-                    std.heap.page_allocator,
-                    "memory_warning",
-                    "system_monitor",
-                    "Memory usage exceeds 100MB",
-                    Signal.memoryWarning,
-                    .high,
-                    1000,
-                )) |msg| {
-                    mailbox.send(msg) catch {};
-                } else |_| {}
+    while (worker_state.shouldRun()) {
+        counter += 1;
+        worker_state.incrementProcessCount();
+
+        // Simulate memory allocation
+        const memory_needed = counter * 1024 * 10; // Increase by 10KB each iteration
+        worker_state.allocateMemory(memory_needed);
+
+        // Simulate health check failures more frequently (every 3rd iteration)
+        if (counter % 3 == 0) {
+            worker_state.setHealth(false);
+            std.debug.print("System health check failed (count: {d})\n", .{counter});
+            if (counter % 9 == 0 and worker_state.active_processes > min_processes) { // Only restart if enough processes are running
+                worker_state.incrementRestarts();
+                break; // Force restart
             }
-
-            // Process incoming messages
-            while (mailbox.receive()) |msg_const| {
-                var msg = msg_const;
-                defer msg.deinit();
-                if (msg.signal) |signal| {
-                    switch (signal) {
-                        .healthCheck => {
-                            if (msg.payload) |response| {
-                                // Process health check response
-                                if (std.mem.eql(u8, response, "unhealthy")) {
-                                    worker_state.setHealth(false);
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                }
-            } else |err| switch (err) {
-                error.EmptyMailbox => {},
-                else => {},
-            }
-
-            std.time.sleep(1 * std.time.ns_per_s);
+        } else {
+            worker_state.setHealth(true);
+            std.debug.print("System health check passed (count: {d})\n", .{counter});
         }
+        std.time.sleep(Config.WORKER_SLEEP_MS * std.time.ns_per_ms);
     }
+    worker_state.decrementActiveProcesses();
+    std.debug.print("System monitor shutting down\n", .{});
 }
 
 /// Business logic worker with high priority
 fn businessLogicWorker() void {
-    if (system_mailbox) |*mailbox| {
-        while (worker_state.shouldRun()) {
-            // Process messages
-            while (mailbox.receive()) |msg_const| {
-                var msg = msg_const;
-                defer msg.deinit();
-                if (msg.signal) |signal| {
-                    switch (signal) {
-                        .healthCheck => {
-                            // Respond to health check
-                            if (msg.createResponse(
-                                std.heap.page_allocator,
-                                if (worker_state.isHealthy()) "healthy" else "unhealthy",
-                                Signal.healthCheck,
-                            )) |response| {
-                                mailbox.send(response) catch {};
-                            } else |_| {}
-                        },
-                        .memoryWarning => {
-                            // Handle memory warning
-                            worker_state.freeMemory(50 * 1024 * 1024);
-                        },
-                        else => {},
-                    }
-                }
-            } else |err| switch (err) {
-                error.EmptyMailbox => {},
-                else => {},
-            }
+    std.debug.print("\nBusiness logic worker started\n", .{});
+    worker_state.incrementActiveProcesses();
+    var counter: usize = 0;
+    const min_processes = (Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1) / 2;
 
-            std.time.sleep(100 * std.time.ns_per_ms);
+    while (worker_state.shouldRun()) {
+        counter += 1;
+        worker_state.incrementProcessCount();
+
+        // Simulate memory usage
+        const memory_needed = counter * 1024 * 20; // Increase by 20KB each iteration
+        worker_state.allocateMemory(memory_needed);
+
+        // Simulate more frequent failures (every 4th iteration)
+        if (counter % 4 == 0 and worker_state.active_processes > min_processes) { // Only restart if enough processes are running
+            std.debug.print("Business logic error occurred (count: {d})\n", .{counter});
+            worker_state.incrementRestarts();
+            break; // This will cause the process to restart
         }
+
+        std.debug.print("Processing business logic (count: {d})\n", .{counter});
+        std.time.sleep(Config.WORKER_SLEEP_MS * std.time.ns_per_ms);
     }
+    worker_state.decrementActiveProcesses();
+    std.debug.print("Business logic worker shutting down\n", .{});
 }
 
 /// Background task worker with low priority
 fn backgroundWorker() void {
-    std.debug.print("Background worker started with low priority\n", .{});
-    var memory_usage: usize = 15 * 1024 * 1024; // Start with 15MB
-    var iteration: usize = 0;
-    var gc_needed: bool = false;
+    std.debug.print("\nBackground worker started\n", .{});
+    worker_state.incrementActiveProcesses();
+    var counter: usize = 0;
+    const min_processes = (Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1) / 2;
 
     while (worker_state.shouldRun()) {
-        iteration += 1;
-        // Simulate background processing with GC cycles
-        if (!gc_needed) {
-            memory_usage += 4 * 1024 * 1024; // Regular growth
-            if (iteration % 3 == 0) {
-                memory_usage += 8 * 1024 * 1024; // Periodic larger allocation
-            }
-            if (memory_usage > 150 * 1024 * 1024) {
-                gc_needed = true;
-            }
-        } else {
-            // Simulate garbage collection
-            memory_usage = @max(15 * 1024 * 1024, memory_usage - 12 * 1024 * 1024);
-            if (memory_usage <= 15 * 1024 * 1024) {
-                gc_needed = false;
-            }
+        counter += 1;
+        worker_state.incrementProcessCount();
+
+        // Simulate memory usage
+        const memory_needed = counter * 1024 * 5; // Increase by 5KB each iteration
+        worker_state.allocateMemory(memory_needed);
+
+        // Simulate occasional failures (every 5th iteration)
+        if (counter % 5 == 0 and worker_state.active_processes > min_processes) { // Only restart if enough processes are running
+            std.debug.print("Background worker error occurred (count: {d})\n", .{counter});
+            worker_state.incrementRestarts();
+            break; // Force restart
         }
-        worker_state.allocateMemory(memory_usage);
-        std.time.sleep(1000 * std.time.ns_per_ms);
+
+        std.debug.print("Running background tasks (count: {d})\n", .{counter});
+        std.time.sleep(Config.WORKER_SLEEP_MS * std.time.ns_per_ms);
     }
+    worker_state.decrementActiveProcesses();
+    std.debug.print("Background worker shutting down\n", .{});
 }
 
-/// Batch processing worker with batch priority
-fn batchProcessorWorker() void {
-    std.debug.print("Batch processor started with batch priority\n", .{});
-    var memory_usage: usize = 25 * 1024 * 1024; // Start with 25MB
-    var iteration: usize = 0;
-
-    const fast_reduction: usize = 15 * 1024 * 1024;
-    const slow_reduction: usize = 8 * 1024 * 1024;
-
-    while (worker_state.shouldRun()) {
-        iteration += 1;
-        // Simulate batch processing with varying batch sizes
-        if (iteration % 6 == 0) {
-            const batch_size = 40 * 1024 * 1024 + (iteration % 4) * 10 * 1024 * 1024; // 40-70MB batches
-            memory_usage += batch_size;
-        }
-        if (memory_usage > 25 * 1024 * 1024) {
-            // Process batch with varying speeds
-            memory_usage = @max(25 * 1024 * 1024, memory_usage - if (iteration % 3 == 0) fast_reduction else slow_reduction);
-        } else {
-            memory_usage += 2 * 1024 * 1024; // Small growth between batches
-        }
-        worker_state.allocateMemory(memory_usage);
-        std.time.sleep(1500 * std.time.ns_per_ms);
-    }
-}
-
-/// Health check functions for different workers
+/// Health check functions
 fn checkSystemHealth() bool {
-    return worker_state.is_healthy;
+    return worker_state.isHealthy();
 }
 
 fn checkBusinessHealth() bool {
-    return worker_state.is_healthy and worker_state.memory_usage < 75 * 1024 * 1024;
+    return worker_state.isHealthy();
 }
 
 fn checkBackgroundHealth() bool {
-    // Simulate health check failures based on memory pressure
-    if (worker_state.memory_usage > 150 * 1024 * 1024) {
-        // Since we can't modify the process stats directly, we'll just return false
-        return false;
-    }
     return worker_state.isHealthy();
 }
