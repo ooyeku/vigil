@@ -62,6 +62,13 @@ A process supervision and inter-process communication library for Zig, designed 
 - Graceful degradation
 - System state management
 
+## Installation
+Fetch latest release:
+
+```bash
+zig fetch --save "git+https://github.com/ooyeku/vigil/archive/refs/tags/v0.1.0.tar.gz"
+```
+
 ## Getting Started
 
 ```zig
@@ -103,23 +110,6 @@ while (mailbox.receive()) |received| {
 } else |err| switch (err) {
     error.EmptyMailbox => break,
     else => return err,
-}
-```
-
-## Installation
-
-Add as a dependency in your `build.zig.zon`:
-
-```zig
-.{
-    .name = "your_project",
-    .version = "0.1.0",
-    .dependencies = .{
-        .vigil = .{
-            .url = "https://github.com/your-username/vigil/archive/refs/tags/v0.1.0.tar.gz",
-            // TODO: Add hash after publishing
-        },
-    },
 }
 ```
 
