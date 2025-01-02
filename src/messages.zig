@@ -4,7 +4,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Time = std.time.Time;
 
-/// Extended error set for message handling operations.
+/// Error set for message handling operations.
 /// These errors cover the full range of potential failures in message processing,
 /// from basic mailbox operations to delivery and validation issues.
 pub const MessageError = error{
@@ -58,7 +58,7 @@ pub const MessagePriority = enum {
     }
 };
 
-/// Extended signal types for process communication.
+/// Signal types for process communication.
 /// Signals represent specific actions or states that processes can communicate.
 /// Use these to trigger specific behaviors or responses in receiving processes.
 ///
@@ -117,7 +117,7 @@ pub const MessageMetadata = struct {
     size_bytes: usize, // Total message size in bytes
 };
 
-/// Enhanced message structure with metadata and delivery controls.
+/// Message structure with metadata and delivery controls.
 /// Messages are the primary means of communication between processes.
 /// They support priorities, signals, TTL, and response tracking.
 ///
@@ -289,7 +289,7 @@ pub const MailboxConfig = struct {
     enable_deadletter: bool = true, // Enable dead letter queue
 };
 
-/// Enhanced process mailbox with priority queues and monitoring.
+/// Process mailbox with priority queues and monitoring.
 /// Provides thread-safe message handling with optional priority queues
 /// and dead letter support for undeliverable messages.
 ///
