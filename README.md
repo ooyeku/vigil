@@ -69,6 +69,16 @@ Fetch latest release:
 zig fetch --save "git+https://github.com/ooyeku/vigil/#v0.1.0"
 ```
 
+Add as a dependency in your `build.zig.zon`:
+
+```zig
+    const vigil = b.dependency("vigil", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("vigil", vigil.module("vigil_lib"));
+    b.installArtifact(exe);
+```
 ## Getting Started
 
 ```zig
