@@ -35,11 +35,16 @@ const builtin = @import("builtin");
 
 // Core components
 pub const Process = @import("process.zig").ChildProcess;
+pub const ProcessStats = @import("process.zig").ProcessStats;
+pub const ProcessResult = @import("process.zig").ProcessResult;
 pub const ChildSpec = @import("process.zig").ChildSpec;
 pub const Supervisor = @import("supervisor.zig").Supervisor;
+pub const SupervisorStats = @import("supervisor.zig").SupervisorStats;
 pub const SupervisorTree = @import("sup_tree.zig").SupervisorTree;
+pub const TreeStats = @import("sup_tree.zig").TreeStats;
 pub const Message = @import("messages.zig").Message;
 pub const ProcessMailbox = @import("messages.zig").ProcessMailbox;
+pub const MessageMetadata = @import("messages.zig").MessageMetadata;
 
 // Configuration types
 pub const SupervisorOptions = @import("supervisor.zig").SupervisorOptions;
@@ -47,11 +52,19 @@ pub const TreeConfig = @import("sup_tree.zig").TreeConfig;
 pub const MailboxConfig = @import("messages.zig").MailboxConfig;
 
 // Enums and error sets
+pub const ProcessError = @import("process.zig").ProcessError;
 pub const ProcessState = @import("process.zig").ProcessState;
 pub const ProcessSignal = @import("process.zig").ProcessSignal;
 pub const ProcessPriority = @import("process.zig").ProcessPriority;
+pub const SupervisorError = @import("supervisor.zig").SupervisorError;
+pub const SupervisorState = @import("supervisor.zig").SupervisorState;
+pub const SupervisorTreeError = @import("sup_tree.zig").SupervisorTreeError;
+pub const RestartStrategy = @import("supervisor.zig").RestartStrategy;
 pub const MessagePriority = @import("messages.zig").MessagePriority;
 pub const Signal = @import("messages.zig").Signal;
+pub const MessageError = @import("messages.zig").MessageError;
+
+
 
 /// Helper to convert between priority types
 fn convertPriority(msg_priority: MessagePriority) ProcessPriority {

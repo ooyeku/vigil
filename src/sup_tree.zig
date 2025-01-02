@@ -133,7 +133,7 @@ const SupervisorNode = struct {
     id: SupervisorId,
 };
 
-/// Enhanced supervisor tree with hierarchical process management.
+/// Supervisor tree with hierarchical process management.
 /// Provides a robust framework for building and managing complex
 /// process supervision hierarchies with monitoring capabilities.
 ///
