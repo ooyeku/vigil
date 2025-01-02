@@ -35,6 +35,7 @@ const builtin = @import("builtin");
 
 // Core components
 pub const Process = @import("process.zig").ChildProcess;
+pub const ChildSpec = @import("process.zig").ChildSpec;
 pub const Supervisor = @import("supervisor.zig").Supervisor;
 pub const SupervisorTree = @import("sup_tree.zig").SupervisorTree;
 pub const Message = @import("messages.zig").Message;
