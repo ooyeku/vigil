@@ -19,30 +19,30 @@ const Config = struct {
     const SLEEP_DURATION_MS = 1;
 
     /// Number of background workers to create
-    const BACKGROUND_WORKERS = 3;
+    const BACKGROUND_WORKERS = 40;
     /// Number of business logic workers
-    const BUSINESS_WORKERS = 20;
+    const BUSINESS_WORKERS = 200;
     /// Demo duration in seconds
     const DEMO_DURATION_SECS = 10;
     /// Status update interval in milliseconds
-    const STATUS_UPDATE_MS = 50000;
+    const STATUS_UPDATE_MS = 50;
     /// Worker sleep duration in milliseconds
     const WORKER_SLEEP_MS = 10;
 
     /// Message passing configuration
     const MAX_MAILBOX_CAPACITY = 1000;
     const MESSAGE_TTL_MS = 5000;
-    const BROADCAST_INTERVAL_MS = 500;
+    const BROADCAST_INTERVAL_MS = 50;
 
     /// Health check thresholds
-    const MEMORY_WARNING_THRESHOLD_MB = 100;
-    const MEMORY_CRITICAL_THRESHOLD_MB = 200;
-    const HEALTH_CHECK_INTERVAL_MS = 1000;
+    const MEMORY_WARNING_THRESHOLD_MB = 10;
+    const MEMORY_CRITICAL_THRESHOLD_MB = 100;
+    const HEALTH_CHECK_INTERVAL_MS = 10;
 
     /// Dynamic scaling
-    const MIN_WORKERS = 2;
-    const MAX_WORKERS = 10;
-    const SCALE_CHECK_INTERVAL_MS = 5000;
+    const MIN_WORKERS = 20;
+    const MAX_WORKERS = 100;
+    const SCALE_CHECK_INTERVAL_MS = 50;
     const LOAD_THRESHOLD_HIGH = 0.8;
     const LOAD_THRESHOLD_LOW = 0.2;
 };
@@ -179,6 +179,22 @@ const SystemMetrics = struct {
 
 var system_metrics = SystemMetrics{};
 
+fn generateWorkerNames(allocator: Allocator, prefix: []const u8, count: usize) ![][]const u8 {
+    var names = try allocator.alloc([]const u8, count);
+    errdefer {
+        for (names) |name| {
+            allocator.free(name);
+        }
+        allocator.free(names);
+    }
+
+    for (0..count) |i| {
+        names[i] = try std.fmt.allocPrint(allocator, "{s}_{d}", .{ prefix, i + 1 });
+    }
+
+    return names;
+}
+
 pub fn main() !void {
     // Setup allocator with leak detection for development
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -225,10 +241,19 @@ pub fn main() !void {
     // Add worker supervisor to tree with name
     try tree.addChild(worker_sup, "worker_sup");
 
+    // Generate worker names dynamically
+    const worker_names = try generateWorkerNames(allocator, "background_worker", Config.BACKGROUND_WORKERS);
+    defer {
+        for (worker_names) |name| {
+            allocator.free(name);
+        }
+        allocator.free(worker_names);
+    }
+
     // Add worker group for background processing
     try vigil.addWorkerGroup(&worker_sup, .{
         .size = Config.BACKGROUND_WORKERS,
-        .worker_names = &[_][]const u8{ "background1", "background2", "batch_processor" } ** Config.BACKGROUND_WORKERS,
+        .worker_names = worker_names,
         .priority = .low,
         .max_memory_mb = 100,
         .health_check_interval_ms = 1000,
