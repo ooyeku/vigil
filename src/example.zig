@@ -1,7 +1,7 @@
 const std = @import("std");
 const vigil = @import("vigil");
 const Allocator = std.mem.Allocator;
-const ProcessState = vigil.ProcessState; 
+const ProcessState = vigil.ProcessState;
 const Message = vigil.Message;
 const ProcessMailbox = vigil.ProcessMailbox;
 const MessagePriority = vigil.MessagePriority;
@@ -28,6 +28,23 @@ const Config = struct {
     const STATUS_UPDATE_MS = 50000;
     /// Worker sleep duration in milliseconds
     const WORKER_SLEEP_MS = 10;
+
+    /// Message passing configuration
+    const MAX_MAILBOX_CAPACITY = 1000;
+    const MESSAGE_TTL_MS = 5000;
+    const BROADCAST_INTERVAL_MS = 500;
+
+    /// Health check thresholds
+    const MEMORY_WARNING_THRESHOLD_MB = 100;
+    const MEMORY_CRITICAL_THRESHOLD_MB = 200;
+    const HEALTH_CHECK_INTERVAL_MS = 1000;
+
+    /// Dynamic scaling
+    const MIN_WORKERS = 2;
+    const MAX_WORKERS = 10;
+    const SCALE_CHECK_INTERVAL_MS = 5000;
+    const LOAD_THRESHOLD_HIGH = 0.8;
+    const LOAD_THRESHOLD_LOW = 0.2;
 };
 
 /// Example worker errors that might occur during operation
@@ -132,6 +149,36 @@ fn deinitSystemMailbox() void {
     }
 }
 
+const SystemMetrics = struct {
+    cpu_usage: f32 = 0.0,
+    memory_usage_mb: usize = 0,
+    message_queue_length: usize = 0,
+    worker_load: f32 = 0.0,
+
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn update(self: *SystemMetrics, cpu: f32, mem: usize, queue: usize) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.cpu_usage = cpu;
+        self.memory_usage_mb = mem;
+        self.message_queue_length = queue;
+        self.worker_load = @as(f32, queue) / @as(f32, Config.MAX_MAILBOX_CAPACITY);
+    }
+
+    pub fn shouldScale(self: *SystemMetrics) enum { Up, Down, None } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.worker_load > Config.LOAD_THRESHOLD_HIGH) return .Up;
+        if (self.worker_load < Config.LOAD_THRESHOLD_LOW) return .Down;
+        return .None;
+    }
+};
+
+var system_metrics = SystemMetrics{};
+
 pub fn main() !void {
     // Setup allocator with leak detection for development
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -217,6 +264,73 @@ pub fn main() !void {
     // Start the entire supervision tree
     try tree.start();
 
+    // Initialize message passing demonstration
+    const messages = [_]struct { id: []const u8, payload: []const u8, priority: MessagePriority }{
+        .{ .id = "status_update", .payload = "System running normally", .priority = .normal },
+        .{ .id = "alert", .payload = "High CPU usage detected", .priority = .high },
+        .{ .id = "metrics", .payload = "Memory: 85%, CPU: 92%", .priority = .critical },
+        .{ .id = "log", .payload = "Background tasks completed", .priority = .low },
+    };
+
+    // Send messages with different priorities
+    for (messages) |msg| {
+        const message = try Message.init(
+            allocator,
+            msg.id,
+            "system_monitor",
+            msg.payload,
+            .info,
+            msg.priority,
+            Config.MESSAGE_TTL_MS,
+        );
+
+        if (system_mailbox) |*mailbox| {
+            if (mailbox.hasCapacity(msg.payload.len)) {
+                try mailbox.send(message);
+                std.debug.print("{s}Message sent: [{s}] {s}{s}\n", .{
+                    if (msg.priority == .critical) "\x1b[31m" else if (msg.priority == .high) "\x1b[33m" else "\x1b[32m",
+                    msg.id,
+                    msg.payload,
+                    "\x1b[0m",
+                });
+            }
+        }
+
+        // Small delay between messages
+        std.time.sleep(50 * std.time.ns_per_ms);
+    }
+
+    // Process received messages
+    if (system_mailbox) |*mailbox| {
+        while (mailbox.messages.items.len > 0) {
+            const msg = try mailbox.receive();
+            std.debug.print("Processing message: [{s}] {?s}\n", .{ msg.id, msg.payload });
+
+            // Simulate message handling
+            switch (msg.priority) {
+                .critical => {
+                    // Send immediate response
+                    const response = try vigil.createResponse(&msg, "Acknowledged critical situation", .alert, allocator);
+                    try mailbox.send(response);
+                    std.debug.print("Sent critical response\n", .{});
+                },
+                .high => std.debug.print("High priority message handled\n", .{}),
+                .normal => std.debug.print("Normal message processed\n", .{}),
+                .low => std.debug.print("Background message queued\n", .{}),
+                .batch => std.debug.print("Batch message queued for processing\n", .{}),
+            }
+        }
+    }
+
+    // View the message in the mailbox
+    if (system_mailbox) |*mailbox| {
+        if (mailbox.messages.items.len > 0) {
+            std.debug.print("Message in mailbox: {?s}\n", .{mailbox.messages.items[0].payload});
+        } else {
+            std.debug.print("No messages in mailbox\n", .{});
+        }
+    }
+
     // ANSI color codes
     const reset = "\x1b[0m";
     const bold = "\x1b[1m";
@@ -289,6 +403,16 @@ pub fn main() !void {
 
     // Broadcast message to all recipients
     try vigil.broadcast(recipients.items, broadcast_msg, allocator);
+
+    // View the message in the mailbox only if there are messages
+    if (system_mailbox) |*mailbox| {
+        if (mailbox.messages.items.len > 0) {
+            const payload = mailbox.messages.items[0].payload orelse "No payload";
+            std.debug.print("Message received: {s}\n", .{payload});
+        } else {
+            std.debug.print("No messages in mailbox\n", .{});
+        }
+    }
 }
 
 /// System monitoring worker with critical priority
@@ -393,4 +517,63 @@ fn checkBusinessHealth() bool {
 
 fn checkBackgroundHealth() bool {
     return worker_state.isHealthy();
+}
+
+fn metricsCollectorWorker(sup_tree: *SupervisorTree) void {
+    std.debug.print("\nMetrics collector started\n", .{});
+    worker_state.incrementActiveProcesses();
+
+    while (worker_state.shouldRun()) {
+        // Collect system metrics
+        const memory_mb = worker_state.memory_usage / (1024 * 1024);
+        const queue_length = if (system_mailbox) |mb| mb.getStats().message_count else 0;
+
+        // Update metrics
+        system_metrics.update(0.7, // Simulated CPU usage
+            memory_mb, queue_length);
+
+        // Check scaling needs
+        switch (system_metrics.shouldScale()) {
+            .Up => scaleWorkers(.up, sup_tree) catch {},
+            .Down => scaleWorkers(.down, sup_tree) catch {},
+            .None => {},
+        }
+
+        std.time.sleep(Config.SCALE_CHECK_INTERVAL_MS * std.time.ns_per_ms);
+    }
+
+    worker_state.decrementActiveProcesses();
+    std.debug.print("Metrics collector shutting down\n", .{});
+}
+
+fn scaleWorkers(direction: enum { up, down }, sup_tree: *SupervisorTree) !void {
+    const allocator = std.heap.page_allocator;
+
+    switch (direction) {
+        .up => {
+            if (worker_state.active_processes < Config.MAX_WORKERS) {
+                // Add a new business logic worker
+                try sup_tree.main.supervisor.addChild(.{
+                    .id = std.fmt.allocPrint(allocator, "business_worker_{d}", .{worker_state.active_processes + 1}) catch "worker",
+                    .start_fn = businessLogicWorker,
+                    .restart_type = .permanent,
+                    .shutdown_timeout_ms = 2000,
+                    .priority = .high,
+                    .max_memory_bytes = 50 * 1024 * 1024,
+                    .health_check_interval_ms = 1000,
+                });
+                try sup_tree.main.supervisor.start();
+            }
+        },
+        .down => {
+            if (worker_state.active_processes > Config.MIN_WORKERS) {
+                // Find and remove the last added worker
+                if (sup_tree.main.supervisor.findChild("business_worker_" ++
+                    std.fmt.allocPrint(allocator, "{d}", .{worker_state.active_processes}) catch "worker")) |worker|
+                {
+                    try sup_tree.main.supervisor.removeChild(worker.spec.id);
+                }
+            }
+        },
+    }
 }

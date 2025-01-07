@@ -3,36 +3,15 @@
 A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications.
 
 ## Features
-
-### Process Supervision
-- One-for-all restart strategy
-- Configurable restart limits and timeframes
-- Graceful shutdown handling
-- Process state monitoring and health checks
-
-### Message Passing System
-- Priority-based message queues (5 priority levels)
-- Message TTL (Time-To-Live) support
-- Dead letter queue for undeliverable messages
-- Thread-safe mailbox operations
+- Process supervision
+- Inter-process communication
+- Priority-based message passing
 - Message correlation and request-response patterns
-- Distributed tracing support via trace IDs
+- Distributed tracing support
+- System monitoring and metrics collection
+- Fault-tolerant system design
 
-### Message Types and Signals
-- Structured message format with metadata
-- Built-in signal types for common operations
-- Support for custom signals and payloads
-- Message size limits and capacity controls
-- Message expiration handling
-
-### Performance Monitoring
-- Detailed mailbox statistics
-- Memory usage tracking
-- Message throughput metrics
-- Peak usage monitoring
-- Size-based metrics
-
-## Use Cases
+## Potential Use Cases
 
 ### Microservices Architecture
 - Process-to-process communication
