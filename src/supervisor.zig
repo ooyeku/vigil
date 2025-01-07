@@ -20,7 +20,7 @@
 //! try supervisor.start();
 //! try supervisor.startMonitoring();
 //! ```
-
+const SupervisorMod = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Mutex = std.Thread.Mutex;

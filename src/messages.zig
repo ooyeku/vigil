@@ -1,3 +1,43 @@
+//! Message handling module for the Vigil supervision system.
+//! This module provides robust message handling capabilities inspired by Erlang/OTP,
+//! allowing for fine-grained control over message routing, priority, and error handling.
+//!
+//! Key features:
+//! - Priority-based message queuing
+//! - Message delivery and response tracking
+//! - Message validation and error handling
+//! - Built-in monitoring and statistics
+//!
+//! Example usage:
+//! ```zig
+//! const Message = @import("messages.zig").Message;
+//! const MessagePriority = @import("messages.zig").MessagePriority;
+//! const Signal = @import("messages.zig").Signal;
+//! const MessageMetadata = @import("messages.zig").MessageMetadata;
+//! const MessageError = @import("messages.zig").MessageError;
+//!
+//! // Create a new message
+//! var msg = try Message.init(allocator, "msg_001", "sender_proc", "Hello!", .info, .normal, 10000);
+//! defer msg.deinit();
+//!
+//! // Create a response
+//! if (msg.metadata.reply_to) |_| {
+//!     var response = try msg.createResponse(allocator, "Got it!", .info);
+//!     defer response.deinit();
+//! }
+//!
+//! // Set correlation ID for tracking
+//! try msg.setCorrelationId("correlation_id_001");
+//!
+//! // Set reply-to address for responses
+//! try msg.setReplyTo("receiver_proc");
+//!
+//! // Check if message is expired
+//! if (msg.isExpired()) {
+//!     // Handle expired message
+//! }
+//! ```
+const MessageMod = @This();
 const std = @import("std");
 const Mutex = std.Thread.Mutex;
 const testing = std.testing;

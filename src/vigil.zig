@@ -30,39 +30,46 @@
 /// // Start supervision
 /// try sup.start();
 /// ```
+const Vigil = @This();
 const std = @import("std");
 const builtin = @import("builtin");
 
 // Core components
-pub const Process = @import("process.zig").ChildProcess;
-pub const ProcessStats = @import("process.zig").ProcessStats;
-pub const ProcessResult = @import("process.zig").ProcessResult;
-pub const ChildSpec = @import("process.zig").ChildSpec;
-pub const Supervisor = @import("supervisor.zig").Supervisor;
-pub const SupervisorStats = @import("supervisor.zig").SupervisorStats;
-pub const SupervisorTree = @import("sup_tree.zig").SupervisorTree;
-pub const TreeStats = @import("sup_tree.zig").TreeStats;
-pub const Message = @import("messages.zig").Message;
-pub const ProcessMailbox = @import("messages.zig").ProcessMailbox;
-pub const MessageMetadata = @import("messages.zig").MessageMetadata;
+pub const ProcessMod = @import("process.zig");
+pub const MessageMod = @import("messages.zig");
+pub const SupervisorMod = @import("supervisor.zig");
+pub const SupervisorTreeMod = @import("sup_tree.zig");
+
+// Core components
+pub const ProcessStats = ProcessMod.ProcessStats;
+pub const ProcessResult = ProcessMod.ProcessResult;
+pub const ChildSpec = ProcessMod.ChildSpec;
+pub const SupervisorStats = SupervisorMod.SupervisorStats;
+pub const Supervisor = SupervisorMod.Supervisor;
+pub const SupervisorTree = SupervisorTreeMod.SupervisorTree;
+pub const TreeStats = SupervisorTreeMod.TreeStats;
+
+pub const Message = MessageMod.Message;
+pub const ProcessMailbox = MessageMod.ProcessMailbox;
+pub const MessageMetadata = MessageMod.MessageMetadata;
 
 // Configuration types
-pub const SupervisorOptions = @import("supervisor.zig").SupervisorOptions;
-pub const TreeConfig = @import("sup_tree.zig").TreeConfig;
-pub const MailboxConfig = @import("messages.zig").MailboxConfig;
+pub const SupervisorOptions = SupervisorMod.SupervisorOptions;
+pub const TreeConfig = SupervisorTreeMod.TreeConfig;
+pub const MailboxConfig = MessageMod.MailboxConfig;
 
 // Enums and error sets
-pub const ProcessError = @import("process.zig").ProcessError;
-pub const ProcessState = @import("process.zig").ProcessState;
-pub const ProcessSignal = @import("process.zig").ProcessSignal;
-pub const ProcessPriority = @import("process.zig").ProcessPriority;
-pub const SupervisorError = @import("supervisor.zig").SupervisorError;
-pub const SupervisorState = @import("supervisor.zig").SupervisorState;
-pub const SupervisorTreeError = @import("sup_tree.zig").SupervisorTreeError;
-pub const RestartStrategy = @import("supervisor.zig").RestartStrategy;
-pub const MessagePriority = @import("messages.zig").MessagePriority;
-pub const Signal = @import("messages.zig").Signal;
-pub const MessageError = @import("messages.zig").MessageError;
+pub const ProcessError = ProcessMod.ProcessError;
+pub const ProcessState = ProcessMod.ProcessState;
+pub const ProcessSignal = ProcessMod.ProcessSignal;
+pub const ProcessPriority = ProcessMod.ProcessPriority;
+pub const SupervisorError = SupervisorMod.SupervisorError;
+pub const SupervisorState = SupervisorMod.SupervisorState;
+pub const SupervisorTreeError = SupervisorTreeMod.SupervisorTreeError;
+pub const RestartStrategy = SupervisorMod.RestartStrategy;
+pub const MessagePriority = MessageMod.MessagePriority;
+pub const Signal = MessageMod.Signal;
+pub const MessageError = MessageMod.MessageError;
 
 
 
@@ -219,7 +226,7 @@ pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
         .major = 0,
         .minor = 1,
-        .patch = 0,
+        .patch = 2,
     };
 }
 

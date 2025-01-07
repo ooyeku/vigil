@@ -23,6 +23,7 @@
 /// try tree.addChild(Supervisor.init(allocator, .{ .strategy = .one_for_one }), "worker_sup");
 /// try tree.start();
 /// ```
+const SupervisorTreeMod = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vigil = @import("vigil.zig");
