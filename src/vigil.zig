@@ -1,35 +1,35 @@
-/// Vigil - Process Supervision and Communication Library
-///
-/// A robust framework for building reliable distributed systems with
-/// process supervision, message passing, and monitoring capabilities.
-///
-/// Main components:
-/// - Process supervision with restart strategies
-/// - Priority-based message passing
-/// - Hierarchical supervision trees
-/// - Built-in monitoring and statistics
-///
-/// Example:
-/// ```zig
-/// const vigil = @import("vigil");
-///
-/// // Create a supervised process group
-/// var sup = try vigil.createSupervisor(allocator, .{
-///     .strategy = .one_for_all,
-///     .max_restarts = 3,
-/// });
-/// defer sup.deinit();
-///
-/// // Add workers with message passing
-/// try vigil.addWorkerGroup(&sup, .{
-///     .size = 4,
-///     .mailbox_capacity = 100,
-///     .priority = .high,
-/// });
-///
-/// // Start supervision
-/// try sup.start();
-/// ```
+//! Vigil - Process Supervision and Communication Library
+//!
+//! A robust framework for building reliable distributed systems with
+//! process supervision, message passing, and monitoring capabilities.
+//!
+//! Main components:
+//! - Process supervision with restart strategies
+//! - Priority-based message passing
+//! - Hierarchical supervision trees
+//! - Built-in monitoring and statistics
+//!
+//! Example:
+//! ```zig
+//! const vigil = @import("vigil");
+//!
+//! // Create a supervised process group
+//! var sup = try vigil.createSupervisor(allocator, .{
+//!     .strategy = .one_for_all,
+//!     .max_restarts = 3,
+//! });
+//! defer sup.deinit();
+//!
+//! // Add workers with message passing
+//! try vigil.addWorkerGroup(&sup, .{
+//!     .size = 4,
+//!     .mailbox_capacity = 100,
+//!     .priority = .high,
+//! });
+//!
+//! // Start supervision
+//! try sup.start();
+//! ```
 const Vigil = @This();
 const std = @import("std");
 const builtin = @import("builtin");
@@ -85,7 +85,7 @@ fn convertPriority(msg_priority: MessagePriority) ProcessPriority {
 }
 
 /// Configuration for creating a worker group
-pub const WorkerGroupConfig = struct {
+pub const DefaultWorkerGroupConfig = struct {
     /// Number of worker processes to create
     size: usize,
     /// Mailbox capacity for each worker
@@ -128,7 +128,7 @@ pub fn createSupervisionTree(
 /// Add a group of worker processes to a supervisor with message passing capabilities
 pub fn addWorkerGroup(
     supervisor: *Supervisor,
-    config: WorkerGroupConfig,
+    config: DefaultWorkerGroupConfig,
 ) !void {
     // Create and add workers
     var i: usize = 0;
@@ -145,26 +145,26 @@ pub fn addWorkerGroup(
     }
 }
 
-/// Create a new process mailbox with common defaults
+pub const DefaultMailboxConfig = struct {
+    capacity: usize = 100,
+    priority: MessagePriority = .normal,
+    default_ttl_ms: u32 = 30_000,
+};
+
+/// This is a wrapper around the ProcessMailbox.init function
+/// that sets up a mailbox with common defaults.
 pub fn createMailbox(
     allocator: std.mem.Allocator,
-    capacity: usize,
-    priority: MessagePriority,
+    config: DefaultMailboxConfig,
 ) !*ProcessMailbox {
     const mailbox = try allocator.create(ProcessMailbox);
     errdefer allocator.destroy(mailbox);
 
     mailbox.* = ProcessMailbox.init(allocator, .{
-        .capacity = capacity,
+        .capacity = config.capacity,
         .priority_queues = true,
         .enable_deadletter = true,
-        .default_ttl_ms = switch (priority) {
-            .critical => 1000,
-            .high => 5000,
-            .normal => 30_000,
-            .low => 60_000,
-            .batch => 300_000,
-        },
+        .default_ttl_ms = config.default_ttl_ms,
     });
 
     return mailbox;

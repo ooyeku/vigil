@@ -66,6 +66,13 @@ pub const MessageError = error{
 /// Priority determines message processing order and resource allocation.
 /// Use this to ensure critical messages are handled before less important ones.
 ///
+/// Priority levels:
+/// - critical: Immediate handling required (e.g., shutdown signals, system failures)
+/// - high: Urgent but not critical (e.g., health alerts, resource warnings)
+/// - normal: Standard operations (e.g., status updates, routine tasks)
+/// - low: Background tasks (e.g., cleanup, optimization)
+/// - batch: Bulk operations (e.g., data processing, logging)
+///
 /// Example:
 /// ```zig
 /// const msg = try Message.init(
@@ -101,6 +108,28 @@ pub const MessagePriority = enum {
 /// Signal types for process communication.
 /// Signals represent specific actions or states that processes can communicate.
 /// Use these to trigger specific behaviors or responses in receiving processes.
+///
+/// Signals:
+/// - restart
+/// - shutdown
+/// - terminate
+/// - exit
+/// - suspend
+/// - resume
+/// - healthCheck
+/// - memoryWarning
+/// - cpuWarning
+/// - deadlockDetected
+/// - messageErr
+/// - info
+/// - warning
+/// - debug
+/// - log
+/// - alert
+/// - metric
+/// - event
+/// - heartbeat
+/// - custom
 ///
 /// Example:
 /// ```zig
@@ -172,8 +201,8 @@ pub const MessageMetadata = struct {
 ///
 /// Fields:
 /// - id: []const u8, // Unique message identifier
-/// - payload: ?[]const u8, // Optional message content
-/// - signal: ?Signal, // Optional signal type
+/// - payload: ?[]const u8, // Optional message content (optional)
+/// - signal: ?Signal, // Optional signal type (optional)
 /// - sender: []const u8, // Sender identifier
 /// - priority: MessagePriority, // Message priority level
 /// - metadata: MessageMetadata, // Message metadata
@@ -368,8 +397,8 @@ pub const MailboxConfig = struct {
 ///
 /// Fields:
 /// - messages: std.ArrayList(Message), // Main message queue
-/// - priority_queues: ?[5]std.ArrayList(Message), // Priority-based queues
-/// - deadletter_queue: ?std.ArrayList(Message), // Queue for undeliverable messages
+/// - priority_queues: ?[5]std.ArrayList(Message), // Priority-based queues (optional)
+/// - deadletter_queue: ?std.ArrayList(Message), // Queue for undeliverable messages (optional)
 /// - mutex: Mutex, // Thread synchronization
 /// - config: MailboxConfig, // Mailbox configuration
 /// - stats: MailboxStats, // Usage statistics

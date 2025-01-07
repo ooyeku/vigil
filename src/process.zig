@@ -61,6 +61,7 @@ pub const ProcessError = error{
 /// Represents the current state of a process in its lifecycle.
 /// State transitions should follow this pattern:
 /// initial -> running -> (suspended <-> running) -> stopping -> stopped
+/// 
 /// The failed state can be entered from any other state.
 pub const ProcessState = enum {
     /// Initial state before first start

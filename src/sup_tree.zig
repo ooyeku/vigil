@@ -1,28 +1,28 @@
-/// Supervisor Tree Module
-///
-/// This module provides hierarchical process supervision capabilities, allowing you to build
-/// and manage complex supervision trees. It supports priority-based process management,
-/// graceful shutdown handling, and comprehensive monitoring.
-///
-/// Example:
-/// ```zig
-/// const allocator = std.heap.page_allocator;
-///
-/// // Create root supervisor
-/// const root_options = SupervisorOptions{ .strategy = .one_for_all };
-/// const root_sup = Supervisor.init(allocator, root_options);
-///
-/// // Initialize supervision tree
-/// var tree = try SupervisorTree.init(allocator, root_sup, "root", .{
-///     .max_depth = 3,
-///     .enable_monitoring = true,
-/// });
-/// defer tree.deinit();
-///
-/// // Add child supervisors
-/// try tree.addChild(Supervisor.init(allocator, .{ .strategy = .one_for_one }), "worker_sup");
-/// try tree.start();
-/// ```
+//! Supervisor Tree Module
+//!
+//! This module provides hierarchical process supervision capabilities, allowing you to build
+//! and manage complex supervision trees. It supports priority-based process management,
+//! graceful shutdown handling, and comprehensive monitoring.
+//!
+//! Example:
+//! ```zig
+//!   const allocator = std.heap.page_allocator;
+//!
+//! Create root supervisor
+//! const root_options = SupervisorOptions{ .strategy = .one_for_all };
+//! const root_sup = Supervisor.init(allocator, root_options);
+//!
+//! Initialize supervision tree
+//! var tree = try SupervisorTree.init(allocator, root_sup, "root", .{
+//!     .max_depth = 3,
+//!     .enable_monitoring = true,
+//! });
+//! defer tree.deinit();
+//!
+//! // Add child supervisors
+//! try tree.addChild(Supervisor.init(allocator, .{ .strategy = .one_for_one }), "worker_sup");
+//! try tree.start();
+//! ```
 const SupervisorTreeMod = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
