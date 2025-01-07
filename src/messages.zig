@@ -107,6 +107,15 @@ pub const Signal = enum {
 
 /// Message metadata for tracking and debugging.
 /// Contains information about message lifecycle, routing, and monitoring.
+///
+/// Fields:
+/// - timestamp: i64, // Creation timestamp (Unix epoch)
+/// - ttl_ms: ?u32, // Time-to-live in milliseconds (null = no expiry)
+/// - correlation_id: ?[]const u8, // For tracking related messages
+/// - reply_to: ?[]const u8, // Destination for responses
+/// - attempt_count: u32, // Number of delivery attempts made
+/// - trace_id: ?[]const u8, // For distributed tracing
+/// - size_bytes: usize, // Total message size in bytes
 pub const MessageMetadata = struct {
     timestamp: i64, // Creation timestamp (Unix epoch)
     ttl_ms: ?u32, // Time-to-live in milliseconds (null = no expiry)
@@ -120,6 +129,23 @@ pub const MessageMetadata = struct {
 /// Message structure with metadata and delivery controls.
 /// Messages are the primary means of communication between processes.
 /// They support priorities, signals, TTL, and response tracking.
+///
+/// Fields:
+/// - id: []const u8, // Unique message identifier
+/// - payload: ?[]const u8, // Optional message content
+/// - signal: ?Signal, // Optional signal type
+/// - sender: []const u8, // Sender identifier
+/// - priority: MessagePriority, // Message priority level
+/// - metadata: MessageMetadata, // Message metadata
+/// - allocator: Allocator, // Memory allocator
+///
+/// Methods:
+/// - init: fn (allocator: Allocator, id: []const u8, sender: []const u8, payload: ?[]const u8, signal: ?Signal, priority: MessagePriority, ttl_ms: ?u32) !Message
+/// - deinit: fn (self: *Message) void
+/// - isExpired: fn (self: Message) bool
+/// - setCorrelationId: fn (self: *Message, correlation_id: []const u8) !void
+/// - setReplyTo: fn (self: *Message, reply_to: []const u8) !void
+/// - createResponse: fn (self: Message, allocator: Allocator, payload: ?[]const u8, signal: ?Signal) !Message
 ///
 /// Example:
 /// ```zig
@@ -281,6 +307,13 @@ pub const Message = struct {
 /// Configuration options for mailbox behavior.
 /// Use this to customize mailbox capacity, message size limits,
 /// TTL defaults, and optional features.
+///
+/// Fields:
+/// - capacity: usize, // Maximum number of messages
+/// - max_message_size: usize, // Maximum message size (1MB default)
+/// - default_ttl_ms: ?u32, // Default message TTL (1 minute)
+/// - priority_queues: bool, // Enable priority-based queuing
+/// - enable_deadletter: bool, // Enable dead letter queue
 pub const MailboxConfig = struct {
     capacity: usize, // Maximum number of messages
     max_message_size: usize = 1024 * 1024, // Maximum message size (1MB default)
@@ -292,6 +325,24 @@ pub const MailboxConfig = struct {
 /// Process mailbox with priority queues and monitoring.
 /// Provides thread-safe message handling with optional priority queues
 /// and dead letter support for undeliverable messages.
+///
+/// Fields:
+/// - messages: std.ArrayList(Message), // Main message queue
+/// - priority_queues: ?[5]std.ArrayList(Message), // Priority-based queues
+/// - deadletter_queue: ?std.ArrayList(Message), // Queue for undeliverable messages
+/// - mutex: Mutex, // Thread synchronization
+/// - config: MailboxConfig, // Mailbox configuration
+/// - stats: MailboxStats, // Usage statistics
+///
+/// Methods:
+/// - init: fn (allocator: Allocator, config: MailboxConfig) ProcessMailbox
+/// - deinit: fn (self: *ProcessMailbox) void
+/// - send: fn (self: *ProcessMailbox, msg: Message) MessageError!void
+/// - receive: fn (self: *ProcessMailbox) MessageError!Message
+/// - peek: fn (self: *ProcessMailbox) MessageError!Message
+/// - clear: fn (self: *ProcessMailbox) void
+/// - getStats: fn (self: *ProcessMailbox) MailboxStats
+/// - hasCapacity: fn (self: *ProcessMailbox, msg_size: usize) bool
 ///
 /// Example:
 /// ```zig

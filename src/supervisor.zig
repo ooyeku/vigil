@@ -44,6 +44,9 @@ pub const RestartStrategy = enum {
 
 /// Configuration options for supervisor behavior.
 /// These options determine how the supervisor manages its child processes.
+/// - strategy: RestartStrategy,
+/// - max_restarts: u32,
+/// - max_seconds: u32,
 pub const SupervisorOptions = struct {
     /// Strategy to use when restarting processes
     strategy: RestartStrategy,
@@ -55,6 +58,10 @@ pub const SupervisorOptions = struct {
 
 /// Statistics about supervisor operations.
 /// These stats can be used for monitoring and debugging.
+/// - total_restarts: u32,
+/// - uptime_ms: i64,
+/// - last_failure_time: i64,
+/// - active_children: u32,
 pub const SupervisorStats = struct {
     /// Total number of process restarts since supervisor start
     total_restarts: u32 = 0,
@@ -91,6 +98,29 @@ pub const SupervisorState = enum {
 };
 
 /// Main supervisor structure that manages child processes
+/// 
+/// fields:
+/// - allocator: Allocator,
+/// - children: std.ArrayList(Process.ChildProcess),
+/// - options: SupervisorOptions,
+/// - restart_count: u32,
+/// - last_restart_time: i64,
+/// - mutex: Mutex,
+/// - stats: SupervisorStats,
+/// - monitor_thread: ?std.Thread,
+/// - is_shutting_down: bool,
+/// - state: SupervisorState,
+/// 
+/// methods:
+/// - init: fn (allocator: Allocator, options: SupervisorOptions) Supervisor,
+/// - deinit: fn (self: *Supervisor) void,
+/// - addChild: fn (self: *Supervisor, spec: Process.ChildSpec) !void,
+/// - start: fn (self: *Supervisor) !void,
+/// - startMonitoring: fn (self: *Supervisor) !void,
+/// - stopMonitoring: fn (self: *Supervisor) void,
+/// - getStats: fn (self: *Supervisor) SupervisorStats,
+/// - shutdown: fn (self: *Supervisor, timeout_ms: i64) SupervisorError!void,
+/// - findChild: fn (self: *Supervisor, id: []const u8) ?*Process.ChildProcess,
 pub const Supervisor = struct {
     /// Memory allocator used by the supervisor
     allocator: Allocator,

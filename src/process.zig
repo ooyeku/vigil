@@ -93,6 +93,15 @@ pub const ProcessSignal = enum {
 /// Statistics collected about process execution.
 /// These statistics are useful for monitoring, debugging, and
 /// resource usage tracking.
+///
+/// Fields:
+/// - start_time: i64,
+/// - last_active_time: i64,
+/// - restart_count: u32,
+/// - total_runtime_ms: i64,
+/// - peak_memory_bytes: usize,
+/// - health_check_failures: u32,
+///
 pub const ProcessStats = struct {
     /// Timestamp when the process was started
     start_time: i64,
@@ -127,6 +136,16 @@ pub const ProcessPriority = enum {
 /// Configuration specification for a child process.
 /// This struct defines all parameters needed to create and manage
 /// a process throughout its lifecycle.
+///
+/// Fields:
+/// - id: []const u8,
+/// - start_fn: *const fn () void,
+/// - restart_type: enum { permanent, transient, temporary },
+/// - shutdown_timeout_ms: u32,
+/// - priority: ProcessPriority,
+/// - max_memory_bytes: ?usize,
+/// - health_check_fn: ?*const fn () bool,
+/// - health_check_interval_ms: u32,
 pub const ChildSpec = struct {
     /// Unique identifier for the process
     id: []const u8,
@@ -156,6 +175,11 @@ pub const ChildSpec = struct {
 /// Result information when a process terminates.
 /// Contains detailed information about how and why
 /// the process ended.
+///
+/// Fields:
+/// - exit_code: u32,
+/// - error_message: ?[]const u8,
+/// - runtime_ms: i64,
 pub const ProcessResult = struct {
     /// Process exit code (0 typically indicates success)
     exit_code: u32,
@@ -168,6 +192,28 @@ pub const ProcessResult = struct {
 /// Main process management structure.
 /// Provides comprehensive process lifecycle management, monitoring,
 /// and control capabilities.
+///
+/// Fields:
+/// - spec: ChildSpec,
+/// - thread: ?Thread,
+/// - mutex: Mutex,
+/// - state: ProcessState,
+/// - last_error: ?anyerror,
+/// - stats: ProcessStats,
+/// - result: ?ProcessResult,
+///
+/// Methods:
+/// - init: fn (allocator: Allocator, spec: ChildSpec) ChildProcess,
+/// - start: fn (self: *ChildProcess) ProcessError!void,
+/// - stop: fn (self: *ChildProcess) ProcessError!void,
+/// - isAlive: fn (self: *ChildProcess) bool,
+/// - getState: fn (self: *ChildProcess) ProcessState,
+/// - sendSignal: fn (self: *ChildProcess, signal: ProcessSignal) ProcessError!void,
+/// - checkHealth: fn (self: *ChildProcess) bool,
+/// - getStats: fn (self: *ChildProcess) ProcessStats,
+/// - getResult: fn (self: *ChildProcess) ?ProcessResult,
+/// - updateStats: fn (self: *ChildProcess) void,
+/// - checkResourceLimits: fn (self: *ChildProcess) ProcessError!void,
 pub const ChildProcess = struct {
     /// Process configuration
     spec: ChildSpec,

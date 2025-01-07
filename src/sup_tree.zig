@@ -52,6 +52,12 @@ pub const SupervisorTreeError = error{
 /// Use this to customize how the supervision tree operates and
 /// handles various scenarios.
 ///
+/// Fields:
+/// - max_depth: u8, // Maximum allowed depth of the supervision hierarchy
+/// - enable_monitoring: bool, // Whether to enable automatic monitoring of all supervisors
+/// - shutdown_timeout_ms: u32, // Default timeout for graceful shutdown operations in milliseconds
+/// - propagate_signals: bool, // Whether signals should propagate up and down the tree
+///
 /// Example:
 /// ```zig
 /// const config = TreeConfig{
@@ -82,6 +88,15 @@ pub const TreeConfig = struct {
 /// Statistics collected for monitoring the supervision tree.
 /// These metrics help track the health and performance of the
 /// supervision hierarchy.
+///
+/// Fields:
+/// - total_supervisors: usize, // Total number of supervisors in the tree
+/// - total_processes: usize, // Total number of processes across all supervisors
+/// - active_processes: usize, // Number of currently running processes
+/// - failed_processes: usize, // Number of processes in failed state
+/// - total_restarts: usize, // Total number of process restarts performed
+/// - max_depth_reached: u8, // Maximum depth reached in the tree
+/// - total_memory_bytes: usize, // Total memory usage of all processes
 pub const TreeStats = struct {
     /// Total number of supervisors in the tree
     total_supervisors: usize = 0,
@@ -102,6 +117,14 @@ pub const TreeStats = struct {
 /// Internal: Supervisor identifier for tracking in the tree.
 /// Manages the lifecycle of supervisor names and ensures proper
 /// memory management.
+///
+/// Fields:
+/// - name: []const u8, // Unique name of the supervisor
+/// - allocator: Allocator, // Memory allocator
+///
+/// Methods:
+/// - init: fn (allocator: Allocator, name: []const u8) !SupervisorId
+/// - deinit: fn (self: *SupervisorId) void
 const SupervisorId = struct {
     /// Unique name of the supervisor
     name: []const u8,
@@ -126,6 +149,10 @@ const SupervisorId = struct {
 
 /// Internal: Node in the supervisor tree containing a supervisor and its identifier.
 /// Represents a single node in the supervision hierarchy.
+///
+/// Fields:
+/// - supervisor: Supervisor, // The supervisor instance
+/// - id: SupervisorId, // Identifier for the supervisor
 const SupervisorNode = struct {
     /// The supervisor instance
     supervisor: Supervisor,
@@ -143,6 +170,25 @@ const SupervisorNode = struct {
 /// - Built-in monitoring and statistics
 /// - Graceful shutdown handling
 /// - Signal propagation
+///
+/// Fields:
+/// - allocator: Allocator, // Memory allocator
+/// - main: SupervisorNode, // Root supervisor node
+/// - children: std.ArrayList(SupervisorNode), // List of child supervisor nodes
+/// - config: TreeConfig, // Tree configuration options
+/// - stats: TreeStats, // Runtime statistics
+/// - mutex: std.Thread.Mutex, // Thread synchronization
+///
+/// Methods:
+/// - init: fn (allocator: Allocator, main_supervisor: Supervisor, main_name: []const u8, config: TreeConfig) !SupervisorTree
+/// - deinit: fn (self: *SupervisorTree) void
+/// - addChild: fn (self: *SupervisorTree, supervisor: Supervisor, name: []const u8) !void
+/// - start: fn (self: *SupervisorTree) !void
+/// - shutdown: fn (self: *SupervisorTree, timeout_ms: ?u32) !void
+/// - findSupervisor: fn (self: *SupervisorTree, name: []const u8) ?*Supervisor
+/// - startMonitoring: fn (self: *SupervisorTree) !void
+/// - getStats: fn (self: *SupervisorTree) TreeStats
+/// - propagateSignal: fn (self: *SupervisorTree, signal: vigil.ProcessSignal) !void
 ///
 /// Example usage:
 /// ```zig
