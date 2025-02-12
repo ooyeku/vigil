@@ -86,6 +86,8 @@ pub fn GenServer(comptime StateType: type) type {
             defer self.allocator.free(mailbox_id);
 
             var msg_copy = try msg.dupe();
+            errdefer msg_copy.deinit();
+
             try msg_copy.setCorrelationId(correlation_id);
             try msg_copy.setReplyTo(mailbox_id);
 
