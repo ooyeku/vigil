@@ -1,5 +1,14 @@
 const std = @import("std");
 const vigil = @import("vigil");
+const worker = @import("worker.zig");
+const config = @import("config.zig");
+
+// Update imports
+const WorkerState = worker.WorkerState;
+const WorkerError = worker.WorkerError;
+const HealthChecks = worker.HealthChecks;
+
+// Remove the old WorkerState and WorkerError definitions
 const Allocator = std.mem.Allocator;
 const ProcessState = vigil.ProcessState;
 const Message = vigil.Message;
@@ -10,99 +19,31 @@ const SupervisorTree = vigil.SupervisorTree;
 const TreeConfig = vigil.TreeConfig;
 const WorkerGroupConfig = vigil.WorkerGroupConfig;
 const Supervisor = vigil.Supervisor;
-const config = @import("config.zig");
 
 /// Configuration constants for the demo
 const Config = config.Config;
-
-/// Example worker errors that might occur during operation
-const WorkerError = error{
-    TaskFailed,
-    ResourceUnavailable,
-    HealthCheckFailed,
-    MemoryLimitExceeded,
-};
-
-/// Shared state for worker processes
-const WorkerState = struct {
-    should_run: bool = true,
-    memory_usage: usize = 0,
-    peak_memory_bytes: usize = 0,
-    is_healthy: bool = true,
-    total_process_count: usize = 0,
-    active_processes: usize = 0,
-    total_restarts: usize = 0,
-    mutex: std.Thread.Mutex = .{},
-
-    fn shouldRun(self: *WorkerState) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.should_run and self.total_process_count < 1000;
-    }
-
-    fn incrementProcessCount(self: *WorkerState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.total_process_count += 1;
-    }
-
-    fn allocateMemory(self: *WorkerState, bytes: usize) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.memory_usage += bytes;
-        self.peak_memory_bytes = @max(self.peak_memory_bytes, self.memory_usage);
-    }
-
-    fn freeMemory(self: *WorkerState, bytes: usize) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (bytes <= self.memory_usage) {
-            self.memory_usage -= bytes;
-        } else {
-            self.memory_usage = 0;
-        }
-    }
-
-    fn isHealthy(self: *WorkerState) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.is_healthy;
-    }
-
-    fn setHealth(self: *WorkerState, healthy: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.is_healthy = healthy;
-    }
-
-    fn incrementActiveProcesses(self: *WorkerState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.active_processes += 1;
-    }
-
-    fn decrementActiveProcesses(self: *WorkerState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.active_processes > 0) {
-            self.active_processes -= 1;
-        }
-    }
-
-    fn incrementRestarts(self: *WorkerState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.total_restarts += 1;
-    }
-};
-
-var worker_state = WorkerState{};
 
 // Add mailbox for inter-process communication
 var system_mailbox: ?ProcessMailbox = null;
 
 // Create a global config instance:
 var system_config = Config.init();
+
+// Update the worker state initialization
+var worker_state = WorkerState.init();
+
+// Update health check function implementations
+fn checkSystemHealth() bool {
+    return HealthChecks.checkSystemHealth(&worker_state);
+}
+
+fn checkBusinessHealth() bool {
+    return HealthChecks.checkBusinessHealth(&worker_state);
+}
+
+fn checkBackgroundHealth() bool {
+    return HealthChecks.checkBackgroundHealth(&worker_state);
+}
 
 fn initSystemMailbox(allocator: Allocator) !void {
     system_mailbox = ProcessMailbox.init(allocator, .{
@@ -502,19 +443,6 @@ fn backgroundWorker() void {
     std.debug.print("Background worker shutting down\n", .{});
 }
 
-/// Health check functions
-fn checkSystemHealth() bool {
-    return worker_state.isHealthy();
-}
-
-fn checkBusinessHealth() bool {
-    return worker_state.isHealthy();
-}
-
-fn checkBackgroundHealth() bool {
-    return worker_state.isHealthy();
-}
-
 fn metricsCollectorWorker(sup_tree: *SupervisorTree) void {
     std.debug.print("\nMetrics collector started\n", .{});
     worker_state.incrementActiveProcesses();
@@ -565,9 +493,9 @@ fn scaleWorkers(direction: enum { up, down }, sup_tree: *SupervisorTree) !void {
             if (worker_state.active_processes > system_config.workers.min_count) {
                 // Find and remove the last added worker
                 if (sup_tree.main.supervisor.findChild("business_worker_" ++
-                    std.fmt.allocPrint(allocator, "{d}", .{worker_state.active_processes}) catch "worker")) |worker|
+                    std.fmt.allocPrint(allocator, "{d}", .{worker_state.active_processes}) catch "worker")) |child|
                 {
-                    try sup_tree.main.supervisor.removeChild(worker.spec.id);
+                    try sup_tree.main.supervisor.removeChild(child.spec.id);
                 }
             }
         },
