@@ -100,8 +100,11 @@ pub fn GenServer(comptime StateType: type) type {
         /// Stop the GenServer
         pub fn stop(self: *Self) void {
             self.terminate_fn(self);
+            // First deinit the mailbox contents
             self.mailbox.deinit();
+            // Then destroy the mailbox struct itself since it was created with allocator.create()
             self.allocator.destroy(self.mailbox);
+            // Finally destroy the GenServer itself
             self.allocator.destroy(self);
         }
 
