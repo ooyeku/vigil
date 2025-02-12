@@ -78,11 +78,10 @@ pub fn GenServer(comptime StateType: type) type {
         }
 
         /// Send a synchronous message and wait for response
-        pub fn call(self: *Self, msg: *vigil.Message) !vigil.Message {
+        pub fn call(self: *Self, msg: *vigil.Message, timeout_ms: ?u32) !vigil.Message {
             const correlation_id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{std.time.milliTimestamp()});
             defer self.allocator.free(correlation_id);
 
-            // Generate unique mailbox ID
             const mailbox_id = try std.fmt.allocPrint(self.allocator, "mailbox_{d}", .{std.time.milliTimestamp()});
             defer self.allocator.free(mailbox_id);
 
@@ -92,7 +91,13 @@ pub fn GenServer(comptime StateType: type) type {
 
             try self.cast(msg_copy);
 
+            const start_time = std.time.milliTimestamp();
             while (true) {
+                if (timeout_ms) |timeout| {
+                    const elapsed = std.time.milliTimestamp() - start_time;
+                    if (elapsed > timeout) return error.Timeout;
+                }
+
                 if (self.mailbox.receive()) |received_const| {
                     var received = received_const;
 
@@ -104,7 +109,10 @@ pub fn GenServer(comptime StateType: type) type {
 
                     received.deinit();
                 } else |err| switch (err) {
-                    error.EmptyMailbox => continue,
+                    error.EmptyMailbox => {
+                        std.time.sleep(1 * std.time.ns_per_ms);
+                        continue;
+                    },
                     else => return err,
                 }
             }
@@ -382,7 +390,7 @@ test "GenServer state management" {
 
     // Wait briefly for message processing
     std.time.sleep(100 * std.time.ns_per_ms);
-    
+
     thread.join();
 
     try testing.expect(server.state.count == 1);
