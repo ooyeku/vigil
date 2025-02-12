@@ -109,10 +109,10 @@ pub fn GenServer(comptime StateType: type) type {
         }
 
         /// Register with a supervisor
-        pub fn supervise(self: *Self, supervisor: *vigil.Supervisor) !void {
+        pub fn supervise(self: *Self, supervisor: *vigil.Supervisor, id: []const u8) !void {
             self.supervisor = supervisor;
             try supervisor.addChild(.{
-                .id = "gen_server",
+                .id = id,
                 .start_fn = startFn,
                 .restart_type = .permanent,
                 .shutdown_timeout_ms = 5000,
@@ -310,7 +310,7 @@ test "GenServer supervision" {
         allocator.destroy(supervisor);
     }
 
-    try server.supervise(supervisor);
+    try server.supervise(supervisor, "test_gen_server");
     try testing.expect(server.supervisor != null);
 }
 
