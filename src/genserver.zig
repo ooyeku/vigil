@@ -21,6 +21,8 @@ pub fn GenServer(comptime StateType: type) type {
 
         const Self = @This();
 
+        var current_context: ?*anyopaque = null;
+
         /// Initialize a new GenServer
         pub fn init(
             allocator: std.mem.Allocator,
@@ -135,6 +137,10 @@ pub fn GenServer(comptime StateType: type) type {
         /// Register with a supervisor
         pub fn supervise(self: *Self, supervisor: *vigil.Supervisor, id: []const u8) !void {
             self.supervisor = supervisor;
+
+            // Store context before starting
+            @atomicStore(?*anyopaque, &current_context, self, .release);
+
             try supervisor.addChild(.{
                 .id = id,
                 .start_fn = startFn,
@@ -150,7 +156,16 @@ pub fn GenServer(comptime StateType: type) type {
         }
 
         fn startFn() void {
-            // TODO: Need proper context passing
+            const Context = struct {
+                fn getContext() ?*anyopaque {
+                    return @atomicLoad(?*anyopaque, &current_context, .acquire);
+                }
+            };
+
+            if (Context.getContext()) |ctx| {
+                const self: *Self = @ptrCast(@alignCast(ctx));
+                _ = self.start() catch {};
+            }
         }
     };
 }
