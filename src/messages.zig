@@ -298,17 +298,15 @@ pub const Message = struct {
     pub fn deinit(self: *Message) void {
         self.allocator.free(self.id);
         self.allocator.free(self.sender);
-        if (self.payload) |payload| {
-            self.allocator.free(payload);
-        }
-        if (self.metadata.correlation_id) |cid| {
-            self.allocator.free(cid);
+
+        if (self.payload) |p| {
+            self.allocator.free(p);
         }
         if (self.metadata.reply_to) |rt| {
             self.allocator.free(rt);
         }
-        if (self.metadata.trace_id) |tid| {
-            self.allocator.free(tid);
+        if (self.metadata.correlation_id) |cid| {
+            self.allocator.free(cid);
         }
     }
 
@@ -370,6 +368,48 @@ pub const Message = struct {
         }
 
         return response;
+    }
+
+    pub fn dupe(self: *const Message) !Message {
+        const new_id = try self.allocator.dupe(u8, self.id);
+        errdefer self.allocator.free(new_id);
+
+        const new_sender = try self.allocator.dupe(u8, self.sender);
+        errdefer self.allocator.free(new_sender);
+
+        const new_payload = if (self.payload) |p| try self.allocator.dupe(u8, p) else null;
+        errdefer if (new_payload) |p| self.allocator.free(p);
+
+        // Duplicate metadata strings
+        var new_reply_to: ?[]const u8 = null;
+        if (self.metadata.reply_to) |rt| {
+            new_reply_to = try self.allocator.dupe(u8, rt);
+            errdefer self.allocator.free(new_reply_to.?);
+        }
+
+        var new_correlation_id: ?[]const u8 = null;
+        if (self.metadata.correlation_id) |cid| {
+            new_correlation_id = try self.allocator.dupe(u8, cid);
+            errdefer self.allocator.free(new_correlation_id.?);
+        }
+
+        return Message{
+            .id = new_id,
+            .sender = new_sender,
+            .payload = new_payload,
+            .signal = self.signal,
+            .priority = self.priority,
+            .metadata = .{
+                .timestamp = self.metadata.timestamp,
+                .ttl_ms = self.metadata.ttl_ms,
+                .correlation_id = new_correlation_id,
+                .reply_to = new_reply_to,
+                .attempt_count = self.metadata.attempt_count,
+                .trace_id = self.metadata.trace_id,
+                .size_bytes = self.metadata.size_bytes,
+            },
+            .allocator = self.allocator,
+        };
     }
 };
 

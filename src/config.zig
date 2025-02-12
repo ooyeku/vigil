@@ -5,9 +5,9 @@ pub const Config = struct {
     /// Demo configuration
     pub const Demo = struct {
         /// Number of iterations to run the demo
-        iterations: usize = 100,
+        iterations: usize = 10,
         /// Sleep duration between iterations in milliseconds
-        sleep_duration_ms: u32 = 1,
+        sleep_duration_ms: u32 = 10,
         /// Demo duration in seconds
         duration_secs: u32 = 10,
         /// Status update interval in milliseconds
@@ -35,7 +35,7 @@ pub const Config = struct {
         /// Message time-to-live in milliseconds
         message_ttl_ms: u32 = 5000,
         /// Broadcast interval in milliseconds
-        broadcast_interval_ms: u32 = 50,
+        broadcast_interval_ms: u32 = 5000,
     };
 
     /// Health check configuration

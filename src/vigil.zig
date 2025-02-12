@@ -39,6 +39,9 @@ pub const ProcessMod = @import("process.zig");
 pub const MessageMod = @import("messages.zig");
 pub const SupervisorMod = @import("supervisor.zig");
 pub const SupervisorTreeMod = @import("sup_tree.zig");
+pub const WorkerMod = @import("worker.zig");
+pub const GenServerMod = @import("genserver.zig");
+
 
 // Core components
 pub const ProcessStats = ProcessMod.ProcessStats;
@@ -48,6 +51,7 @@ pub const SupervisorStats = SupervisorMod.SupervisorStats;
 pub const Supervisor = SupervisorMod.Supervisor;
 pub const SupervisorTree = SupervisorTreeMod.SupervisorTree;
 pub const TreeStats = SupervisorTreeMod.TreeStats;
+pub const GenServer = GenServerMod.GenServer;
 
 pub const Message = MessageMod.Message;
 pub const ProcessMailbox = MessageMod.ProcessMailbox;
@@ -57,6 +61,7 @@ pub const MessageMetadata = MessageMod.MessageMetadata;
 pub const SupervisorOptions = SupervisorMod.SupervisorOptions;
 pub const TreeConfig = SupervisorTreeMod.TreeConfig;
 pub const MailboxConfig = MessageMod.MailboxConfig;
+
 
 // Enums and error sets
 pub const ProcessError = ProcessMod.ProcessError;

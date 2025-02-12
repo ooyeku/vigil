@@ -1,6 +1,8 @@
 const std = @import("std");
-const vigil = @import("vigil");
-const worker = @import("worker.zig");
+const vigil = @import("vigil.zig");
+
+// Change direct worker.zig import to use the public API from vigil
+const worker = vigil.WorkerMod;
 const config = @import("config.zig");
 
 // Update imports
