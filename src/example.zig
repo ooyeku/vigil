@@ -10,42 +10,10 @@ const SupervisorTree = vigil.SupervisorTree;
 const TreeConfig = vigil.TreeConfig;
 const WorkerGroupConfig = vigil.WorkerGroupConfig;
 const Supervisor = vigil.Supervisor;
+const config = @import("config.zig");
 
 /// Configuration constants for the demo
-const Config = struct {
-    /// Number of iterations to run the demo
-    const DEMO_ITERATIONS = 100;
-    /// Sleep duration between iterations in milliseconds
-    const SLEEP_DURATION_MS = 1;
-
-    /// Number of background workers to create
-    const BACKGROUND_WORKERS = 40;
-    /// Number of business logic workers
-    const BUSINESS_WORKERS = 200;
-    /// Demo duration in seconds
-    const DEMO_DURATION_SECS = 10;
-    /// Status update interval in milliseconds
-    const STATUS_UPDATE_MS = 50;
-    /// Worker sleep duration in milliseconds
-    const WORKER_SLEEP_MS = 10;
-
-    /// Message passing configuration
-    const MAX_MAILBOX_CAPACITY = 1000;
-    const MESSAGE_TTL_MS = 5000;
-    const BROADCAST_INTERVAL_MS = 50;
-
-    /// Health check thresholds
-    const MEMORY_WARNING_THRESHOLD_MB = 10;
-    const MEMORY_CRITICAL_THRESHOLD_MB = 100;
-    const HEALTH_CHECK_INTERVAL_MS = 10;
-
-    /// Dynamic scaling
-    const MIN_WORKERS = 20;
-    const MAX_WORKERS = 100;
-    const SCALE_CHECK_INTERVAL_MS = 50;
-    const LOAD_THRESHOLD_HIGH = 0.8;
-    const LOAD_THRESHOLD_LOW = 0.2;
-};
+const Config = config.Config;
 
 /// Example worker errors that might occur during operation
 const WorkerError = error{
@@ -133,6 +101,9 @@ var worker_state = WorkerState{};
 // Add mailbox for inter-process communication
 var system_mailbox: ?ProcessMailbox = null;
 
+// Create a global config instance:
+var system_config = Config.init();
+
 fn initSystemMailbox(allocator: Allocator) !void {
     system_mailbox = ProcessMailbox.init(allocator, .{
         .capacity = 100,
@@ -164,15 +135,15 @@ const SystemMetrics = struct {
         self.cpu_usage = cpu;
         self.memory_usage_mb = mem;
         self.message_queue_length = queue;
-        self.worker_load = @as(f32, queue) / @as(f32, Config.MAX_MAILBOX_CAPACITY);
+        self.worker_load = @as(f32, queue) / @as(f32, system_config.messaging.max_mailbox_capacity);
     }
 
     pub fn shouldScale(self: *SystemMetrics) enum { Up, Down, None } {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.worker_load > Config.LOAD_THRESHOLD_HIGH) return .Up;
-        if (self.worker_load < Config.LOAD_THRESHOLD_LOW) return .Down;
+        if (self.worker_load > system_config.scaling.load_threshold_high) return .Up;
+        if (self.worker_load < system_config.scaling.load_threshold_low) return .Down;
         return .None;
     }
 };
@@ -242,7 +213,7 @@ pub fn main() !void {
     try tree.addChild(worker_sup, "worker_sup");
 
     // Generate worker names dynamically
-    const worker_names = try generateWorkerNames(allocator, "background_worker", Config.BACKGROUND_WORKERS);
+    const worker_names = try generateWorkerNames(allocator, "background_worker", system_config.workers.background_count);
     defer {
         for (worker_names) |name| {
             allocator.free(name);
@@ -252,12 +223,12 @@ pub fn main() !void {
 
     // Add worker group for background processing
     try vigil.addWorkerGroup(&worker_sup, .{
-        .size = Config.BACKGROUND_WORKERS,
+        .size = system_config.workers.background_count,
         .worker_names = worker_names,
         .priority = .low,
-        .max_memory_mb = 100,
-        .health_check_interval_ms = 1000,
-        .mailbox_capacity = 100,
+        .max_memory_mb = system_config.health.memory_critical_mb,
+        .health_check_interval_ms = system_config.health.check_interval_ms,
+        .mailbox_capacity = system_config.messaging.max_mailbox_capacity,
         .enable_monitoring = false,
     });
 
@@ -273,7 +244,7 @@ pub fn main() !void {
     });
 
     // Add high-priority business logic workers
-    if (Config.BUSINESS_WORKERS > 0) {
+    if (system_config.workers.business_count > 0) {
         try tree.main.supervisor.addChild(.{
             .id = "business_logic",
             .start_fn = businessLogicWorker,
@@ -282,7 +253,7 @@ pub fn main() !void {
             .priority = .high,
             .max_memory_bytes = 50 * 1024 * 1024,
             .health_check_fn = checkBusinessHealth,
-            .health_check_interval_ms = 1000,
+            .health_check_interval_ms = system_config.health.check_interval_ms,
         });
     }
 
@@ -306,7 +277,7 @@ pub fn main() !void {
             msg.payload,
             .info,
             msg.priority,
-            Config.MESSAGE_TTL_MS,
+            system_config.messaging.message_ttl_ms,
         );
 
         if (system_mailbox) |*mailbox| {
@@ -369,14 +340,14 @@ pub fn main() !void {
 
     // Simple loop that runs for a fixed number of iterations
     var iterations: usize = 0;
-    const max_iterations = Config.DEMO_ITERATIONS;
+    const max_iterations = system_config.demo.iterations;
 
     while (iterations < max_iterations) : (iterations += 1) {
         std.debug.print("{s}System Status (Iteration: {d}/{d}){s}\n", .{ bold, iterations + 1, max_iterations, reset });
         std.debug.print("├─ Active processes: {s}{d}/{d}{s}\n", .{
             green,
             worker_state.active_processes,
-            Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1,
+            system_config.workers.background_count + system_config.workers.business_count + 1,
             reset,
         });
         std.debug.print("├─ Total restarts: {s}{d}{s}\n", .{
@@ -390,7 +361,7 @@ pub fn main() !void {
             reset,
         });
 
-        std.time.sleep(Config.SLEEP_DURATION_MS * std.time.ns_per_ms); // Sleep between updates
+        std.time.sleep(system_config.demo.sleep_duration_ms * std.time.ns_per_ms); // Sleep between updates
     }
 
     // Demonstrate graceful shutdown
@@ -445,7 +416,7 @@ fn systemMonitorWorker() void {
     std.debug.print("\nSystem monitor started\n", .{});
     worker_state.incrementActiveProcesses();
     var counter: usize = 0;
-    const min_processes = (Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1) / 2;
+    const min_processes = (system_config.workers.background_count + system_config.workers.business_count + 1) / 2;
 
     while (worker_state.shouldRun()) {
         counter += 1;
@@ -467,7 +438,7 @@ fn systemMonitorWorker() void {
             worker_state.setHealth(true);
             std.debug.print("System health check passed (count: {d})\n", .{counter});
         }
-        std.time.sleep(Config.WORKER_SLEEP_MS * std.time.ns_per_ms);
+        std.time.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
     }
     worker_state.decrementActiveProcesses();
     std.debug.print("System monitor shutting down\n", .{});
@@ -478,7 +449,7 @@ fn businessLogicWorker() void {
     std.debug.print("\nBusiness logic worker started\n", .{});
     worker_state.incrementActiveProcesses();
     var counter: usize = 0;
-    const min_processes = (Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1) / 2;
+    const min_processes = (system_config.workers.background_count + system_config.workers.business_count + 1) / 2;
 
     while (worker_state.shouldRun()) {
         counter += 1;
@@ -496,7 +467,7 @@ fn businessLogicWorker() void {
         }
 
         std.debug.print("Processing business logic (count: {d})\n", .{counter});
-        std.time.sleep(Config.WORKER_SLEEP_MS * std.time.ns_per_ms);
+        std.time.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
     }
     worker_state.decrementActiveProcesses();
     std.debug.print("Business logic worker shutting down\n", .{});
@@ -507,7 +478,7 @@ fn backgroundWorker() void {
     std.debug.print("\nBackground worker started\n", .{});
     worker_state.incrementActiveProcesses();
     var counter: usize = 0;
-    const min_processes = (Config.BACKGROUND_WORKERS + Config.BUSINESS_WORKERS + 1) / 2;
+    const min_processes = (system_config.workers.background_count + system_config.workers.business_count + 1) / 2;
 
     while (worker_state.shouldRun()) {
         counter += 1;
@@ -525,7 +496,7 @@ fn backgroundWorker() void {
         }
 
         std.debug.print("Running background tasks (count: {d})\n", .{counter});
-        std.time.sleep(Config.WORKER_SLEEP_MS * std.time.ns_per_ms);
+        std.time.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
     }
     worker_state.decrementActiveProcesses();
     std.debug.print("Background worker shutting down\n", .{});
@@ -564,7 +535,7 @@ fn metricsCollectorWorker(sup_tree: *SupervisorTree) void {
             .None => {},
         }
 
-        std.time.sleep(Config.SCALE_CHECK_INTERVAL_MS * std.time.ns_per_ms);
+        std.time.sleep(system_config.scaling.check_interval_ms * std.time.ns_per_ms);
     }
 
     worker_state.decrementActiveProcesses();
@@ -576,7 +547,7 @@ fn scaleWorkers(direction: enum { up, down }, sup_tree: *SupervisorTree) !void {
 
     switch (direction) {
         .up => {
-            if (worker_state.active_processes < Config.MAX_WORKERS) {
+            if (worker_state.active_processes < system_config.workers.max_count) {
                 // Add a new business logic worker
                 try sup_tree.main.supervisor.addChild(.{
                     .id = std.fmt.allocPrint(allocator, "business_worker_{d}", .{worker_state.active_processes + 1}) catch "worker",
@@ -585,13 +556,13 @@ fn scaleWorkers(direction: enum { up, down }, sup_tree: *SupervisorTree) !void {
                     .shutdown_timeout_ms = 2000,
                     .priority = .high,
                     .max_memory_bytes = 50 * 1024 * 1024,
-                    .health_check_interval_ms = 1000,
+                    .health_check_interval_ms = system_config.health.check_interval_ms,
                 });
                 try sup_tree.main.supervisor.start();
             }
         },
         .down => {
-            if (worker_state.active_processes > Config.MIN_WORKERS) {
+            if (worker_state.active_processes > system_config.workers.min_count) {
                 // Find and remove the last added worker
                 if (sup_tree.main.supervisor.findChild("business_worker_" ++
                     std.fmt.allocPrint(allocator, "{d}", .{worker_state.active_processes}) catch "worker")) |worker|
