@@ -2,6 +2,12 @@ const std = @import("std");
 const vigil = @import("vigil.zig");
 const testing = @import("std").testing;
 
+pub const GenServerState = enum {
+    initial,
+    running,
+    stopped,
+};
+
 pub fn GenServer(comptime StateType: type) type {
     return struct {
         allocator: std.mem.Allocator,
@@ -11,6 +17,7 @@ pub fn GenServer(comptime StateType: type) type {
         init_fn: *const fn (self: *@This()) anyerror!void,
         terminate_fn: *const fn (self: *@This()) void,
         supervisor: ?*vigil.Supervisor = null,
+        server_state: GenServerState = .initial,
 
         const Self = @This();
 
@@ -43,9 +50,12 @@ pub fn GenServer(comptime StateType: type) type {
 
         /// Start the GenServer process
         pub fn start(self: *Self) !void {
-            try self.init_fn(self);
+            if (self.server_state != .initial) return error.AlreadyRunning;
 
-            while (true) {
+            try self.init_fn(self);
+            self.server_state = .running;
+
+            while (self.server_state == .running) {
                 if (self.mailbox.receive()) |msg_const| {
                     var msg = msg_const;
                     defer if (msg.metadata.correlation_id == null) {
@@ -53,7 +63,10 @@ pub fn GenServer(comptime StateType: type) type {
                     };
                     try self.handler(self, msg);
                 } else |err| switch (err) {
-                    error.EmptyMailbox => break,
+                    error.EmptyMailbox => {
+                        std.time.sleep(1 * std.time.ns_per_ms);
+                        continue;
+                    },
                     else => return err,
                 }
             }
@@ -99,6 +112,7 @@ pub fn GenServer(comptime StateType: type) type {
 
         /// Stop the GenServer
         pub fn stop(self: *Self) void {
+            self.server_state = .stopped;
             self.terminate_fn(self);
             // First deinit the mailbox contents
             self.mailbox.deinit();
@@ -184,6 +198,7 @@ test "GenServer message handling" {
             fn handle(self: *ServerType, msg: vigil.Message) !void {
                 if (std.mem.eql(u8, msg.payload.?, "test")) {
                     self.state.received = true;
+                    self.server_state = .stopped; // Stop after receiving the message
                 }
             }
         }.handle,
@@ -214,8 +229,18 @@ test "GenServer message handling" {
     );
     defer msg.deinit();
 
-    try server.cast(msg_copy); // Server takes ownership
-    try server.start();
+    try server.cast(msg_copy);
+
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *ServerType) void {
+            s.start() catch {};
+        }
+    }.run, .{server});
+
+    // Wait briefly for message processing
+    std.time.sleep(100 * std.time.ns_per_ms);
+
+    thread.join();
 
     try testing.expect(server.state.received);
 }
@@ -328,6 +353,7 @@ test "GenServer state management" {
             fn handle(self: *ServerType, msg: vigil.Message) !void {
                 if (std.mem.eql(u8, msg.payload.?, "increment")) {
                     self.state.count += 1;
+                    self.server_state = .stopped; // Stop after incrementing
                 }
             }
         }.handle,
@@ -347,7 +373,17 @@ test "GenServer state management" {
 
     const msg = try vigil.Message.init(allocator, "inc_msg", "tester", "increment", .info, .normal, 1000);
     try server.cast(msg);
-    try server.start();
+
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *ServerType) void {
+            s.start() catch {};
+        }
+    }.run, .{server});
+
+    // Wait briefly for message processing
+    std.time.sleep(100 * std.time.ns_per_ms);
+    
+    thread.join();
 
     try testing.expect(server.state.count == 1);
 }
