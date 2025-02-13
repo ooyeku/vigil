@@ -689,7 +689,7 @@ fn scaleWorkers(direction: enum { up, down }, sup_tree: *SupervisorTree) !void {
                     .id = std.fmt.allocPrint(allocator, "business_worker_{d}", .{worker_state.active_processes + 1}) catch "worker",
                     .start_fn = businessLogicWorker,
                     .restart_type = .permanent,
-                    .shutdown_timeout_ms = 2000,
+                    .shutdown_timeout_ms = 20_000,
                     .priority = .high,
                     .max_memory_bytes = 50 * 1024 * 1024,
                     .health_check_interval_ms = system_config.health.check_interval_ms,
