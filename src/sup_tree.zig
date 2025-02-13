@@ -367,26 +367,29 @@ pub const SupervisorTree = struct {
     /// // Use default timeout from config
     /// try tree.shutdown(null);
     /// ```
-    pub fn shutdown(self: *SupervisorTree, timeout_ms: ?u32) !void {
+    pub fn shutdown(self: *SupervisorTree, timeout_ms: u32) !void {
+        const actual_timeout: u64 = @as(u64, timeout_ms);
+        var timer = try std.time.Timer.start();
+
+        // Convert timeout to nanoseconds safely using u64
+        const timeout_ns: u64 = actual_timeout * @as(u64, std.time.ns_per_ms);
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const actual_timeout = timeout_ms orelse self.config.shutdown_timeout_ms;
-        var timer = try std.time.Timer.start();
-
-        // Shutdown child supervisors first
+        // Stop all child supervisors first
         for (self.children.items) |*child| {
-            const remaining_time = @as(i64, @intCast(@max(0, actual_timeout - @divFloor(timer.read(), std.time.ns_per_ms))));
-            try child.supervisor.shutdown(remaining_time);
+            if (timer.read() > timeout_ns) {
+                return error.ShutdownTimeout;
+            }
+            try child.supervisor.shutdown(timeout_ms);
         }
 
-        // Shutdown main supervisor
-        const remaining_time = @as(i64, @intCast(@max(0, actual_timeout - @divFloor(timer.read(), std.time.ns_per_ms))));
-        try self.main.supervisor.shutdown(remaining_time);
-
-        if (timer.read() > actual_timeout * std.time.ns_per_ms) {
-            return SupervisorTreeError.ShutdownTimeout;
+        // Then stop the main supervisor
+        if (timer.read() > timeout_ns) {
+            return error.ShutdownTimeout;
         }
+        try self.main.supervisor.shutdown(timeout_ms);
     }
 
     /// Find a supervisor by name in the tree.

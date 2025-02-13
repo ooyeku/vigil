@@ -1,51 +1,15 @@
 # Vigil
 
+Note: API is subject to change (hopefully for the better)
+
 A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications.
 
-## Features
-- Process supervision
-- Inter-process communication
-- Priority-based message passing
-- Message correlation and request-response patterns
-- Distributed tracing support
-- System monitoring and metrics collection
-- Fault-tolerant system design
-
-## Potential Use Cases
-
-### Microservices Architecture
-- Process-to-process communication
-- Service health monitoring
-- Load balancing via priority queues
-- Request routing and correlation
-- Distributed tracing
-
-### Background Job Processing
-- Priority-based job scheduling
-- Batch processing coordination
-- Worker pool management
-- Job status monitoring
-- Failed job handling via dead letter queue
-
-### System Monitoring
-- Health check implementation
-- Resource usage monitoring
-- Alert propagation
-- Metric collection
-- Log aggregation
-
-### Fault-Tolerant Systems
-- Process recovery
-- Message delivery guarantees
-- Error propagation
-- Graceful degradation
-- System state management
-
 ## Installation
+
 Fetch latest release:
 
 ```bash
-zig fetch --save "git+https://github.com/ooyeku/vigil/#v0.1.1"
+zig fetch --save "git+https://github.com/ooyeku/vigil/#v0.2.0"
 ```
 
 Add as a dependency in your `build.zig.zon`:
@@ -58,6 +22,7 @@ Add as a dependency in your `build.zig.zon`:
     exe.root_module.addImport("vigil", vigil.module("vigil_lib"));
     b.installArtifact(exe);
 ```
+
 ## Getting Started
 
 ```zig
@@ -100,9 +65,81 @@ while (mailbox.receive()) |received| {
     error.EmptyMailbox => break,
     else => return err,
 }
+
+// Create a supervisor
+var supervisor = vigil.Supervisor.init(allocator, .{
+    .name = "my_supervisor",
+    .strategy = .one_for_one,
+    .shutdown_timeout_ms = 5000,
+});
+defer supervisor.deinit();
+
+// Create a worker group
+var worker_group = vigil.WorkerGroup.init(allocator, .{
+    .name = "my_worker_group",
+    .size = 5,
+    .mailbox_capacity = 100,
+    .priority = .high,
+});
+defer worker_group.deinit();
+
+// Create a GenServer
+var gen_server = vigil.GenServer.init(allocator, .{
+    .name = "my_gen_server",
+    .mailbox_capacity = 100,
+    .priority = .high,
+});
+defer gen_server.deinit();
+
+// Start the supervisor
+try supervisor.start();
+
+// Supervise the GenServer
+try gen_server.supervise(supervisor, "my_gen_server");
+
+// Start the worker group
+try worker_group.start();
+
+// Send a message to the GenServer
+var msg = try vigil.Message.init(
+    allocator,
+    "my_message",
+    "my_sender",
+    "my_payload",
+    .info,
+    .normal,
+    5000, // 5 second TTL
+);
+try gen_server.cast(msg);
+
+// Process messages with priority handling
+while (mailbox.receive()) |received| {
+    defer received.deinit();
+    if (received.signal) |signal| {
+        switch (signal) {
+            .cpuWarning => handleCpuWarning(received),
+            .healthCheck => sendHealthStatus(),
+            else => handleOtherSignal(received),
+        }
+    }
+} else |err| switch (err) {
+    error.EmptyMailbox => break,
+    else => return err,
+}
+
+// Stop the GenServer
+try gen_server.stop();
+
+// Stop the worker group
+try worker_group.stop();
+
+// Stop the supervisor
+try supervisor.stop();
+
 ```
 
 ## Requirements
+
 - Zig 0.13.0 or later
 - POSIX-compliant operating system
 

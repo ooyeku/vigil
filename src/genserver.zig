@@ -21,7 +21,7 @@ pub fn GenServer(comptime StateType: type) type {
 
         const Self = @This();
 
-        var current_context: ?*anyopaque = null;
+        pub var current_context: ?*anyopaque = null;
 
         /// Initialize a new GenServer
         pub fn init(
@@ -166,6 +166,10 @@ pub fn GenServer(comptime StateType: type) type {
                 const self: *Self = @ptrCast(@alignCast(ctx));
                 _ = self.start() catch {};
             }
+        }
+
+        pub fn getContext() ?*anyopaque {
+            return current_context;
         }
     };
 }

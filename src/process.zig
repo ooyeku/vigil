@@ -171,6 +171,8 @@ pub const ChildSpec = struct {
     health_check_fn: ?*const fn () bool = null,
     /// Interval between health checks in milliseconds
     health_check_interval_ms: u32 = 1000,
+    /// Optional context for the process
+    context: ?*anyopaque = null,
 };
 
 /// Result information when a process terminates.

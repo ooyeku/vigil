@@ -21,6 +21,7 @@ const SupervisorTree = vigil.SupervisorTree;
 const TreeConfig = vigil.TreeConfig;
 const WorkerGroupConfig = vigil.WorkerGroupConfig;
 const Supervisor = vigil.Supervisor;
+const GenServer = vigil.GenServer;
 
 /// Configuration constants for the demo
 const Config = config.Config;
@@ -78,7 +79,7 @@ const SystemMetrics = struct {
         self.cpu_usage = cpu;
         self.memory_usage_mb = mem;
         self.message_queue_length = queue;
-        self.worker_load = @as(f32, queue) / @as(f32, system_config.messaging.max_mailbox_capacity);
+        self.worker_load = @as(f32, @floatFromInt(queue)) / @as(f32, @floatFromInt(system_config.messaging.max_mailbox_capacity));
     }
 
     pub fn shouldScale(self: *SystemMetrics) enum { Up, Down, None } {
@@ -107,6 +108,122 @@ fn generateWorkerNames(allocator: Allocator, prefix: []const u8, count: usize) !
     }
 
     return names;
+}
+
+/// Example GenServer state for the system monitor
+const MonitorState = struct {
+    metrics: SystemMetrics,
+    last_update: i64,
+    check_interval_ms: u32,
+};
+
+/// Create a GenServer for system monitoring
+fn createMonitorServer(allocator: std.mem.Allocator, check_interval_ms: u32) !*GenServer(MonitorState) {
+    return try GenServer(MonitorState).init(
+        allocator,
+        struct {
+            fn handle(self: *GenServer(MonitorState), msg: Message) !void {
+                if (std.mem.eql(u8, msg.payload.?, "collect_metrics")) {
+                    // Update metrics
+                    const memory_mb = worker_state.memory_usage / (1024 * 1024);
+                    const queue_length = if (system_mailbox) |*mb| blk: {
+                        const stats = mb.getStats();
+                        break :blk stats.messages_received;
+                    } else 0;
+
+                    self.state.metrics.update(0.7, memory_mb, queue_length);
+                    self.state.last_update = std.time.milliTimestamp();
+
+                    // Send response if this was a call
+                    if (msg.metadata.correlation_id) |_| {
+                        var response = try Message.init(
+                            self.allocator,
+                            "metrics_response",
+                            msg.metadata.reply_to.?,
+                            "metrics_updated",
+                            .info,
+                            .normal,
+                            1000,
+                        );
+                        defer response.deinit();
+                        try self.mailbox.send(response);
+                    }
+                }
+            }
+        }.handle,
+        struct {
+            fn init(self: *GenServer(MonitorState)) !void {
+                std.debug.print("Monitor GenServer starting...\n", .{});
+                // Schedule first metrics collection
+                const msg = try Message.init(
+                    self.allocator,
+                    "collect_metrics",
+                    "self",
+                    "collect_metrics",
+                    .info,
+                    .normal,
+                    1000,
+                );
+                try self.cast(msg);
+            }
+        }.init,
+        struct {
+            fn terminate(self: *GenServer(MonitorState)) void {
+                std.debug.print("Monitor GenServer shutting down...\n", .{});
+                _ = self;
+            }
+        }.terminate,
+        .{
+            .metrics = SystemMetrics{},
+            .last_update = std.time.milliTimestamp(),
+            .check_interval_ms = check_interval_ms,
+        },
+    );
+}
+
+/// Example GenServer state for worker management
+const WorkerManagerState = struct {
+    active_workers: u32,
+    max_workers: u32,
+    min_workers: u32,
+};
+
+/// Create a GenServer for worker management
+fn createWorkerManager(allocator: std.mem.Allocator, min: u32, max: u32) !*GenServer(WorkerManagerState) {
+    return try GenServer(WorkerManagerState).init(
+        allocator,
+        struct {
+            fn handle(self: *GenServer(WorkerManagerState), msg: Message) !void {
+                if (std.mem.eql(u8, msg.payload.?, "scale_up")) {
+                    if (self.state.active_workers < self.state.max_workers) {
+                        self.state.active_workers += 1;
+                        std.debug.print("Scaling up to {d} workers\n", .{self.state.active_workers});
+                    }
+                } else if (std.mem.eql(u8, msg.payload.?, "scale_down")) {
+                    if (self.state.active_workers > self.state.min_workers) {
+                        self.state.active_workers -= 1;
+                        std.debug.print("Scaling down to {d} workers\n", .{self.state.active_workers});
+                    }
+                }
+            }
+        }.handle,
+        struct {
+            fn init(self: *GenServer(WorkerManagerState)) !void {
+                std.debug.print("Worker Manager starting with {d} workers...\n", .{self.state.active_workers});
+            }
+        }.init,
+        struct {
+            fn terminate(self: *GenServer(WorkerManagerState)) void {
+                std.debug.print("Worker Manager shutting down...\n", .{});
+                _ = self;
+            }
+        }.terminate,
+        .{
+            .active_workers = min,
+            .max_workers = max,
+            .min_workers = min,
+        },
+    );
 }
 
 pub fn main() !void {
@@ -139,10 +256,15 @@ pub fn main() !void {
     var tree = try SupervisorTree.init(allocator, Supervisor.init(allocator, root_options), "root", .{
         .max_depth = 3,
         .enable_monitoring = false,
-        .shutdown_timeout_ms = 10_000,
+        .shutdown_timeout_ms = 30_000,
         .propagate_signals = true,
     });
-    defer tree.deinit();
+    defer {
+        _ = tree.shutdown(30_000) catch |err| {
+            std.debug.print("Warning: Shutdown error: {}\n", .{err});
+        };
+        tree.deinit();
+    }
 
     // Create worker supervisor for background tasks
     var worker_sup = Supervisor.init(allocator, .{
@@ -176,15 +298,35 @@ pub fn main() !void {
     });
 
     // Add critical system workers to root supervisor
-    try tree.main.supervisor.addChild(.{
-        .id = "system_monitor",
-        .start_fn = systemMonitorWorker,
+    const monitor_server = try createMonitorServer(allocator, system_config.health.check_interval_ms);
+    defer {
+        // First stop the server to prevent new messages
+        monitor_server.server_state = .stopped;
+        // Wait a bit for any in-flight messages
+        std.time.sleep(10 * std.time.ns_per_ms);
+        // Now clean up
+        monitor_server.terminate_fn(monitor_server);
+        monitor_server.mailbox.deinit();
+        allocator.destroy(monitor_server.mailbox);
+        allocator.destroy(monitor_server);
+    }
+    const child_spec = vigil.ChildSpec{
+        .id = "monitor",
+        .start_fn = struct {
+            fn start() void {
+                if (@atomicLoad(?*anyopaque, &GenServer(MonitorState).current_context, .acquire)) |ctx| {
+                    const server: *GenServer(MonitorState) = @ptrCast(@alignCast(ctx));
+                    server.start() catch {};
+                }
+            }
+        }.start,
         .restart_type = .permanent,
-        .shutdown_timeout_ms = 1000,
-        .priority = .critical,
-        .max_memory_bytes = 10 * 1024 * 1024,
-        .health_check_interval_ms = 500,
-    });
+        .shutdown_timeout_ms = 5000,
+    };
+    try tree.main.supervisor.addChild(child_spec);
+
+    // Update context storage using atomic store
+    @atomicStore(?*anyopaque, &GenServer(MonitorState).current_context, monitor_server, .release);
 
     // Add high-priority business logic workers
     if (system_config.workers.business_count > 0) {
@@ -199,6 +341,42 @@ pub fn main() !void {
             .health_check_interval_ms = system_config.health.check_interval_ms,
         });
     }
+
+    // Create and start the worker manager with proper type conversion
+    const worker_manager = try createWorkerManager(
+        allocator,
+        @intCast(system_config.workers.min_count),
+        @intCast(system_config.workers.max_count),
+    );
+    defer {
+        // First stop the server to prevent new messages
+        worker_manager.server_state = .stopped;
+        // Wait a bit for any in-flight messages
+        std.time.sleep(10 * std.time.ns_per_ms);
+        // Now clean up
+        worker_manager.terminate_fn(worker_manager);
+        worker_manager.mailbox.deinit();
+        allocator.destroy(worker_manager.mailbox);
+        allocator.destroy(worker_manager);
+    }
+
+    // Add both servers to the supervision tree
+    try tree.main.supervisor.addChild(.{
+        .id = "worker_manager",
+        .start_fn = struct {
+            fn start() void {
+                if (@atomicLoad(?*anyopaque, &GenServer(WorkerManagerState).current_context, .acquire)) |ctx| {
+                    const server: *GenServer(WorkerManagerState) = @ptrCast(@alignCast(ctx));
+                    server.start() catch {};
+                }
+            }
+        }.start,
+        .restart_type = .permanent,
+        .shutdown_timeout_ms = 5000,
+    });
+
+    // Store the context before starting
+    @atomicStore(?*anyopaque, &GenServer(WorkerManagerState).current_context, worker_manager, .release);
 
     // Start the entire supervision tree
     try tree.start();
@@ -352,6 +530,32 @@ pub fn main() !void {
             std.debug.print("No messages in mailbox\n", .{});
         }
     }
+
+    // Example of GenServer message passing
+    const scale_msg = try Message.init(
+        allocator,
+        "scale_request",
+        "main",
+        "scale_up",
+        .info,
+        .high,
+        1000,
+    );
+    try worker_manager.cast(scale_msg);
+
+    // Example of synchronous call with proper message handling
+    var metrics_msg = try Message.init(
+        allocator,
+        "metrics_request",
+        "main",
+        "collect_metrics",
+        .info,
+        .normal,
+        1000,
+    );
+    var response = try monitor_server.call(&metrics_msg, 5000);
+    metrics_msg.deinit();
+    response.deinit();
 }
 
 /// System monitoring worker with critical priority
@@ -452,11 +656,13 @@ fn metricsCollectorWorker(sup_tree: *SupervisorTree) void {
     while (worker_state.shouldRun()) {
         // Collect system metrics
         const memory_mb = worker_state.memory_usage / (1024 * 1024);
-        const queue_length = if (system_mailbox) |mb| mb.getStats().message_count else 0;
+        const queue_length = if (system_mailbox) |*mb| blk: {
+            const stats = mb.getStats();
+            break :blk stats.messages_received;
+        } else 0;
 
         // Update metrics
-        system_metrics.update(0.7, // Simulated CPU usage
-            memory_mb, queue_length);
+        system_metrics.update(0.7, memory_mb, queue_length);
 
         // Check scaling needs
         switch (system_metrics.shouldScale()) {
