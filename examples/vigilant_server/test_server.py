@@ -13,7 +13,7 @@ import resource
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
-TEST_ITERATIONS = 1000
+TEST_ITERATIONS = 100000
 
 @dataclass
 class TestStats:
@@ -24,28 +24,72 @@ class TestStats:
     std_dev: float
 
 class ServerTester:
-    def __init__(self, host: str = '127.0.0.1', port: int = 8080):
+    def __init__(self, host: str = '127.0.0.1', port: int = 8080, pool_size: int = 100):
         self.host = host
         self.port = port
         self.results: Dict[str, List[float]] = {}
+        self.connection_pool: List[socket.socket] = []
+        self.pool_size = pool_size
+        self._initialize_pool()
         
+    def _initialize_pool(self):
+        """Initialize the connection pool"""
+        for _ in range(self.pool_size):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.connect((self.host, self.port))
+                self.connection_pool.append(sock)
+            except (socket.timeout, ConnectionResetError, OSError) as e:
+                print(f"Failed to initialize connection: {e}")
+
+    def _get_connection(self) -> socket.socket:
+        """Get an available connection from the pool"""
+        if not self.connection_pool:
+            self._initialize_pool()
+        return self.connection_pool.pop() if self.connection_pool else None
+
+    def _return_connection(self, sock: socket.socket):
+        """Return a connection to the pool"""
+        if sock and len(self.connection_pool) < self.pool_size:
+            self.connection_pool.append(sock)
+        else:
+            try:
+                sock.close()
+            except:
+                pass
+
     def send_request(self, message: str) -> float:
         start = time.perf_counter()
+        sock = self._get_connection()
+        
+        if not sock:
+            return float('inf')
+            
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.settimeout(1.0)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.connect((self.host, self.port))
-                sock.sendall((message + '\n').encode())
-                response = sock.recv(1024)
-                sock.shutdown(socket.SHUT_RDWR)
+            sock.sendall((message + '\n').encode())
+            response = sock.recv(1024)
+            self._return_connection(sock)
         except (socket.timeout, ConnectionResetError, OSError) as e:
             print(f"Connection error: {e}")
+            try:
+                sock.close()
+            except:
+                pass
             time.sleep(0.1)  # Add small delay before retry
             return float('inf')
             
         end = time.perf_counter()
         return (end - start) * 1000
+
+    def __del__(self):
+        """Cleanup connections when the tester is destroyed"""
+        for sock in self.connection_pool:
+            try:
+                sock.close()
+            except:
+                pass
 
     def run_test(self, category: str, message: str, iterations: int = TEST_ITERATIONS):
         if category not in self.results:

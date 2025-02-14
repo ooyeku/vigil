@@ -13,6 +13,9 @@ const ServerState = struct {
     pool: ConnectionPool,
     allocator: std.mem.Allocator,
     connections_mutex: std.Thread.Mutex,
+    is_shutting_down: std.atomic.Value(bool),
+    server: ?*net.Server,
+    shutdown_trigger: std.Thread.ResetEvent,
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, port: u16) !ServerState {
         return ServerState{
@@ -21,10 +24,17 @@ const ServerState = struct {
             .pool = ConnectionPool.init(allocator, MAX_CONNECTIONS),
             .allocator = allocator,
             .connections_mutex = .{},
+            .is_shutting_down = std.atomic.Value(bool).init(false),
+            .server = null,
+            .shutdown_trigger = .{},
         };
     }
 
     pub fn deinit(self: *ServerState) void {
+        if (self.server) |s| {
+            s.stream.close();
+            self.allocator.destroy(s);
+        }
         self.pool.deinit();
     }
 
@@ -32,6 +42,15 @@ const ServerState = struct {
         self.pool.mutex.lock();
         defer self.pool.mutex.unlock();
         return self.pool.connections.items.len - self.pool.idle_connections.items.len;
+    }
+
+    pub fn waitForActiveConnections(self: *ServerState) void {
+        while (true) {
+            const active_count = self.getActiveConnectionCount();
+            if (active_count == 0) break;
+            std.debug.print("⏳ Waiting for {d} active connections to finish...\n", .{active_count});
+            std.time.sleep(100 * std.time.ns_per_ms);
+        }
     }
 };
 
@@ -42,7 +61,7 @@ const Connection = struct {
     state: *ServerState,
     buffer: [1024]u8 = undefined,
     last_activity: i64,
-    const TIMEOUT_MS: i64 = 100; // 30 second timeout
+    const TIMEOUT_MS: i64 = 30000; // 30 seconds timeout
 
     pub fn init(stream: net.Stream, address: net.Address, state: *ServerState) Connection {
         return .{
@@ -57,9 +76,15 @@ const Connection = struct {
     pub fn handle(self: *Connection) !void {
         std.debug.print("👂 Waiting for data from {}\n", .{self.address});
         while (true) {
-            // Check for timeout using timestamp
+            // Check shutdown flag before accepting new requests
+            if (self.state.is_shutting_down.load(.acquire)) {
+                std.debug.print("🛑 Server is shutting down, no new requests accepted from {}\n", .{self.address});
+                return;
+            }
+
+            // Check for timeout using timestamp and convert ms to seconds correctly
             const current_time: i64 = @intCast(std.time.timestamp());
-            if (current_time - self.last_activity > TIMEOUT_MS / 1000) { // Convert to seconds
+            if (current_time - self.last_activity > TIMEOUT_MS / 1000) {
                 std.debug.print("⏰ Connection timeout from {}\n", .{self.address});
                 return error.ConnectionTimeout;
             }
@@ -217,6 +242,9 @@ pub fn NetworkServer(comptime Config: type) type {
             };
             errdefer state.allocator.destroy(stream_server);
 
+            // Store server reference in state
+            state.server = stream_server;
+
             // Accept connections in a separate thread
             _ = try std.Thread.spawn(.{}, struct {
                 fn accept(l: *net.Server, s: *ServerState) !void {
@@ -225,16 +253,17 @@ pub fn NetworkServer(comptime Config: type) type {
                         s.allocator.destroy(l);
                     }
 
-                    std.debug.print("✅ Server ready on {s}:{d}\n", .{ s.address, s.port });
-
-                    while (true) {
+                    while (!s.is_shutting_down.load(.acquire)) { // Check shutdown flag in accept loop
                         const conn = l.accept() catch |err| switch (err) {
                             error.ProcessFdQuotaExceeded => {
                                 std.debug.print("⚠️ FD limit reached, waiting...\n", .{});
                                 std.time.sleep(100 * std.time.ns_per_ms);
                                 continue;
                             },
-                            else => return err,
+                            else => {
+                                if (s.is_shutting_down.load(.acquire)) break; // Break if shutting down
+                                return err;
+                            },
                         };
 
                         const connection = s.pool.acquire(conn.stream, conn.address, s) catch |err| {
@@ -258,12 +287,31 @@ pub fn NetworkServer(comptime Config: type) type {
                             }
                         }.handler, .{ connection, s });
                     }
+                    std.debug.print("🔌 Accept loop exiting...\n", .{});
                 }
             }.accept, .{ stream_server, state });
         }
 
         fn stopServer(server: *vigil.GenServer(ServerState)) void {
-            server.state.deinit();
+            const state = &server.state;
+            std.debug.print("🛑 Initiating graceful shutdown...\n", .{});
+
+            // Set shutdown flag first
+            state.is_shutting_down.store(true, .release);
+
+            // Close listening socket to interrupt accept()
+            if (state.server) |s| {
+                s.stream.close();
+            }
+
+            // Wait for active connections to finish
+            state.waitForActiveConnections();
+
+            std.debug.print("👋 All connections finished, cleaning up...\n", .{});
+            state.deinit();
+
+            // Signal completion
+            state.shutdown_trigger.set();
         }
 
         fn handleMessage(server: *vigil.GenServer(ServerState), msg: vigil.Message) !void {
@@ -294,6 +342,9 @@ const ServerConfig = struct {
     port: u16,
 };
 
+// Move this to global scope (before main)
+var sig_received = std.atomic.Value(bool).init(false);
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -306,13 +357,44 @@ pub fn main() !void {
 
     const server = try NetworkServer(ServerConfig).init(allocator, config);
     try server.server.start();
-    defer server.server.terminate_fn(server.server);
+
+    const handler = struct {
+        fn handle(sig: c_int) callconv(.C) void {
+            _ = sig;
+            sig_received.store(true, .release);
+            std.debug.print("\n🛑 Received interrupt signal (Ctrl-C)...\n", .{});
+        }
+    }.handle;
+
+    try std.posix.sigaction(
+        std.posix.SIG.INT,
+        &std.posix.Sigaction{
+            .handler = .{ .handler = handler },
+            .mask = std.posix.empty_sigset,
+            .flags = 0,
+        },
+        null,
+    );
 
     std.debug.print("🏁 Server started at {s}:{d}\n", .{ config.address, config.port });
-    std.debug.print("⏳ Press Ctrl+C to exit...\n", .{});
+    std.debug.print("⏳ Press Ctrl+C to initiate graceful shutdown...\n", .{});
 
-    // Keep main thread alive
-    while (true) {
-        std.time.sleep(std.time.ns_per_s);
+    // Wait for signal
+    while (!sig_received.load(.acquire)) {
+        std.time.sleep(100 * std.time.ns_per_ms);
     }
+
+    // Initiate graceful shutdown
+    std.debug.print("🔄 Starting graceful shutdown sequence...\n", .{});
+    server.server.terminate_fn(server.server);
+
+    // Wait for shutdown with timeout
+    const SHUTDOWN_WAIT_MS: u64 = 5000;
+    if (server.server.state.shutdown_trigger.timedWait(SHUTDOWN_WAIT_MS * std.time.ns_per_ms)) {
+        std.debug.print("✅ Server shutdown completed successfully\n", .{});
+    } else |err| {
+        std.debug.print("⚠️ Server shutdown timed out: {any}\n", .{err});
+    }
+
+    std.debug.print("👋 Server process exiting\n", .{});
 }
