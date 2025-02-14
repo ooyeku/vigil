@@ -25,6 +25,25 @@ Add as a dependency in your `build.zig.zon`:
 
 ## Getting Started
 
+### Running the example server
+
+See [examples/vigilant_server](examples/vigilant_server) for an example of a basic server implementation using the `vigil` librarys `GenServer` and `WorkerGroup` features.
+
+```bash
+zig build example-server
+```
+
+### Running the Python test client
+
+See [examples/vigilant_server/test_server.py](examples/vigilant_server/test_server.py) for an example of a basic python client implementation.
+
+```bash
+zig build test-server
+./zig-out/bin/test-server
+```
+
+### Basic Usage
+
 ```zig
 const std = @import("std");
 const vigil = @import("vigil");
