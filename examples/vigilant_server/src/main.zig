@@ -1,5 +1,5 @@
 const std = @import("std");
-const vigil = @import("vigil.zig");
+const vigil = @import("vigil");
 const net = std.net;
 const posix = std.posix;
 
