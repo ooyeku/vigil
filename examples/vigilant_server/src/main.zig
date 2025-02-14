@@ -41,15 +41,37 @@ const Connection = struct {
     address: net.Address,
     state: *ServerState,
     buffer: [1024]u8 = undefined,
+    last_activity: i64,
+    const TIMEOUT_MS: i64 = 100; // 30 second timeout
+
+    pub fn init(stream: net.Stream, address: net.Address, state: *ServerState) Connection {
+        return .{
+            .stream = stream,
+            .address = address,
+            .state = state,
+            .buffer = undefined,
+            .last_activity = @intCast(std.time.timestamp()),
+        };
+    }
 
     pub fn handle(self: *Connection) !void {
         std.debug.print("👂 Waiting for data from {}\n", .{self.address});
         while (true) {
+            // Check for timeout using timestamp
+            const current_time: i64 = @intCast(std.time.timestamp());
+            if (current_time - self.last_activity > TIMEOUT_MS / 1000) { // Convert to seconds
+                std.debug.print("⏰ Connection timeout from {}\n", .{self.address});
+                return error.ConnectionTimeout;
+            }
+
             const bytes_read = try self.stream.read(&self.buffer);
             if (bytes_read == 0) {
                 std.debug.print("📭 Zero bytes read, closing connection\n", .{});
                 return;
             }
+
+            // Update last activity time on successful read
+            self.last_activity = std.time.timestamp();
 
             const cmd = std.mem.trim(u8, self.buffer[0..bytes_read], "\r\n");
             if (std.mem.eql(u8, cmd, "STATUS")) {
@@ -106,20 +128,14 @@ const ConnectionPool = struct {
         // Try to reuse an idle connection
         if (self.idle_connections.items.len > 0) {
             const conn = self.idle_connections.pop();
-            conn.stream = stream;
-            conn.address = address;
+            conn.* = Connection.init(stream, address, state);
             return conn;
         }
 
         // Create new connection if pool isn't full
         if (self.connections.items.len < self.max_pool_size) {
             const conn = try self.allocator.create(Connection);
-            conn.* = .{
-                .stream = stream,
-                .address = address,
-                .state = state,
-                .buffer = undefined,
-            };
+            conn.* = Connection.init(stream, address, state);
             try self.connections.append(conn);
             return conn;
         }
