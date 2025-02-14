@@ -57,6 +57,18 @@ pub fn build(b: *std.Build) void {
     const server_run_step = b.step("example-server", "Run the vigilant server example");
     server_run_step.dependOn(&server_run_cmd.step);
 
+    // Add Python test server command
+    const test_server_cmd = b.addSystemCommand(&.{
+        "python3",
+        "examples/vigilant_server/test_server.py",
+    });
+
+    const test_server_step = b.step(
+        "test-server",
+        "Run the vigilant server Python test script",
+    );
+    test_server_step.dependOn(&test_server_cmd.step);
+
     // Add tests
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/vigil.zig"),
