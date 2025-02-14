@@ -6,6 +6,51 @@ const posix = std.posix;
 // Add at the top with other constants
 const MAX_CONNECTIONS = 1000;
 
+const ServerMetrics = struct {
+    total_connections: std.atomic.Value(usize),
+    active_connections: std.atomic.Value(usize),
+    peak_connections: std.atomic.Value(usize),
+    total_bytes_received: std.atomic.Value(usize),
+    total_bytes_sent: std.atomic.Value(usize),
+    start_time: i64,
+
+    pub fn init() ServerMetrics {
+        return .{
+            .total_connections = std.atomic.Value(usize).init(0),
+            .active_connections = std.atomic.Value(usize).init(0),
+            .peak_connections = std.atomic.Value(usize).init(0),
+            .total_bytes_received = std.atomic.Value(usize).init(0),
+            .total_bytes_sent = std.atomic.Value(usize).init(0),
+            .start_time = std.time.timestamp(),
+        };
+    }
+
+    pub fn incrementConnections(self: *ServerMetrics) void {
+        _ = self.total_connections.fetchAdd(1, .monotonic);
+        const active = self.active_connections.fetchAdd(1, .monotonic);
+
+        var current_peak = self.peak_connections.load(.monotonic);
+        while (active + 1 > current_peak) {
+            // Use @cmpxchgWeak instead of compareAndSwap
+            const swapped = @cmpxchgWeak(usize, &self.peak_connections.raw, current_peak, active + 1, .monotonic, .monotonic);
+            if (swapped) |_| break;
+            current_peak = self.peak_connections.load(.monotonic);
+        }
+    }
+
+    pub fn decrementConnections(self: *ServerMetrics) void {
+        _ = self.active_connections.fetchSub(1, .monotonic);
+    }
+
+    pub fn addBytesReceived(self: *ServerMetrics, bytes: usize) void {
+        _ = self.total_bytes_received.fetchAdd(bytes, .monotonic);
+    }
+
+    pub fn addBytesSent(self: *ServerMetrics, bytes: usize) void {
+        _ = self.total_bytes_sent.fetchAdd(bytes, .monotonic);
+    }
+};
+
 // Server state to track connections and configuration
 const ServerState = struct {
     port: u16,
@@ -16,6 +61,7 @@ const ServerState = struct {
     is_shutting_down: std.atomic.Value(bool),
     server: ?*net.Server,
     shutdown_trigger: std.Thread.ResetEvent,
+    metrics: ServerMetrics,
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, port: u16) !ServerState {
         return ServerState{
@@ -27,6 +73,7 @@ const ServerState = struct {
             .is_shutting_down = std.atomic.Value(bool).init(false),
             .server = null,
             .shutdown_trigger = .{},
+            .metrics = ServerMetrics.init(),
         };
     }
 
@@ -103,16 +150,38 @@ const Connection = struct {
                 const count = self.state.getActiveConnectionCount();
                 const response = try std.fmt.bufPrint(&self.buffer, "OK {d}\n", .{count});
                 _ = try self.stream.write(response[0..response.len]);
+                self.state.metrics.addBytesSent(response.len);
                 std.debug.print("📤 Sent status response\n", .{});
             } else if (std.mem.eql(u8, cmd, "HEALTHCHECK")) {
-                const response = "OK\n";
+                const uptime = std.time.timestamp() - self.state.metrics.start_time;
+                const response = try std.fmt.bufPrint(&self.buffer,
+                    \\OK
+                    \\uptime_seconds={d}
+                    \\total_connections={d}
+                    \\active_connections={d}
+                    \\peak_connections={d}
+                    \\bytes_received={d}
+                    \\bytes_sent={d}
+                    \\
+                , .{
+                    uptime,
+                    self.state.metrics.total_connections.load(.monotonic),
+                    self.state.metrics.active_connections.load(.monotonic),
+                    self.state.metrics.peak_connections.load(.monotonic),
+                    self.state.metrics.total_bytes_received.load(.monotonic),
+                    self.state.metrics.total_bytes_sent.load(.monotonic),
+                });
                 _ = try self.stream.write(response);
-                std.debug.print("🩺 Healthcheck responded\n", .{});
+                self.state.metrics.addBytesSent(response.len);
+                std.debug.print("🩺 Healthcheck responded with metrics\n", .{});
             } else {
                 std.debug.print("📥 Received {} bytes: '{s}'\n", .{ bytes_read, cmd });
                 _ = try self.stream.write(self.buffer[0..bytes_read]);
+                self.state.metrics.addBytesSent(bytes_read);
                 std.debug.print("📤 Echoed {} bytes\n", .{bytes_read});
             }
+
+            self.state.metrics.addBytesReceived(bytes_read);
         }
     }
 };
@@ -154,6 +223,7 @@ const ConnectionPool = struct {
         if (self.idle_connections.items.len > 0) {
             const conn = self.idle_connections.pop();
             conn.* = Connection.init(stream, address, state);
+            state.metrics.incrementConnections();
             return conn;
         }
 
@@ -162,6 +232,7 @@ const ConnectionPool = struct {
             const conn = try self.allocator.create(Connection);
             conn.* = Connection.init(stream, address, state);
             try self.connections.append(conn);
+            state.metrics.incrementConnections();
             return conn;
         }
 
@@ -179,7 +250,11 @@ const ConnectionPool = struct {
         connection.buffer = undefined;
 
         // Add to idle pool
+        // Reset connection state more thoroughly
+        connection.* = Connection.init(undefined, undefined, connection.state);
+
         try self.idle_connections.append(connection);
+        connection.state.metrics.decrementConnections();
     }
 };
 
@@ -398,3 +473,12 @@ pub fn main() !void {
 
     std.debug.print("👋 Server process exiting\n", .{});
 }
+
+pub const AtomicOrder = enum {
+    unordered,
+    monotonic,
+    acquire,
+    release,
+    acq_rel,
+    seq_cst,
+};

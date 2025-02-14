@@ -13,7 +13,8 @@ import resource
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
-TEST_ITERATIONS = 100000
+TEST_ITERATIONS = 1000000
+
 
 @dataclass
 class TestStats:
@@ -23,8 +24,37 @@ class TestStats:
     count: int
     std_dev: float
 
+@dataclass
+class ServerMetrics:
+    uptime_seconds: int
+    total_connections: int
+    active_connections: int
+    peak_connections: int
+    bytes_received: int
+    bytes_sent: int
+
+    @classmethod
+    def from_response(cls, response: str) -> 'ServerMetrics':
+        lines = response.strip().split('\n')
+        if lines[0] != "OK":
+            raise ValueError("Invalid metrics response")
+            
+        metrics = {}
+        for line in lines[1:]:
+            key, value = line.split('=')
+            metrics[key] = int(value)
+            
+        return cls(
+            uptime_seconds=metrics['uptime_seconds'],
+            total_connections=metrics['total_connections'],
+            active_connections=metrics['active_connections'],
+            peak_connections=metrics['peak_connections'],
+            bytes_received=metrics['bytes_received'],
+            bytes_sent=metrics['bytes_sent']
+        )
+
 class ServerTester:
-    def __init__(self, host: str = '127.0.0.1', port: int = 8080, pool_size: int = 100):
+    def __init__(self, host: str = '127.0.0.1', port: int = 8080, pool_size: int = 1000):
         self.host = host
         self.port = port
         self.results: Dict[str, List[float]] = {}
@@ -84,12 +114,13 @@ class ServerTester:
         return (end - start) * 1000
 
     def __del__(self):
-        """Cleanup connections when the tester is destroyed"""
+        # Close all connections when tester is destroyed
         for sock in self.connection_pool:
             try:
                 sock.close()
             except:
                 pass
+        self.connection_pool.clear()
 
     def run_test(self, category: str, message: str, iterations: int = TEST_ITERATIONS):
         if category not in self.results:
@@ -120,10 +151,50 @@ class ServerTester:
             std_dev=statistics.stdev(times) if len(times) > 1 else 0
         )
 
+    def collect_metrics(self) -> ServerMetrics:
+        sock = self._get_connection()
+        if not sock:
+            raise ConnectionError("Could not get connection for metrics collection")
+            
+        try:
+            sock.sendall(b"HEALTHCHECK\n")
+            response = sock.recv(1024).decode()
+            self._return_connection(sock)
+            return ServerMetrics.from_response(response)
+        except (socket.timeout, ConnectionResetError, OSError) as e:
+            try:
+                sock.close()
+            except:
+                pass
+            raise ConnectionError(f"Failed to collect metrics: {e}")
+
     def run_all_tests(self, iterations: int = TEST_ITERATIONS):
+        print("\n=== Starting Server Tests ===\n")
+        
+        # Initial metrics
+        try:
+            initial_metrics = self.collect_metrics()
+            print("\nInitial Server Metrics:")
+            print(f"Active Connections: {initial_metrics.active_connections}")
+            print(f"Total Connections: {initial_metrics.total_connections}")
+            print(f"Peak Connections: {initial_metrics.peak_connections}\n")
+        except ConnectionError as e:
+            print(f"Failed to collect initial metrics: {e}\n")
+
         # Standard commands test
         for cmd in ["HEALTHCHECK", "STATUS"]:
             self.run_test(cmd, cmd, iterations)
+            
+            # Collect metrics after each major test
+            try:
+                metrics = self.collect_metrics()
+                print(f"\nMetrics after {cmd} test:")
+                print(f"Active Connections: {metrics.active_connections}")
+                print(f"Total Connections: {metrics.total_connections}")
+                print(f"Bytes Received: {metrics.bytes_received}")
+                print(f"Bytes Sent: {metrics.bytes_sent}\n")
+            except ConnectionError as e:
+                print(f"Failed to collect metrics after {cmd}: {e}\n")
 
         # Variable length test
         self.run_test("VARIABLE_LENGTH", "x" * 1000, iterations)
@@ -132,11 +203,10 @@ class ServerTester:
         json_msg = json.dumps({"test": "payload", "number": 123})
         self.run_test("JSON", json_msg, iterations)
 
-        # Random words test with different message for each iteration
+        # Random words test
         words = ["hello", "world", "test", "server", "network"]
         random_messages = [" ".join(random.choices(words, k=3)) for _ in range(iterations)]
         
-        # Create a custom test run for random words to use different message each time
         if "RANDOM_WORDS" not in self.results:
             self.results["RANDOM_WORDS"] = []
         print(f"Running RANDOM_WORDS test ({iterations} iterations)...")
@@ -147,6 +217,15 @@ class ServerTester:
         for i in range(iterations):
             if i % progress_interval == 0:
                 print(f"  Progress: {i}/{iterations} (Success rate: {successful}/{i if i > 0 else 1})")
+                # Collect metrics every 10% of the test
+                try:
+                    metrics = self.collect_metrics()
+                    print(f"\n  Current Metrics:")
+                    print(f"  Active Connections: {metrics.active_connections}")
+                    print(f"  Total Connections: {metrics.total_connections}")
+                    print(f"  Peak Connections: {metrics.peak_connections}\n")
+                except ConnectionError as e:
+                    print(f"  Failed to collect metrics: {e}\n")
             
             duration = self.send_request(random_messages[i])
             if duration != float('inf'):
@@ -154,6 +233,17 @@ class ServerTester:
                 successful += 1
             else:
                 time.sleep(0.01)  # Back off on failure
+
+        # Final metrics
+        try:
+            final_metrics = self.collect_metrics()
+            print("\nFinal Server Metrics:")
+            print(f"Total Connections: {final_metrics.total_connections}")
+            print(f"Peak Connections: {final_metrics.peak_connections}")
+            print(f"Total Bytes Received: {final_metrics.bytes_received}")
+            print(f"Total Bytes Sent: {final_metrics.bytes_sent}\n")
+        except ConnectionError as e:
+            print(f"Failed to collect final metrics: {e}\n")
 
     def print_results(self):
         print("\n=== TEST RESULTS ===")
