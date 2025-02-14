@@ -3,12 +3,17 @@ const vigil = @import("vigil");
 const net = std.net;
 const posix = std.posix;
 
+// Add at the top with other constants
+const MAX_CONNECTIONS = 1000;
+
 // Server state to track connections and configuration
 const ServerState = struct {
     port: u16,
     address: []const u8,
     connections: std.ArrayList(*Connection),
     allocator: std.mem.Allocator,
+    // Add a mutex to protect concurrent access to connections list
+    connections_mutex: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, port: u16) !ServerState {
         return ServerState{
@@ -16,10 +21,14 @@ const ServerState = struct {
             .address = address,
             .connections = std.ArrayList(*Connection).init(allocator),
             .allocator = allocator,
+            .connections_mutex = std.Thread.Mutex{},
         };
     }
 
     pub fn deinit(self: *ServerState) void {
+        self.connections_mutex.lock();
+        defer self.connections_mutex.unlock();
+
         for (self.connections.items) |conn| {
             conn.stream.close();
             self.allocator.destroy(conn);
@@ -36,17 +45,45 @@ const Connection = struct {
     buffer: [1024]u8 = undefined,
 
     pub fn handle(self: *Connection) !void {
+        // Store these values before we potentially free self
+        const addr = self.address;
+        var state = self.state;
+
+        defer {
+            // Lock the mutex while removing from connections list
+            state.connections_mutex.lock();
+            defer state.connections_mutex.unlock();
+
+            // First close the stream
+            self.stream.close();
+
+            // Then remove from connections list
+            for (state.connections.items, 0..) |conn, i| {
+                if (conn == self) {
+                    _ = state.connections.orderedRemove(i);
+                    // Destroy self after removing from list
+                    state.allocator.destroy(self);
+                    break;
+                }
+            }
+            std.debug.print("🚪 Connection closed from {}\n", .{addr});
+        }
+
         std.debug.print("👂 Waiting for data from {}\n", .{self.address});
         while (true) {
             const bytes_read = try self.stream.read(&self.buffer);
             if (bytes_read == 0) {
                 std.debug.print("📭 Zero bytes read, closing connection\n", .{});
-                break;
+                return;
             }
 
             const cmd = std.mem.trim(u8, self.buffer[0..bytes_read], "\r\n");
             if (std.mem.eql(u8, cmd, "STATUS")) {
-                const count = self.state.connections.items.len;
+                // Lock mutex while reading connection count
+                state.connections_mutex.lock();
+                const count = state.connections.items.len;
+                state.connections_mutex.unlock();
+
                 const response = try std.fmt.bufPrint(&self.buffer, "OK {d}\n", .{count});
                 _ = try self.stream.write(response[0..response.len]);
                 std.debug.print("📤 Sent status response\n", .{});
@@ -136,6 +173,17 @@ pub fn NetworkServer(comptime Config: type) type {
                         const conn = try l.accept();
                         std.debug.print("🔌 New connection from {}\n", .{conn.address});
 
+                        // Lock the mutex while checking and modifying connections
+                        s.connections_mutex.lock();
+                        defer s.connections_mutex.unlock();
+
+                        // Check if we've hit the connection limit
+                        if (s.connections.items.len >= MAX_CONNECTIONS) {
+                            std.debug.print("⚠️ Connection limit reached, rejecting connection from {}\n", .{conn.address});
+                            conn.stream.close();
+                            continue;
+                        }
+
                         const connection = try s.allocator.create(Connection);
                         connection.* = .{
                             .stream = conn.stream,
@@ -146,7 +194,6 @@ pub fn NetworkServer(comptime Config: type) type {
 
                         _ = try std.Thread.spawn(.{}, struct {
                             fn handle(c: *Connection) !void {
-                                defer std.debug.print("🚪 Connection closed from {}\n", .{c.address});
                                 try c.handle();
                             }
                         }.handle, .{connection});
@@ -162,7 +209,12 @@ pub fn NetworkServer(comptime Config: type) type {
         fn handleMessage(server: *vigil.GenServer(ServerState), msg: vigil.Message) !void {
             if (msg.payload) |payload| {
                 if (std.mem.eql(u8, payload, "status")) {
-                    const status = try std.fmt.allocPrint(server.state.allocator, "Active connections: {d}", .{server.state.connections.items.len});
+                    // Lock mutex while reading connection count
+                    server.state.connections_mutex.lock();
+                    const count = server.state.connections.items.len;
+                    server.state.connections_mutex.unlock();
+
+                    const status = try std.fmt.allocPrint(server.state.allocator, "Active connections: {d}", .{count});
                     defer server.state.allocator.free(status);
 
                     const response = try vigil.Message.init(

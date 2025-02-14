@@ -88,10 +88,28 @@ class ServerTester:
         json_msg = json.dumps({"test": "payload", "number": 123})
         self.run_test("JSON", json_msg, iterations)
 
-        # Random words test (run as a single batch instead of individual tests)
+        # Random words test with different message for each iteration
         words = ["hello", "world", "test", "server", "network"]
         random_messages = [" ".join(random.choices(words, k=3)) for _ in range(iterations)]
-        self.run_test("RANDOM_WORDS", random_messages[0], iterations)
+        
+        # Create a custom test run for random words to use different message each time
+        if "RANDOM_WORDS" not in self.results:
+            self.results["RANDOM_WORDS"] = []
+        print(f"Running RANDOM_WORDS test ({iterations} iterations)...")
+        
+        successful = 0
+        progress_interval = max(1, iterations // 10)
+        
+        for i in range(iterations):
+            if i % progress_interval == 0:
+                print(f"  Progress: {i}/{iterations} (Success rate: {successful}/{i if i > 0 else 1})")
+            
+            duration = self.send_request(random_messages[i])
+            if duration != float('inf'):
+                self.results["RANDOM_WORDS"].append(duration)
+                successful += 1
+            else:
+                time.sleep(0.01)  # Back off on failure
 
     def print_results(self):
         print("\n=== TEST RESULTS ===")
