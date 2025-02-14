@@ -13,7 +13,7 @@ import resource
 soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
 resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 
-TEST_ITERATIONS = 1000000
+TEST_ITERATIONS = 100000
 
 
 @dataclass

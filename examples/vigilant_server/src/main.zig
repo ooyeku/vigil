@@ -5,6 +5,8 @@ const posix = std.posix;
 
 // Add at the top with other constants
 const MAX_CONNECTIONS = 1000;
+const RATE_LIMIT_WINDOW_MS: i64 = 60_000; // 1 minute window
+const RATE_LIMIT_MAX_REQUESTS: usize = 10000000; // Max requests per window
 
 const ServerMetrics = struct {
     total_connections: std.atomic.Value(usize),
@@ -108,16 +110,41 @@ const Connection = struct {
     state: *ServerState,
     buffer: [1024]u8 = undefined,
     last_activity: i64,
+    request_count: usize,
+    window_start: i64,
     const TIMEOUT_MS: i64 = 30000; // 30 seconds timeout
 
     pub fn init(stream: net.Stream, address: net.Address, state: *ServerState) Connection {
+        const current_time = std.time.timestamp();
         return .{
             .stream = stream,
             .address = address,
             .state = state,
             .buffer = undefined,
-            .last_activity = @intCast(std.time.timestamp()),
+            .last_activity = current_time,
+            .request_count = 0,
+            .window_start = current_time,
         };
+    }
+
+    fn checkRateLimit(self: *Connection) !void {
+        const current_time = std.time.timestamp();
+        const window_elapsed = current_time - self.window_start;
+
+        if (window_elapsed >= RATE_LIMIT_WINDOW_MS / 1000) {
+            self.window_start = current_time;
+            self.request_count = 0;
+        }
+
+        if (self.request_count >= RATE_LIMIT_MAX_REQUESTS) {
+            std.debug.print("⚠️ Rate limit exceeded for {}\n", .{self.address});
+            const response = "ERROR: Rate limit exceeded. Please try again later.\n";
+            _ = try self.stream.write(response);
+            self.state.metrics.addBytesSent(response.len);
+            return error.RateLimitExceeded;
+        }
+
+        self.request_count += 1;
     }
 
     pub fn handle(self: *Connection) !void {
@@ -129,8 +156,8 @@ const Connection = struct {
                 return;
             }
 
-            // Check for timeout using timestamp and convert ms to seconds correctly
-            const current_time: i64 = @intCast(std.time.timestamp());
+            // Check for timeout using timestamp
+            const current_time: i64 = std.time.timestamp();
             if (current_time - self.last_activity > TIMEOUT_MS / 1000) {
                 std.debug.print("⏰ Connection timeout from {}\n", .{self.address});
                 return error.ConnectionTimeout;
@@ -141,6 +168,9 @@ const Connection = struct {
                 std.debug.print("📭 Zero bytes read, closing connection\n", .{});
                 return;
             }
+
+            // Check rate limit before processing request
+            try self.checkRateLimit();
 
             // Update last activity time on successful read
             self.last_activity = std.time.timestamp();
