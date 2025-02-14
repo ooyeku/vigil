@@ -10,30 +10,28 @@ const MAX_CONNECTIONS = 1000;
 const ServerState = struct {
     port: u16,
     address: []const u8,
-    connections: std.ArrayList(*Connection),
+    pool: ConnectionPool,
     allocator: std.mem.Allocator,
-    // Add a mutex to protect concurrent access to connections list
     connections_mutex: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, port: u16) !ServerState {
         return ServerState{
             .port = port,
             .address = address,
-            .connections = std.ArrayList(*Connection).init(allocator),
+            .pool = ConnectionPool.init(allocator, MAX_CONNECTIONS),
             .allocator = allocator,
-            .connections_mutex = std.Thread.Mutex{},
+            .connections_mutex = .{},
         };
     }
 
     pub fn deinit(self: *ServerState) void {
-        self.connections_mutex.lock();
-        defer self.connections_mutex.unlock();
+        self.pool.deinit();
+    }
 
-        for (self.connections.items) |conn| {
-            conn.stream.close();
-            self.allocator.destroy(conn);
-        }
-        self.connections.deinit();
+    pub fn getActiveConnectionCount(self: *ServerState) usize {
+        self.pool.mutex.lock();
+        defer self.pool.mutex.unlock();
+        return self.pool.connections.items.len - self.pool.idle_connections.items.len;
     }
 };
 
@@ -45,30 +43,6 @@ const Connection = struct {
     buffer: [1024]u8 = undefined,
 
     pub fn handle(self: *Connection) !void {
-        // Store these values before we potentially free self
-        const addr = self.address;
-        var state = self.state;
-
-        defer {
-            // Lock the mutex while removing from connections list
-            state.connections_mutex.lock();
-            defer state.connections_mutex.unlock();
-
-            // First close the stream
-            self.stream.close();
-
-            // Then remove from connections list
-            for (state.connections.items, 0..) |conn, i| {
-                if (conn == self) {
-                    _ = state.connections.orderedRemove(i);
-                    // Destroy self after removing from list
-                    state.allocator.destroy(self);
-                    break;
-                }
-            }
-            std.debug.print("🚪 Connection closed from {}\n", .{addr});
-        }
-
         std.debug.print("👂 Waiting for data from {}\n", .{self.address});
         while (true) {
             const bytes_read = try self.stream.read(&self.buffer);
@@ -79,11 +53,7 @@ const Connection = struct {
 
             const cmd = std.mem.trim(u8, self.buffer[0..bytes_read], "\r\n");
             if (std.mem.eql(u8, cmd, "STATUS")) {
-                // Lock mutex while reading connection count
-                state.connections_mutex.lock();
-                const count = state.connections.items.len;
-                state.connections_mutex.unlock();
-
+                const count = self.state.getActiveConnectionCount();
                 const response = try std.fmt.bufPrint(&self.buffer, "OK {d}\n", .{count});
                 _ = try self.stream.write(response[0..response.len]);
                 std.debug.print("📤 Sent status response\n", .{});
@@ -97,6 +67,78 @@ const Connection = struct {
                 std.debug.print("📤 Echoed {} bytes\n", .{bytes_read});
             }
         }
+    }
+};
+
+const ConnectionPool = struct {
+    connections: std.ArrayList(*Connection),
+    idle_connections: std.ArrayList(*Connection),
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex,
+    max_pool_size: usize,
+
+    pub fn init(allocator: std.mem.Allocator, max_size: usize) ConnectionPool {
+        return .{
+            .connections = std.ArrayList(*Connection).init(allocator),
+            .idle_connections = std.ArrayList(*Connection).init(allocator),
+            .allocator = allocator,
+            .mutex = .{},
+            .max_pool_size = max_size,
+        };
+    }
+
+    pub fn deinit(self: *ConnectionPool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.connections.items) |conn| {
+            conn.stream.close();
+            self.allocator.destroy(conn);
+        }
+        self.connections.deinit();
+        self.idle_connections.deinit();
+    }
+
+    pub fn acquire(self: *ConnectionPool, stream: net.Stream, address: net.Address, state: *ServerState) !*Connection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Try to reuse an idle connection
+        if (self.idle_connections.items.len > 0) {
+            const conn = self.idle_connections.pop();
+            conn.stream = stream;
+            conn.address = address;
+            return conn;
+        }
+
+        // Create new connection if pool isn't full
+        if (self.connections.items.len < self.max_pool_size) {
+            const conn = try self.allocator.create(Connection);
+            conn.* = .{
+                .stream = stream,
+                .address = address,
+                .state = state,
+                .buffer = undefined,
+            };
+            try self.connections.append(conn);
+            return conn;
+        }
+
+        return error.PoolExhausted;
+    }
+
+    pub fn release(self: *ConnectionPool, connection: *Connection) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Safely close the stream first
+        connection.stream.close();
+
+        // Only reset fields that are safe to reset
+        connection.buffer = undefined;
+
+        // Add to idle pool
+        try self.idle_connections.append(connection);
     }
 };
 
@@ -170,33 +212,35 @@ pub fn NetworkServer(comptime Config: type) type {
                     std.debug.print("✅ Server ready on {s}:{d}\n", .{ s.address, s.port });
 
                     while (true) {
-                        const conn = try l.accept();
-                        std.debug.print("🔌 New connection from {}\n", .{conn.address});
-
-                        // Lock the mutex while checking and modifying connections
-                        s.connections_mutex.lock();
-                        defer s.connections_mutex.unlock();
-
-                        // Check if we've hit the connection limit
-                        if (s.connections.items.len >= MAX_CONNECTIONS) {
-                            std.debug.print("⚠️ Connection limit reached, rejecting connection from {}\n", .{conn.address});
-                            conn.stream.close();
-                            continue;
-                        }
-
-                        const connection = try s.allocator.create(Connection);
-                        connection.* = .{
-                            .stream = conn.stream,
-                            .address = conn.address,
-                            .state = s,
+                        const conn = l.accept() catch |err| switch (err) {
+                            error.ProcessFdQuotaExceeded => {
+                                std.debug.print("⚠️ FD limit reached, waiting...\n", .{});
+                                std.time.sleep(100 * std.time.ns_per_ms);
+                                continue;
+                            },
+                            else => return err,
                         };
-                        try s.connections.append(connection);
+
+                        const connection = s.pool.acquire(conn.stream, conn.address, s) catch |err| {
+                            conn.stream.close();
+                            if (err == error.PoolExhausted) {
+                                std.debug.print("⚠️ Pool full, rejecting connection\n", .{});
+                                // Add backpressure delay
+                                std.time.sleep(10 * std.time.ns_per_ms);
+                            }
+                            continue;
+                        };
 
                         _ = try std.Thread.spawn(.{}, struct {
-                            fn handle(c: *Connection) !void {
+                            fn handler(c: *Connection, state_ref: *ServerState) !void {
+                                const addr = c.address; // Capture address before potential close
+                                defer {
+                                    state_ref.pool.release(c) catch {};
+                                    std.debug.print("🚪 Connection closed from {}\n", .{addr});
+                                }
                                 try c.handle();
                             }
-                        }.handle, .{connection});
+                        }.handler, .{ connection, s });
                     }
                 }
             }.accept, .{ stream_server, state });
@@ -209,11 +253,7 @@ pub fn NetworkServer(comptime Config: type) type {
         fn handleMessage(server: *vigil.GenServer(ServerState), msg: vigil.Message) !void {
             if (msg.payload) |payload| {
                 if (std.mem.eql(u8, payload, "status")) {
-                    // Lock mutex while reading connection count
-                    server.state.connections_mutex.lock();
-                    const count = server.state.connections.items.len;
-                    server.state.connections_mutex.unlock();
-
+                    const count = server.state.getActiveConnectionCount();
                     const status = try std.fmt.allocPrint(server.state.allocator, "Active connections: {d}", .{count});
                     defer server.state.allocator.free(status);
 
@@ -224,7 +264,7 @@ pub fn NetworkServer(comptime Config: type) type {
                         status,
                         .info,
                         .normal,
-                        5000,
+                        50000,
                     );
                     try server.cast(response);
                 }
