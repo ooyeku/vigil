@@ -39,6 +39,24 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the example");
     run_step.dependOn(&run_cmd.step);
 
+    // Add vigilant server example
+    const server_exe = b.addExecutable(.{
+        .name = "vigilant-server",
+        .root_source_file = b.path("examples/vigilant_server/src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_exe.root_module.addImport("vigil", b.modules.get("vigil_lib").?);
+    b.installArtifact(server_exe);
+
+    const server_run_cmd = b.addRunArtifact(server_exe);
+    server_run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        server_run_cmd.addArgs(args);
+    }
+    const server_run_step = b.step("example-server", "Run the vigilant server example");
+    server_run_step.dependOn(&server_run_cmd.step);
+
     // Add tests
     const lib_unit_tests = b.addTest(.{
         .root_source_file = b.path("src/vigil.zig"),
