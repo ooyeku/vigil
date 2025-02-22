@@ -175,36 +175,30 @@ pub fn GenServer(comptime StateType: type) type {
 }
 
 test "GenServer initialization" {
-    const allocator = testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const State = struct { count: u32 };
-    const ServerType = GenServer(State);
+    const TestState = struct {
+        counter: u32 = 0,
+    };
 
-    const state = State{ .count = 0 };
-
-    const server = try ServerType.init(
+    const server = try GenServer(TestState).init(
         allocator,
         struct {
-            fn handle(self: *ServerType, msg: vigil.Message) !void {
-                _ = self;
-                _ = msg;
-            }
+            fn handle(_: *GenServer(TestState), _: vigil.Message) !void {}
         }.handle,
         struct {
-            fn init(self: *ServerType) !void {
-                _ = self;
-            }
+            fn init(_: *GenServer(TestState)) !void {}
         }.init,
         struct {
-            fn terminate(self: *ServerType) void {
-                _ = self;
-            }
+            fn terminate(_: *GenServer(TestState)) void {}
         }.terminate,
-        state,
+        .{ .counter = 0 },
     );
     defer server.stop();
 
-    try testing.expect(server.mailbox != undefined);
+    // Check if the mailbox is properly initialized by verifying it's a valid pointer
+    try testing.expect(@intFromPtr(server.mailbox) != 0);
+    try testing.expect(server.state.counter == 0);
 }
 
 test "GenServer message handling" {

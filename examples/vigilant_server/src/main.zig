@@ -66,10 +66,10 @@ const ServerState = struct {
     metrics: ServerMetrics,
 
     pub fn init(allocator: std.mem.Allocator, address: []const u8, port: u16) !ServerState {
-        return ServerState{
+        var self = ServerState{
             .port = port,
             .address = address,
-            .pool = ConnectionPool.init(allocator, MAX_CONNECTIONS),
+            .pool = undefined, // Temporarily undefined
             .allocator = allocator,
             .connections_mutex = .{},
             .is_shutting_down = std.atomic.Value(bool).init(false),
@@ -77,6 +77,8 @@ const ServerState = struct {
             .shutdown_trigger = .{},
             .metrics = ServerMetrics.init(),
         };
+        self.pool = ConnectionPool.init(allocator, MAX_CONNECTIONS, &self);
+        return self;
     }
 
     pub fn deinit(self: *ServerState) void {
@@ -120,7 +122,7 @@ const Connection = struct {
             .stream = stream,
             .address = address,
             .state = state,
-            .buffer = undefined,
+            .buffer = [_]u8{0} ** 1024, // Initialize buffer with zeros
             .last_activity = current_time,
             .request_count = 0,
             .window_start = current_time,
@@ -148,22 +150,51 @@ const Connection = struct {
     }
 
     pub fn handle(self: *Connection) !void {
-        std.debug.print("👂 Waiting for data from {}\n", .{self.address});
+        var buf: [100]u8 = undefined;
+        const addr_str = switch (self.address.any.family) {
+            posix.AF.INET => |_| blk: {
+                const ip4 = self.address.in;
+                const octets = @as([4]u8, @bitCast(ip4.sa.addr));
+                break :blk try std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}:{d}", .{
+                    octets[0],              octets[1], octets[2], octets[3],
+                    self.address.getPort(),
+                });
+            },
+            posix.AF.INET6 => |_| blk: {
+                const ip6 = self.address.in6;
+                break :blk try std.fmt.bufPrint(&buf, "[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]:{d}", .{
+                    ip6.sa.addr[0],         ip6.sa.addr[1], ip6.sa.addr[2], ip6.sa.addr[3],
+                    ip6.sa.addr[4],         ip6.sa.addr[5], ip6.sa.addr[6], ip6.sa.addr[7],
+                    self.address.getPort(),
+                });
+            },
+            else => "unknown",
+        };
+
+        std.debug.print("👂 Waiting for data from {s}\n", .{addr_str});
+
         while (true) {
             // Check shutdown flag before accepting new requests
             if (self.state.is_shutting_down.load(.acquire)) {
-                std.debug.print("🛑 Server is shutting down, no new requests accepted from {}\n", .{self.address});
+                std.debug.print("🛑 Server is shutting down, no new requests accepted from {s}\n", .{addr_str});
                 return;
             }
 
             // Check for timeout using timestamp
             const current_time: i64 = std.time.timestamp();
             if (current_time - self.last_activity > TIMEOUT_MS / 1000) {
-                std.debug.print("⏰ Connection timeout from {}\n", .{self.address});
+                std.debug.print("⏰ Connection timeout from {s}\n", .{addr_str});
                 return error.ConnectionTimeout;
             }
 
-            const bytes_read = try self.stream.read(&self.buffer);
+            const bytes_read = self.stream.read(&self.buffer) catch |err| switch (err) {
+                error.ConnectionResetByPeer => {
+                    std.debug.print("📫 Connection reset by peer\n", .{});
+                    return;
+                },
+                else => return err,
+            };
+
             if (bytes_read == 0) {
                 std.debug.print("📭 Zero bytes read, closing connection\n", .{});
                 return;
@@ -222,14 +253,16 @@ const ConnectionPool = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     max_pool_size: usize,
+    state: *ServerState,
 
-    pub fn init(allocator: std.mem.Allocator, max_size: usize) ConnectionPool {
+    pub fn init(allocator: std.mem.Allocator, max_size: usize, server_state: *ServerState) ConnectionPool {
         return .{
             .connections = std.ArrayList(*Connection).init(allocator),
             .idle_connections = std.ArrayList(*Connection).init(allocator),
             .allocator = allocator,
             .mutex = .{},
             .max_pool_size = max_size,
+            .state = server_state,
         };
     }
 
@@ -245,24 +278,32 @@ const ConnectionPool = struct {
         self.idle_connections.deinit();
     }
 
-    pub fn acquire(self: *ConnectionPool, stream: net.Stream, address: net.Address, state: *ServerState) !*Connection {
+    pub fn acquire(self: *ConnectionPool) !*Connection {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Try to reuse an idle connection
+        // Try to get an idle connection first
         if (self.idle_connections.items.len > 0) {
-            const conn = self.idle_connections.pop();
-            conn.* = Connection.init(stream, address, state);
-            state.metrics.incrementConnections();
+            const conn = self.idle_connections.items[self.idle_connections.items.len - 1];
+            _ = self.idle_connections.pop();
+            // Initialize the connection with new stream and address
+            conn.stream = undefined;
+            conn.address = undefined;
             return conn;
         }
 
-        // Create new connection if pool isn't full
+        // Create new connection if under limit
         if (self.connections.items.len < self.max_pool_size) {
             const conn = try self.allocator.create(Connection);
-            conn.* = Connection.init(stream, address, state);
+            errdefer self.allocator.destroy(conn);
+
+            // Initialize without dereferencing
+            conn.stream = undefined;
+            conn.address = undefined;
+            conn.state = self.state;
+            conn.buffer = undefined;
+
             try self.connections.append(conn);
-            state.metrics.incrementConnections();
             return conn;
         }
 
@@ -276,12 +317,11 @@ const ConnectionPool = struct {
         // Safely close the stream first
         connection.stream.close();
 
-        // Only reset fields that are safe to reset
-        connection.buffer = undefined;
-
-        // Add to idle pool
-        // Reset connection state more thoroughly
-        connection.* = Connection.init(undefined, undefined, connection.state);
+        // Reset connection state
+        connection.buffer = [_]u8{0} ** 1024;
+        connection.last_activity = 0;
+        connection.request_count = 0;
+        connection.window_start = 0;
 
         try self.idle_connections.append(connection);
         connection.state.metrics.decrementConnections();
@@ -371,22 +411,45 @@ pub fn NetworkServer(comptime Config: type) type {
                             },
                         };
 
-                        const connection = s.pool.acquire(conn.stream, conn.address, s) catch |err| {
+                        const connection = s.pool.acquire() catch |err| {
                             conn.stream.close();
                             if (err == error.PoolExhausted) {
                                 std.debug.print("⚠️ Pool full, rejecting connection\n", .{});
-                                // Add backpressure delay
                                 std.time.sleep(10 * std.time.ns_per_ms);
                             }
                             continue;
                         };
 
+                        // Initialize the connection properly
+                        connection.* = Connection.init(conn.stream, conn.address, s);
+                        s.metrics.incrementConnections();
+
                         _ = try std.Thread.spawn(.{}, struct {
                             fn handler(c: *Connection, state_ref: *ServerState) !void {
-                                const addr = c.address; // Capture address before potential close
+                                var buf: [100]u8 = undefined;
+                                const addr_str = switch (c.address.any.family) {
+                                    posix.AF.INET => |_| blk: {
+                                        const ip4 = c.address.in;
+                                        const octets = @as([4]u8, @bitCast(ip4.sa.addr));
+                                        break :blk try std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}:{d}", .{
+                                            octets[0],           octets[1], octets[2], octets[3],
+                                            c.address.getPort(),
+                                        });
+                                    },
+                                    posix.AF.INET6 => |_| blk: {
+                                        const ip6 = c.address.in6;
+                                        break :blk try std.fmt.bufPrint(&buf, "[{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}]:{d}", .{
+                                            ip6.sa.addr[0],      ip6.sa.addr[1], ip6.sa.addr[2], ip6.sa.addr[3],
+                                            ip6.sa.addr[4],      ip6.sa.addr[5], ip6.sa.addr[6], ip6.sa.addr[7],
+                                            c.address.getPort(),
+                                        });
+                                    },
+                                    else => "unknown",
+                                };
+
                                 defer {
                                     state_ref.pool.release(c) catch {};
-                                    std.debug.print("🚪 Connection closed from {}\n", .{addr});
+                                    std.debug.print("🚪 Connection closed from {s}\n", .{addr_str});
                                 }
                                 try c.handle();
                             }
@@ -463,23 +526,7 @@ pub fn main() !void {
     const server = try NetworkServer(ServerConfig).init(allocator, config);
     try server.server.start();
 
-    const handler = struct {
-        fn handle(sig: c_int) callconv(.C) void {
-            _ = sig;
-            sig_received.store(true, .release);
-            std.debug.print("\n🛑 Received interrupt signal (Ctrl-C)...\n", .{});
-        }
-    }.handle;
-
-    try std.posix.sigaction(
-        std.posix.SIG.INT,
-        &std.posix.Sigaction{
-            .handler = .{ .handler = handler },
-            .mask = std.posix.empty_sigset,
-            .flags = 0,
-        },
-        null,
-    );
+    try setupSignalHandler();
 
     std.debug.print("🏁 Server started at {s}:{d}\n", .{ config.address, config.port });
     std.debug.print("⏳ Press Ctrl+C to initiate graceful shutdown...\n", .{});
@@ -502,6 +549,23 @@ pub fn main() !void {
     }
 
     std.debug.print("👋 Server process exiting\n", .{});
+}
+
+fn setupSignalHandler() !void {
+    const sigaction = std.posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.posix.empty_sigset,
+        .flags = 0,
+    };
+
+    // In Zig 0.14.0, sigaction returns void, so we don't need try
+    std.posix.sigaction(std.posix.SIG.INT, &sigaction, null);
+    std.posix.sigaction(std.posix.SIG.TERM, &sigaction, null);
+}
+
+fn handleSignal(sig: c_int) callconv(.C) void {
+    _ = sig;
+    sig_received.store(true, .release);
 }
 
 pub const AtomicOrder = enum {
