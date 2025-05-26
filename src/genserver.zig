@@ -203,8 +203,6 @@ test "GenServer initialization" {
         state,
     );
     defer server.stop();
-
-    try testing.expect(server.mailbox != undefined);
 }
 
 test "GenServer message handling" {

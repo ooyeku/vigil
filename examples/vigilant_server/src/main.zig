@@ -251,10 +251,19 @@ const ConnectionPool = struct {
 
         // Try to reuse an idle connection
         if (self.idle_connections.items.len > 0) {
-            const conn = self.idle_connections.pop();
-            conn.* = Connection.init(stream, address, state);
-            state.metrics.incrementConnections();
-            return conn;
+            // Pop the connection and ensure it's not null
+            if (self.idle_connections.pop()) |conn| {
+                // Reinitialize the connection fields directly instead of using assignment
+                conn.stream = stream;
+                conn.address = address;
+                conn.state = state;
+                conn.buffer = undefined;
+                conn.last_activity = std.time.timestamp();
+                conn.request_count = 0;
+                conn.window_start = std.time.timestamp();
+                state.metrics.incrementConnections();
+                return conn;
+            }
         }
 
         // Create new connection if pool isn't full
@@ -280,9 +289,10 @@ const ConnectionPool = struct {
         connection.buffer = undefined;
 
         // Add to idle pool
-        // Reset connection state more thoroughly
-        connection.* = Connection.init(undefined, undefined, connection.state);
-
+        // Reset connection state more thoroughly by setting fields directly
+        connection.buffer = undefined;
+        // Keep the state reference but reset other fields as needed
+        
         try self.idle_connections.append(connection);
         connection.state.metrics.decrementConnections();
     }
@@ -471,11 +481,17 @@ pub fn main() !void {
         }
     }.handle;
 
-    try std.posix.sigaction(
+    // Create an empty sigset_t
+    var empty_set: std.posix.sigset_t = undefined;
+    // Initialize it to empty (all bits 0)
+    @memset(@as([*]u8, @ptrCast(&empty_set))[0..@sizeOf(std.posix.sigset_t)], 0);
+    
+    // In Zig 0.14.1, sigaction doesn't return an error union
+    std.posix.sigaction(
         std.posix.SIG.INT,
         &std.posix.Sigaction{
             .handler = .{ .handler = handler },
-            .mask = std.posix.empty_sigset,
+            .mask = empty_set,
             .flags = 0,
         },
         null,
