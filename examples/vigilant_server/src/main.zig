@@ -97,7 +97,7 @@ const ServerState = struct {
         while (true) {
             const active_count = self.getActiveConnectionCount();
             if (active_count == 0) break;
-            std.debug.print("⏳ Waiting for {d} active connections to finish...\n", .{active_count});
+            std.debug.print("Waiting for {d} active connections to finish...\n", .{active_count});
             std.time.sleep(100 * std.time.ns_per_ms);
         }
     }
@@ -137,7 +137,7 @@ const Connection = struct {
         }
 
         if (self.request_count >= RATE_LIMIT_MAX_REQUESTS) {
-            std.debug.print("⚠️ Rate limit exceeded for {}\n", .{self.address});
+            std.debug.print("WARNING: Rate limit exceeded for {}\n", .{self.address});
             const response = "ERROR: Rate limit exceeded. Please try again later.\n";
             _ = try self.stream.write(response);
             self.state.metrics.addBytesSent(response.len);
@@ -148,24 +148,24 @@ const Connection = struct {
     }
 
     pub fn handle(self: *Connection) !void {
-        std.debug.print("👂 Waiting for data from {}\n", .{self.address});
+        std.debug.print("Waiting for data from {}\n", .{self.address});
         while (true) {
             // Check shutdown flag before accepting new requests
             if (self.state.is_shutting_down.load(.acquire)) {
-                std.debug.print("🛑 Server is shutting down, no new requests accepted from {}\n", .{self.address});
+                std.debug.print("Server is shutting down, no new requests accepted from {}\n", .{self.address});
                 return;
             }
 
             // Check for timeout using timestamp
             const current_time: i64 = std.time.timestamp();
             if (current_time - self.last_activity > TIMEOUT_MS / 1000) {
-                std.debug.print("⏰ Connection timeout from {}\n", .{self.address});
+                std.debug.print("Connection timeout from {}\n", .{self.address});
                 return error.ConnectionTimeout;
             }
 
             const bytes_read = try self.stream.read(&self.buffer);
             if (bytes_read == 0) {
-                std.debug.print("📭 Zero bytes read, closing connection\n", .{});
+                std.debug.print("Zero bytes read, closing connection\n", .{});
                 return;
             }
 
@@ -181,7 +181,7 @@ const Connection = struct {
                 const response = try std.fmt.bufPrint(&self.buffer, "OK {d}\n", .{count});
                 _ = try self.stream.write(response[0..response.len]);
                 self.state.metrics.addBytesSent(response.len);
-                std.debug.print("📤 Sent status response\n", .{});
+                std.debug.print("Sent status response\n", .{});
             } else if (std.mem.eql(u8, cmd, "HEALTHCHECK")) {
                 const uptime = std.time.timestamp() - self.state.metrics.start_time;
                 const response = try std.fmt.bufPrint(&self.buffer,
@@ -203,12 +203,12 @@ const Connection = struct {
                 });
                 _ = try self.stream.write(response);
                 self.state.metrics.addBytesSent(response.len);
-                std.debug.print("🩺 Healthcheck responded with metrics\n", .{});
+                std.debug.print("Healthcheck responded with metrics\n", .{});
             } else {
-                std.debug.print("📥 Received {} bytes: '{s}'\n", .{ bytes_read, cmd });
+                std.debug.print("Received {} bytes: '{s}'\n", .{ bytes_read, cmd });
                 _ = try self.stream.write(self.buffer[0..bytes_read]);
                 self.state.metrics.addBytesSent(bytes_read);
-                std.debug.print("📤 Echoed {} bytes\n", .{bytes_read});
+                std.debug.print("Echoed {} bytes\n", .{bytes_read});
             }
 
             self.state.metrics.addBytesReceived(bytes_read);
@@ -326,7 +326,7 @@ pub fn NetworkServer(comptime Config: type) type {
 
             // Create TCP server using correct 0.13.0 API
             const address = try net.Address.parseIp(state.address, state.port);
-            std.debug.print("🚀 Starting server on {s}:{d}\n", .{ state.address, state.port });
+            std.debug.print("Starting server on {s}:{d}\n", .{ state.address, state.port });
 
             // Initialize socket with proper flags
             const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
@@ -343,11 +343,11 @@ pub fn NetworkServer(comptime Config: type) type {
 
             // Bind the socket
             try posix.bind(fd, &address.any, address.getOsSockLen());
-            std.debug.print("🔒 Socket bound successfully\n", .{});
+            std.debug.print("Socket bound successfully\n", .{});
 
             // Start listening
             try posix.listen(fd, 128);
-            std.debug.print("👂 Listening for connections...\n", .{});
+            std.debug.print("Listening for connections...\n", .{});
 
             // Create heap-allocated server that outlives this function
             const stream_server = try state.allocator.create(net.Server);
@@ -364,14 +364,14 @@ pub fn NetworkServer(comptime Config: type) type {
             _ = try std.Thread.spawn(.{}, struct {
                 fn accept(l: *net.Server, s: *ServerState) !void {
                     defer {
-                        std.debug.print("🛑 Stopping server on {s}:{d}\n", .{ s.address, s.port });
+                        std.debug.print("Stopping server on {s}:{d}\n", .{ s.address, s.port });
                         s.allocator.destroy(l);
                     }
 
                     while (!s.is_shutting_down.load(.acquire)) { // Check shutdown flag in accept loop
                         const conn = l.accept() catch |err| switch (err) {
                             error.ProcessFdQuotaExceeded => {
-                                std.debug.print("⚠️ FD limit reached, waiting...\n", .{});
+                                std.debug.print("WARNING: FD limit reached, waiting...\n", .{});
                                 std.time.sleep(100 * std.time.ns_per_ms);
                                 continue;
                             },
@@ -384,7 +384,7 @@ pub fn NetworkServer(comptime Config: type) type {
                         const connection = s.pool.acquire(conn.stream, conn.address, s) catch |err| {
                             conn.stream.close();
                             if (err == error.PoolExhausted) {
-                                std.debug.print("⚠️ Pool full, rejecting connection\n", .{});
+                                std.debug.print("WARNING: Pool full, rejecting connection\n", .{});
                                 // Add backpressure delay
                                 std.time.sleep(10 * std.time.ns_per_ms);
                             }
@@ -396,20 +396,20 @@ pub fn NetworkServer(comptime Config: type) type {
                                 const addr = c.address; // Capture address before potential close
                                 defer {
                                     state_ref.pool.release(c) catch {};
-                                    std.debug.print("🚪 Connection closed from {}\n", .{addr});
+                                    std.debug.print("Connection closed from {}\n", .{addr});
                                 }
                                 try c.handle();
                             }
                         }.handler, .{ connection, s });
                     }
-                    std.debug.print("🔌 Accept loop exiting...\n", .{});
+                    std.debug.print("Accept loop exiting...\n", .{});
                 }
             }.accept, .{ stream_server, state });
         }
 
         fn stopServer(server: *vigil.GenServer(ServerState)) void {
             const state = &server.state;
-            std.debug.print("🛑 Initiating graceful shutdown...\n", .{});
+            std.debug.print("Initiating graceful shutdown...\n", .{});
 
             // Set shutdown flag first
             state.is_shutting_down.store(true, .release);
@@ -422,7 +422,7 @@ pub fn NetworkServer(comptime Config: type) type {
             // Wait for active connections to finish
             state.waitForActiveConnections();
 
-            std.debug.print("👋 All connections finished, cleaning up...\n", .{});
+            std.debug.print("All connections finished, cleaning up...\n", .{});
             state.deinit();
 
             // Signal completion
@@ -477,7 +477,7 @@ pub fn main() !void {
         fn handle(sig: c_int) callconv(.C) void {
             _ = sig;
             sig_received.store(true, .release);
-            std.debug.print("\n🛑 Received interrupt signal (Ctrl-C)...\n", .{});
+            std.debug.print("\nReceived interrupt signal (Ctrl-C)...\n", .{});
         }
     }.handle;
 
@@ -497,8 +497,8 @@ pub fn main() !void {
         null,
     );
 
-    std.debug.print("🏁 Server started at {s}:{d}\n", .{ config.address, config.port });
-    std.debug.print("⏳ Press Ctrl+C to initiate graceful shutdown...\n", .{});
+    std.debug.print("Server started at {s}:{d}\n", .{ config.address, config.port });
+    std.debug.print("Press Ctrl+C to initiate graceful shutdown...\n", .{});
 
     // Wait for signal
     while (!sig_received.load(.acquire)) {
@@ -506,18 +506,18 @@ pub fn main() !void {
     }
 
     // Initiate graceful shutdown
-    std.debug.print("🔄 Starting graceful shutdown sequence...\n", .{});
+    std.debug.print("Starting graceful shutdown sequence...\n", .{});
     server.server.terminate_fn(server.server);
 
     // Wait for shutdown with timeout
     const SHUTDOWN_WAIT_MS: u64 = 5000;
     if (server.server.state.shutdown_trigger.timedWait(SHUTDOWN_WAIT_MS * std.time.ns_per_ms)) {
-        std.debug.print("✅ Server shutdown completed successfully\n", .{});
+        std.debug.print("Server shutdown completed successfully\n", .{});
     } else |err| {
-        std.debug.print("⚠️ Server shutdown timed out: {any}\n", .{err});
+        std.debug.print("WARNING: Server shutdown timed out: {any}\n", .{err});
     }
 
-    std.debug.print("👋 Server process exiting\n", .{});
+    std.debug.print("Server process exiting\n", .{});
 }
 
 pub const AtomicOrder = enum {
