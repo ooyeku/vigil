@@ -251,7 +251,7 @@ const ConnectionPool = struct {
 
         // Try to reuse an idle connection
         if (self.idle_connections.items.len > 0) {
-            // Pop the connection and ensure it's not null
+            // Pop the connection safely
             if (self.idle_connections.pop()) |conn| {
                 // Reinitialize the connection fields directly instead of using assignment
                 conn.stream = stream;
@@ -292,7 +292,7 @@ const ConnectionPool = struct {
         // Reset connection state more thoroughly by setting fields directly
         connection.buffer = undefined;
         // Keep the state reference but reset other fields as needed
-        
+
         try self.idle_connections.append(connection);
         connection.state.metrics.decrementConnections();
     }
@@ -485,8 +485,8 @@ pub fn main() !void {
     var empty_set: std.posix.sigset_t = undefined;
     // Initialize it to empty (all bits 0)
     @memset(@as([*]u8, @ptrCast(&empty_set))[0..@sizeOf(std.posix.sigset_t)], 0);
-    
-    // In Zig 0.14.1, sigaction doesn't return an error union
+
+    // In Zig 0.14.1, sigaction returns void, not an error union
     std.posix.sigaction(
         std.posix.SIG.INT,
         &std.posix.Sigaction{
