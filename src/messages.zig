@@ -482,6 +482,7 @@ pub const ProcessMailbox = struct {
     mutex: Mutex, // Thread synchronization
     config: MailboxConfig, // Mailbox configuration
     stats: MailboxStats, // Usage statistics
+    allocator: Allocator, // Allocator for dynamic memory management
 
     /// Statistics for monitoring mailbox performance and usage
     pub const MailboxStats = struct {
@@ -496,25 +497,26 @@ pub const ProcessMailbox = struct {
     pub fn init(allocator: Allocator, config: MailboxConfig) ProcessMailbox {
         const priority_queues: ?[5]std.ArrayList(Message) = if (config.priority_queues)
             .{
-                std.ArrayList(Message).init(allocator), // critical
-                std.ArrayList(Message).init(allocator), // high
-                std.ArrayList(Message).init(allocator), // normal
-                std.ArrayList(Message).init(allocator), // low
-                std.ArrayList(Message).init(allocator), // batch
+                std.ArrayList(Message){}, // critical
+                std.ArrayList(Message){}, // high
+                std.ArrayList(Message){}, // normal
+                std.ArrayList(Message){}, // low
+                std.ArrayList(Message){}, // batch
             }
         else
             null;
 
         return .{
-            .messages = std.ArrayList(Message).init(allocator),
+            .messages = std.ArrayList(Message){},
             .priority_queues = priority_queues,
             .deadletter_queue = if (config.enable_deadletter)
-                std.ArrayList(Message).init(allocator)
+                std.ArrayList(Message){}
             else
                 null,
             .mutex = .{},
             .config = config,
             .stats = .{},
+            .allocator = allocator,
         };
     }
 
@@ -526,7 +528,7 @@ pub const ProcessMailbox = struct {
         for (self.messages.items) |*msg| {
             msg.deinit();
         }
-        self.messages.deinit();
+        self.messages.deinit(self.allocator);
 
         // Clean up priority queues if enabled
         if (self.priority_queues) |*queues| {
@@ -534,7 +536,7 @@ pub const ProcessMailbox = struct {
                 for (queue.items) |*msg| {
                     msg.deinit();
                 }
-                queue.deinit();
+                queue.deinit(self.allocator);
             }
         }
 
@@ -543,7 +545,7 @@ pub const ProcessMailbox = struct {
             for (queue.items) |*msg| {
                 msg.deinit();
             }
-            queue.deinit();
+            queue.deinit(self.allocator);
         }
     }
 
@@ -575,7 +577,7 @@ pub const ProcessMailbox = struct {
             if (queue.items.len >= self.config.capacity) {
                 // Try to move to deadletter queue if enabled
                 if (self.deadletter_queue) |*dlq| {
-                    dlq.append(msg_mut) catch |err| switch (err) {
+                    dlq.append(self.allocator, msg_mut) catch |err| switch (err) {
                         error.OutOfMemory => {
                             return MessageError.OutOfMemory;
                         },
@@ -587,7 +589,7 @@ pub const ProcessMailbox = struct {
                 return MessageError.MailboxFull;
             }
 
-            queue.append(msg_mut) catch |err| switch (err) {
+            queue.append(self.allocator, msg_mut) catch |err| switch (err) {
                 error.OutOfMemory => {
                     return MessageError.OutOfMemory;
                 },
@@ -599,7 +601,7 @@ pub const ProcessMailbox = struct {
                 return MessageError.MailboxFull;
             }
 
-            self.messages.append(msg_mut) catch |err| switch (err) {
+            self.messages.append(self.allocator, msg_mut) catch |err| switch (err) {
                 error.OutOfMemory => {
                     return MessageError.OutOfMemory;
                 },

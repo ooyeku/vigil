@@ -246,7 +246,7 @@ pub const SupervisorTree = struct {
                 .supervisor = main_supervisor,
                 .id = main_id,
             },
-            .children = std.ArrayList(SupervisorNode).init(allocator),
+            .children = std.ArrayList(SupervisorNode){},
             .config = config,
             .stats = .{},
             .mutex = .{},
@@ -265,7 +265,7 @@ pub const SupervisorTree = struct {
             child.supervisor.deinit();
             child.id.deinit();
         }
-        self.children.deinit();
+        self.children.deinit(self.allocator);
 
         // Cleanup main supervisor
         self.main.supervisor.deinit();
@@ -316,7 +316,7 @@ pub const SupervisorTree = struct {
         var id = try SupervisorId.init(self.allocator, name);
         errdefer id.deinit();
 
-        try self.children.append(.{
+        try self.children.append(self.allocator, .{
             .supervisor = supervisor,
             .id = id,
         });

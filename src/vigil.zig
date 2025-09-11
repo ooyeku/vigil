@@ -42,7 +42,6 @@ pub const SupervisorTreeMod = @import("sup_tree.zig");
 pub const WorkerMod = @import("worker.zig");
 pub const GenServerMod = @import("genserver.zig");
 
-
 // Core components
 pub const ProcessStats = ProcessMod.ProcessStats;
 pub const ProcessResult = ProcessMod.ProcessResult;
@@ -62,7 +61,6 @@ pub const SupervisorOptions = SupervisorMod.SupervisorOptions;
 pub const TreeConfig = SupervisorTreeMod.TreeConfig;
 pub const MailboxConfig = MessageMod.MailboxConfig;
 
-
 // Enums and error sets
 pub const ProcessError = ProcessMod.ProcessError;
 pub const ProcessState = ProcessMod.ProcessState;
@@ -75,8 +73,6 @@ pub const RestartStrategy = SupervisorMod.RestartStrategy;
 pub const MessagePriority = MessageMod.MessagePriority;
 pub const Signal = MessageMod.Signal;
 pub const MessageError = MessageMod.MessageError;
-
-
 
 /// Helper to convert between priority types
 fn convertPriority(msg_priority: MessagePriority) ProcessPriority {
@@ -222,7 +218,7 @@ pub fn createResponse(
 /// Default worker function that can be used as a starting point
 fn genericWorker() void {
     while (true) {
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 }
 

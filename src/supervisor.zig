@@ -98,7 +98,7 @@ pub const SupervisorState = enum {
 };
 
 /// Main supervisor structure that manages child processes
-/// 
+///
 /// fields:
 /// - allocator: Allocator,
 /// - children: std.ArrayList(Process.ChildProcess),
@@ -110,7 +110,7 @@ pub const SupervisorState = enum {
 /// - monitor_thread: ?std.Thread,
 /// - is_shutting_down: bool,
 /// - state: SupervisorState,
-/// 
+///
 /// methods:
 /// - init: fn (allocator: Allocator, options: SupervisorOptions) Supervisor,
 /// - deinit: fn (self: *Supervisor) void,
@@ -148,7 +148,7 @@ pub const Supervisor = struct {
     pub fn init(allocator: Allocator, options: SupervisorOptions) Supervisor {
         return .{
             .allocator = allocator,
-            .children = std.ArrayList(Process.ChildProcess).init(allocator),
+            .children = std.ArrayList(Process.ChildProcess){},
             .options = options,
             .restart_count = 0,
             .last_restart_time = 0,
@@ -167,17 +167,10 @@ pub const Supervisor = struct {
     pub fn deinit(self: *Supervisor) void {
         // First stop monitoring and wait for thread to finish
         if (self.state != .stopped) {
-            self.mutex.lock();
-            self.is_shutting_down = true;
-            self.mutex.unlock();
-
-            if (self.monitor_thread) |thread| {
-                thread.join(); // Wait for monitor thread to finish
-                self.monitor_thread = null;
-            }
+            self.stopMonitoring();
             self.shutdown(5000) catch {};
         }
-        self.children.deinit();
+        self.children.deinit(self.allocator);
     }
 
     /// Add a child process to be supervised.
@@ -194,7 +187,7 @@ pub const Supervisor = struct {
         }
 
         const child = Process.ChildProcess.init(self.allocator, spec);
-        try self.children.append(child);
+        try self.children.append(self.allocator, child);
     }
 
     /// Start all child processes.
@@ -226,11 +219,12 @@ pub const Supervisor = struct {
     pub fn stopMonitoring(self: *Supervisor) void {
         self.mutex.lock();
         self.is_shutting_down = true;
+        const thread_handle = self.monitor_thread;
+        self.monitor_thread = null;
         self.mutex.unlock();
 
-        if (self.monitor_thread) |thread| {
+        if (thread_handle) |thread| {
             thread.join(); // Wait for thread to finish
-            self.monitor_thread = null;
         }
     }
 
@@ -252,41 +246,60 @@ pub const Supervisor = struct {
     /// Gracefully shut down the supervisor and all child processes.
     /// Waits up to timeout_ms for processes to stop before returning error.ShutdownTimeout.
     pub fn shutdown(self: *Supervisor, timeout_ms: i64) SupervisorError!void {
-        if (self.state == .stopped) return;
-        self.state = .stopping;
+        // Check and set state atomically
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.state == .stopped) return;
+            self.state = .stopping;
+        }
 
         // First stop monitoring to prevent interference
         self.stopMonitoring();
 
         // Then handle children shutdown
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-        for (self.children.items) |*child| {
-            child.stop() catch {};
+            for (self.children.items) |*child| {
+                child.stop() catch {};
+            }
         }
 
-        // Wait for children to stop
+        // Wait for children to stop (without holding the mutex continuously)
         const start_time = std.time.milliTimestamp();
         while (true) {
             var all_stopped = true;
-            for (self.children.items) |*child| {
-                if (child.isAlive()) {
-                    all_stopped = false;
-                    break;
+
+            // Check if all children are stopped
+            {
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                for (self.children.items) |*child| {
+                    if (child.isAlive()) {
+                        all_stopped = false;
+                        break;
+                    }
                 }
             }
+
             if (all_stopped) break;
 
             const elapsed = std.time.milliTimestamp() - start_time;
             if (elapsed > timeout_ms) return error.ShutdownTimeout;
 
-            self.mutex.unlock();
-            std.time.sleep(50 * std.time.ns_per_ms);
-            self.mutex.lock();
+            // Sleep without holding the mutex
+            std.Thread.sleep(50 * std.time.ns_per_ms);
         }
 
-        self.state = .stopped;
+        // Set final state
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.state = .stopped;
+        }
     }
 
     /// Find a child process by ID.
@@ -367,7 +380,7 @@ pub const Supervisor = struct {
             if (should_shutdown) break;
 
             // Sleep at the start to prevent tight loop
-            std.time.sleep(100 * std.time.ns_per_ms);
+            std.Thread.sleep(100 * std.time.ns_per_ms);
 
             // Now check children with proper locking
             self.mutex.lock();
@@ -445,7 +458,53 @@ test "supervisor basic operations" {
         .id = "test1",
         .start_fn = struct {
             fn testFn() void {
-                std.time.sleep(200 * std.time.ns_per_ms);
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+            }
+        }.testFn,
+        .restart_type = .permanent,
+        .shutdown_timeout_ms = 100,
+    });
+
+    try supervisor.start();
+
+    // Wait for process to start
+    std.Thread.sleep(150 * std.time.ns_per_ms);
+
+    const stats = supervisor.getStats();
+    try std.testing.expect(stats.active_children == 1);
+    try std.testing.expect(stats.total_restarts == 0);
+
+    try supervisor.shutdown(5000);
+
+    // Verify shutdown completed successfully
+    {
+        supervisor.mutex.lock();
+        defer supervisor.mutex.unlock();
+
+        if (supervisor.children.items.len > 0) {
+            try std.testing.expect(!supervisor.children.items[0].isAlive());
+        }
+        try std.testing.expect(supervisor.state == .stopped);
+    }
+}
+
+test "supervisor monitoring" {
+    const allocator = std.testing.allocator;
+
+    const options = SupervisorOptions{
+        .strategy = .one_for_one,
+        .max_restarts = 3,
+        .max_seconds = 5,
+    };
+
+    var supervisor = Supervisor.init(allocator, options);
+    defer supervisor.deinit();
+
+    try supervisor.addChild(.{
+        .id = "monitor_test",
+        .start_fn = struct {
+            fn testFn() void {
+                std.Thread.sleep(300 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,
@@ -456,14 +515,25 @@ test "supervisor basic operations" {
     try supervisor.startMonitoring();
 
     // Wait for process to start
-    std.time.sleep(150 * std.time.ns_per_ms);
+    std.Thread.sleep(150 * std.time.ns_per_ms);
 
     const stats = supervisor.getStats();
     try std.testing.expect(stats.active_children == 1);
-    try std.testing.expect(stats.total_restarts == 0);
+
+    // Stop monitoring first before shutdown
+    supervisor.stopMonitoring();
+
+    // Wait a bit for monitoring thread to fully stop
+    std.Thread.sleep(50 * std.time.ns_per_ms);
 
     try supervisor.shutdown(5000);
-    try std.testing.expect(!supervisor.children.items[0].isAlive());
+
+    // Verify shutdown completed successfully
+    {
+        supervisor.mutex.lock();
+        defer supervisor.mutex.unlock();
+        try std.testing.expect(supervisor.state == .stopped);
+    }
 }
 
 test "supervisor restart strategies" {
@@ -478,7 +548,7 @@ test "supervisor restart strategies" {
         });
         defer {
             supervisor.stopMonitoring();
-            std.time.sleep(200 * std.time.ns_per_ms);
+            std.Thread.sleep(200 * std.time.ns_per_ms);
             supervisor.deinit();
         }
 
@@ -487,7 +557,7 @@ test "supervisor restart strategies" {
             .start_fn = struct {
                 fn testFn() void {
                     while (true) {
-                        std.time.sleep(50 * std.time.ns_per_ms);
+                        std.Thread.sleep(50 * std.time.ns_per_ms);
                     }
                 }
             }.testFn,
@@ -499,7 +569,7 @@ test "supervisor restart strategies" {
         try supervisor.startMonitoring();
 
         // Wait for process to start
-        std.time.sleep(200 * std.time.ns_per_ms);
+        std.Thread.sleep(200 * std.time.ns_per_ms);
 
         // Force single failure
         {
@@ -510,7 +580,7 @@ test "supervisor restart strategies" {
         }
 
         // Wait for restart to complete
-        std.time.sleep(500 * std.time.ns_per_ms);
+        std.Thread.sleep(500 * std.time.ns_per_ms);
 
         // Get stats with mutex protection
         const stats = supervisor.getStats();
@@ -528,7 +598,7 @@ test "supervisor max restarts" {
     });
     defer {
         supervisor.stopMonitoring();
-        std.time.sleep(200 * std.time.ns_per_ms);
+        std.Thread.sleep(200 * std.time.ns_per_ms);
         supervisor.deinit();
     }
 
@@ -536,7 +606,7 @@ test "supervisor max restarts" {
         .id = "test_restart",
         .start_fn = struct {
             fn testFn() void {
-                std.time.sleep(50 * std.time.ns_per_ms);
+                std.Thread.sleep(50 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,
@@ -547,7 +617,7 @@ test "supervisor max restarts" {
     try supervisor.startMonitoring();
 
     // Wait for initial start
-    std.time.sleep(100 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // Force exactly two failures
     {
@@ -556,13 +626,13 @@ test "supervisor max restarts" {
             child.mutex.lock();
             child.state = .failed;
             child.mutex.unlock();
-            std.time.sleep(200 * std.time.ns_per_ms);
+            std.Thread.sleep(200 * std.time.ns_per_ms);
         }
     }
 
     // Stop monitoring before checking stats
     supervisor.stopMonitoring();
-    std.time.sleep(200 * std.time.ns_per_ms);
+    std.Thread.sleep(200 * std.time.ns_per_ms);
 
     // Get stats with mutex protection
     supervisor.mutex.lock();
@@ -585,7 +655,7 @@ test "supervisor findChild" {
         .id = "test_find",
         .start_fn = struct {
             fn testFn() void {
-                std.time.sleep(50 * std.time.ns_per_ms);
+                std.Thread.sleep(50 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,

@@ -4,30 +4,27 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const lib = b.addStaticLibrary(.{
-        .name = "vigil",
+    // Create the vigil module
+    const vigil_mod = b.addModule("vigil", .{
         .root_source_file = b.path("src/vigil.zig"),
         .target = target,
-        .optimize = optimize,
     });
 
-    // Make the library available as a package
-    _ = b.addModule("vigil_lib", .{
-        .root_source_file = b.path("src/vigil.zig"),
-    });
-
-    // Install library artifacts
-    b.installArtifact(lib);
+    // No main executable - vigil is a library
 
     // Create example executable
     const exe = b.addExecutable(.{
         .name = "vigil-example",
-        .root_source_file = b.path("src/example.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/example.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vigil", .module = vigil_mod },
+            },
+        }),
     });
 
-    exe.root_module.addImport("vigil", b.modules.get("vigil_lib").?);
     b.installArtifact(exe);
 
     // Create run step for the example
@@ -42,11 +39,15 @@ pub fn build(b: *std.Build) void {
     // Add vigilant server example
     const server_exe = b.addExecutable(.{
         .name = "vigilant-server",
-        .root_source_file = b.path("examples/vigilant_server/src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/vigilant_server/src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vigil", .module = vigil_mod },
+            },
+        }),
     });
-    server_exe.root_module.addImport("vigil", b.modules.get("vigil_lib").?);
     b.installArtifact(server_exe);
 
     const server_run_cmd = b.addRunArtifact(server_exe);
@@ -71,9 +72,7 @@ pub fn build(b: *std.Build) void {
 
     // Add tests
     const lib_unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/vigil.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = vigil_mod,
     });
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);

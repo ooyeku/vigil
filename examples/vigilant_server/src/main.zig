@@ -98,7 +98,7 @@ const ServerState = struct {
             const active_count = self.getActiveConnectionCount();
             if (active_count == 0) break;
             std.debug.print("Waiting for {d} active connections to finish...\n", .{active_count});
-            std.time.sleep(100 * std.time.ns_per_ms);
+            std.Thread.sleep(100 * std.time.ns_per_ms);
         }
     }
 };
@@ -137,7 +137,7 @@ const Connection = struct {
         }
 
         if (self.request_count >= RATE_LIMIT_MAX_REQUESTS) {
-            std.debug.print("WARNING: Rate limit exceeded for {}\n", .{self.address});
+            std.debug.print("WARNING: Rate limit exceeded for {any}\n", .{self.address});
             const response = "ERROR: Rate limit exceeded. Please try again later.\n";
             _ = try self.stream.write(response);
             self.state.metrics.addBytesSent(response.len);
@@ -148,18 +148,18 @@ const Connection = struct {
     }
 
     pub fn handle(self: *Connection) !void {
-        std.debug.print("Waiting for data from {}\n", .{self.address});
+        std.debug.print("Waiting for data from {any}\n", .{self.address});
         while (true) {
             // Check shutdown flag before accepting new requests
             if (self.state.is_shutting_down.load(.acquire)) {
-                std.debug.print("Server is shutting down, no new requests accepted from {}\n", .{self.address});
+                std.debug.print("Server is shutting down, no new requests accepted from {any}\n", .{self.address});
                 return;
             }
 
             // Check for timeout using timestamp
             const current_time: i64 = std.time.timestamp();
             if (current_time - self.last_activity > TIMEOUT_MS / 1000) {
-                std.debug.print("Connection timeout from {}\n", .{self.address});
+                std.debug.print("Connection timeout from {any}\n", .{self.address});
                 return error.ConnectionTimeout;
             }
 
@@ -225,8 +225,8 @@ const ConnectionPool = struct {
 
     pub fn init(allocator: std.mem.Allocator, max_size: usize) ConnectionPool {
         return .{
-            .connections = std.ArrayList(*Connection).init(allocator),
-            .idle_connections = std.ArrayList(*Connection).init(allocator),
+            .connections = std.ArrayList(*Connection){},
+            .idle_connections = std.ArrayList(*Connection){},
             .allocator = allocator,
             .mutex = .{},
             .max_pool_size = max_size,
@@ -241,8 +241,8 @@ const ConnectionPool = struct {
             conn.stream.close();
             self.allocator.destroy(conn);
         }
-        self.connections.deinit();
-        self.idle_connections.deinit();
+        self.connections.deinit(self.allocator);
+        self.idle_connections.deinit(self.allocator);
     }
 
     pub fn acquire(self: *ConnectionPool, stream: net.Stream, address: net.Address, state: *ServerState) !*Connection {
@@ -270,7 +270,7 @@ const ConnectionPool = struct {
         if (self.connections.items.len < self.max_pool_size) {
             const conn = try self.allocator.create(Connection);
             conn.* = Connection.init(stream, address, state);
-            try self.connections.append(conn);
+            try self.connections.append(self.allocator, conn);
             state.metrics.incrementConnections();
             return conn;
         }
@@ -293,7 +293,7 @@ const ConnectionPool = struct {
         connection.buffer = undefined;
         // Keep the state reference but reset other fields as needed
 
-        try self.idle_connections.append(connection);
+        try self.idle_connections.append(self.allocator, connection);
         connection.state.metrics.decrementConnections();
     }
 };
@@ -372,7 +372,7 @@ pub fn NetworkServer(comptime Config: type) type {
                         const conn = l.accept() catch |err| switch (err) {
                             error.ProcessFdQuotaExceeded => {
                                 std.debug.print("WARNING: FD limit reached, waiting...\n", .{});
-                                std.time.sleep(100 * std.time.ns_per_ms);
+                                std.Thread.sleep(100 * std.time.ns_per_ms);
                                 continue;
                             },
                             else => {
@@ -386,7 +386,7 @@ pub fn NetworkServer(comptime Config: type) type {
                             if (err == error.PoolExhausted) {
                                 std.debug.print("WARNING: Pool full, rejecting connection\n", .{});
                                 // Add backpressure delay
-                                std.time.sleep(10 * std.time.ns_per_ms);
+                                std.Thread.sleep(10 * std.time.ns_per_ms);
                             }
                             continue;
                         };
@@ -396,7 +396,7 @@ pub fn NetworkServer(comptime Config: type) type {
                                 const addr = c.address; // Capture address before potential close
                                 defer {
                                     state_ref.pool.release(c) catch {};
-                                    std.debug.print("Connection closed from {}\n", .{addr});
+                                    std.debug.print("Connection closed from {any}\n", .{addr});
                                 }
                                 try c.handle();
                             }
@@ -474,7 +474,7 @@ pub fn main() !void {
     try server.server.start();
 
     const handler = struct {
-        fn handle(sig: c_int) callconv(.C) void {
+        fn handle(sig: c_int) callconv(.c) void {
             _ = sig;
             sig_received.store(true, .release);
             std.debug.print("\nReceived interrupt signal (Ctrl-C)...\n", .{});
@@ -502,7 +502,7 @@ pub fn main() !void {
 
     // Wait for signal
     while (!sig_received.load(.acquire)) {
-        std.time.sleep(100 * std.time.ns_per_ms);
+        std.Thread.sleep(100 * std.time.ns_per_ms);
     }
 
     // Initiate graceful shutdown

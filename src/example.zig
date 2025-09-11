@@ -303,7 +303,7 @@ pub fn main() !void {
         // First stop the server to prevent new messages
         monitor_server.server_state = .stopped;
         // Wait a bit for any in-flight messages
-        std.time.sleep(10 * std.time.ns_per_ms);
+        std.Thread.sleep(10 * std.time.ns_per_ms);
         // Now clean up
         monitor_server.terminate_fn(monitor_server);
         monitor_server.mailbox.deinit();
@@ -352,7 +352,7 @@ pub fn main() !void {
         // First stop the server to prevent new messages
         worker_manager.server_state = .stopped;
         // Wait a bit for any in-flight messages
-        std.time.sleep(10 * std.time.ns_per_ms);
+        std.Thread.sleep(10 * std.time.ns_per_ms);
         // Now clean up
         worker_manager.terminate_fn(worker_manager);
         worker_manager.mailbox.deinit();
@@ -414,7 +414,7 @@ pub fn main() !void {
         }
 
         // Small delay between messages
-        std.time.sleep(50 * std.time.ns_per_ms);
+        std.Thread.sleep(50 * std.time.ns_per_ms);
     }
 
     // Process received messages
@@ -482,7 +482,7 @@ pub fn main() !void {
             reset,
         });
 
-        std.time.sleep(system_config.demo.sleep_duration_ms * std.time.ns_per_ms); // Sleep between updates
+        std.Thread.sleep(system_config.demo.sleep_duration_ms * std.time.ns_per_ms); // Sleep between updates
     }
 
     // Demonstrate graceful shutdown
@@ -510,12 +510,12 @@ pub fn main() !void {
         5000,
     );
 
-    var recipients = std.ArrayList(*ProcessMailbox).init(allocator);
-    defer recipients.deinit();
+    var recipients = std.ArrayList(*ProcessMailbox){};
+    defer recipients.deinit(allocator);
 
     // Collect mailboxes for broadcasting
     if (system_mailbox) |*mailbox| {
-        try recipients.append(mailbox);
+        try recipients.append(allocator, mailbox);
     }
 
     // Broadcast message to all recipients
@@ -585,7 +585,7 @@ fn systemMonitorWorker() void {
             worker_state.setHealth(true);
             std.debug.print("System health check passed (count: {d})\n", .{counter});
         }
-        std.time.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
+        std.Thread.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
     }
     worker_state.decrementActiveProcesses();
     std.debug.print("System monitor shutting down\n", .{});
@@ -614,7 +614,7 @@ fn businessLogicWorker() void {
         }
 
         std.debug.print("Processing business logic (count: {d})\n", .{counter});
-        std.time.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
+        std.Thread.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
     }
     worker_state.decrementActiveProcesses();
     std.debug.print("Business logic worker shutting down\n", .{});
@@ -643,7 +643,7 @@ fn backgroundWorker() void {
         }
 
         std.debug.print("Running background tasks (count: {d})\n", .{counter});
-        std.time.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
+        std.Thread.sleep(system_config.workers.sleep_ms * std.time.ns_per_ms);
     }
     worker_state.decrementActiveProcesses();
     std.debug.print("Background worker shutting down\n", .{});
@@ -671,7 +671,7 @@ fn metricsCollectorWorker(sup_tree: *SupervisorTree) void {
             .None => {},
         }
 
-        std.time.sleep(system_config.scaling.check_interval_ms * std.time.ns_per_ms);
+        std.Thread.sleep(system_config.scaling.check_interval_ms * std.time.ns_per_ms);
     }
 
     worker_state.decrementActiveProcesses();

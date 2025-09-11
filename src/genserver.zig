@@ -66,7 +66,7 @@ pub fn GenServer(comptime StateType: type) type {
                     try self.handler(self, msg);
                 } else |err| switch (err) {
                     error.EmptyMailbox => {
-                        std.time.sleep(1 * std.time.ns_per_ms);
+                        std.Thread.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },
                     else => return err,
@@ -114,7 +114,7 @@ pub fn GenServer(comptime StateType: type) type {
                     received.deinit();
                 } else |err| switch (err) {
                     error.EmptyMailbox => {
-                        std.time.sleep(1 * std.time.ns_per_ms);
+                        std.Thread.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },
                     else => return err,
@@ -265,7 +265,7 @@ test "GenServer message handling" {
     }.run, .{server});
 
     // Wait briefly for message processing
-    std.time.sleep(100 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     thread.join();
 
@@ -408,7 +408,7 @@ test "GenServer state management" {
     }.run, .{server});
 
     // Wait briefly for message processing
-    std.time.sleep(100 * std.time.ns_per_ms);
+    std.Thread.sleep(100 * std.time.ns_per_ms);
 
     thread.join();
 
