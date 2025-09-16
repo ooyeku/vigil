@@ -10,7 +10,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    // No main executable - vigil is a library
 
     // Create example executable
     const exe = b.addExecutable(.{

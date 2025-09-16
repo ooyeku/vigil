@@ -51,7 +51,6 @@ pub const Supervisor = SupervisorMod.Supervisor;
 pub const SupervisorTree = SupervisorTreeMod.SupervisorTree;
 pub const TreeStats = SupervisorTreeMod.TreeStats;
 pub const GenServer = GenServerMod.GenServer;
-
 pub const Message = MessageMod.Message;
 pub const ProcessMailbox = MessageMod.ProcessMailbox;
 pub const MessageMetadata = MessageMod.MessageMetadata;
@@ -226,7 +225,7 @@ fn genericWorker() void {
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
         .major = 0,
-        .minor = 1,
+        .minor = 2,
         .patch = 2,
     };
 }
