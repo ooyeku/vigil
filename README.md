@@ -9,7 +9,7 @@ A process supervision and inter-process communication library for Zig, designed 
 Fetch latest release:
 
 ```bash
-zig fetch --save "git+https://github.com/ooyeku/vigil/#v0.2.0"
+zig fetch --save "git+https://github.com/ooyeku/vigil/#v0.2.2"
 ```
 
 Add as a dependency in your `build.zig.zon`:

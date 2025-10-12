@@ -26,7 +26,9 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        // No external dependencies - vigil is provided by parent project
+        .vigil = .{
+            .path = "../..",
+        },
     },
     .paths = .{
         "build.zig",
