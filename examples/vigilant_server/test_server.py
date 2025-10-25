@@ -54,7 +54,7 @@ class ServerMetrics:
         )
 
 class ServerTester:
-    def __init__(self, host: str = '127.0.0.1', port: int = 8080, pool_size: int = 1000):
+    def __init__(self, host: str = '127.0.0.1', port: int = 9090, pool_size: int = 1000):
         self.host = host
         self.port = port
         self.results: Dict[str, List[float]] = {}
