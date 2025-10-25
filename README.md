@@ -1,166 +1,155 @@
 # Vigil
 
-Note: API is subject to change (hopefully for the better)
-
 A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications.
+
+**Version: 0.3.0** - Now with a simplified, intuitive high-level API!
 
 ## Installation
 
 Fetch latest release:
 
 ```bash
-zig fetch --save "git+https://github.com/ooyeku/vigil/#v0.2.2"
+zig fetch --save "git+https://github.com/ooyeku/vigil/#v0.3.0"
 ```
 
 Add as a dependency in your `build.zig.zon`:
 
 ```zig
-    const vigil = b.dependency("vigil", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.root_module.addImport("vigil", vigil.module("vigil_lib"));
-    b.installArtifact(exe);
+const vigil = b.dependency("vigil", .{
+    .target = target,
+    .optimize = optimize,
+});
+exe.root_module.addImport("vigil", vigil.module("vigil"));
+b.installArtifact(exe);
 ```
 
-## Getting Started
+## Quick Start (0.3.0 High-Level API)
 
-### Running the example server
+### Basic Message Passing
 
-See [examples/vigilant_server](examples/vigilant_server) for an example of a basic server implementation using the `vigil` librarys `GenServer` and `WorkerGroup` features.
+```zig
+const vigil = @import("vigil");
+
+// Create a simple message
+var msg = try vigil.msg("Hello World")
+    .from("sender")
+    .priority(.high)
+    .ttl(5000)
+    .build(allocator);
+defer msg.deinit();
+```
+
+### Simple Worker Pool
+
+```zig
+fn worker() void {
+    std.debug.print("Worker running\n", .{});
+    std.Thread.sleep(100 * std.time.ns_per_ms);
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var app = try vigil.app(allocator)
+        .worker("task1", worker)
+        .workerPool("pool", worker, 4)
+        .build();
+    defer app.shutdown();
+    
+    try app.start();
+}
+```
+
+### Channel-Like Message Inbox
+
+```zig
+var inbox = try vigil.inbox(allocator);
+defer inbox.close();
+
+try inbox.send("message 1");
+try inbox.send("message 2");
+
+if (try inbox.recvTimeout(1000)) |msg_opt| {
+    if (msg_opt) |msg| {
+        std.debug.print("Received: {s?}\n", .{msg.payload});
+        msg.deinit();
+    }
+}
+```
+
+### Supervisor with Child Processes
+
+```zig
+var supervisor = vigil.supervisor(allocator);
+try supervisor.child("worker_1", workerFn);
+try supervisor.child("worker_2", workerFn);
+supervisor.build();
+```
+
+### Configuration Presets
+
+```zig
+// Production preset: conservative restarts, monitoring enabled
+var app = try vigil.appWithPreset(allocator, .production);
+
+// Development preset: verbose logging, quick restarts
+var dev_app = try vigil.appWithPreset(allocator, .development);
+
+// High availability mode: intensive health checks
+var ha_app = try vigil.appWithPreset(allocator, .high_availability);
+```
+
+## Features
+
+- **Simplified High-Level API**: Intuitive builders with sensible defaults
+- **Channel-Like Messaging**: `inbox()` for easy message passing
+- **Fluent Configuration**: Builder pattern for supervisor and app setup
+- **Configuration Presets**: Built-in configurations for common scenarios (production, development, HA, testing)
+- **Process Supervision**: Automatic restart strategies (one_for_one, one_for_all, rest_for_one)
+- **Priority Message Queues**: Route critical messages before background tasks
+- **Backward Compatible**: 0.2.x code still works via compatibility layer
+
+## Advanced Usage (Low-Level API)
+
+For advanced use cases, the full low-level API remains available:
+
+```zig
+const vigil_legacy = @import("vigil/legacy");
+
+// Access all 0.2.x functionality
+const supervisor = try vigil_legacy.Supervisor.init(allocator, .{
+    .strategy = .one_for_all,
+    .max_restarts = 5,
+    .max_seconds = 30,
+});
+```
+
+See [docs/api.md](docs/api.md) for comprehensive documentation.
+
+## Examples
+
+See [examples/vigilant_server](examples/vigilant_server) for a complete server implementation using the high-level API.
 
 ```bash
 zig build example-server
 ```
 
-### Running the Python test client
-
-See [examples/vigilant_server/test_server.py](examples/vigilant_server/test_server.py) for an example of a basic python client implementation.
+## Running Tests
 
 ```bash
-zig build test-server
-./zig-out/bin/test-server
-```
-
-### Basic Usage
-
-```zig
-const std = @import("std");
-const vigil = @import("vigil");
-
-// Initialize a mailbox
-var mailbox = vigil.ProcessMailbox.init(allocator, .{
-    .capacity = 100,
-    .max_message_size = 1024 * 1024, // 1MB
-    .default_ttl_ms = 5000, // 5 seconds
-    .priority_queues = true,
-    .enable_deadletter = true,
-});
-defer mailbox.deinit();
-
-// Send a high-priority message
-const msg = try vigil.Message.init(
-    allocator,
-    "status_update",
-    "worker_1",
-    "CPU usage high",
-    .cpuWarning,
-    .high,
-    5000, // 5 second TTL
-);
-try mailbox.send(msg);
-
-// Process messages with priority handling
-while (mailbox.receive()) |received| {
-    defer received.deinit();
-    if (received.signal) |signal| {
-        switch (signal) {
-            .cpuWarning => handleCpuWarning(received),
-            .healthCheck => sendHealthStatus(),
-            else => handleOtherSignal(received),
-        }
-    }
-} else |err| switch (err) {
-    error.EmptyMailbox => break,
-    else => return err,
-}
-
-// Create a supervisor
-var supervisor = vigil.Supervisor.init(allocator, .{
-    .name = "my_supervisor",
-    .strategy = .one_for_one,
-    .shutdown_timeout_ms = 5000,
-});
-defer supervisor.deinit();
-
-// Create a worker group
-var worker_group = vigil.WorkerGroup.init(allocator, .{
-    .name = "my_worker_group",
-    .size = 5,
-    .mailbox_capacity = 100,
-    .priority = .high,
-});
-defer worker_group.deinit();
-
-// Create a GenServer
-var gen_server = vigil.GenServer.init(allocator, .{
-    .name = "my_gen_server",
-    .mailbox_capacity = 100,
-    .priority = .high,
-});
-defer gen_server.deinit();
-
-// Start the supervisor
-try supervisor.start();
-
-// Supervise the GenServer
-try gen_server.supervise(supervisor, "my_gen_server");
-
-// Start the worker group
-try worker_group.start();
-
-// Send a message to the GenServer
-var msg = try vigil.Message.init(
-    allocator,
-    "my_message",
-    "my_sender",
-    "my_payload",
-    .info,
-    .normal,
-    5000, // 5 second TTL
-);
-try gen_server.cast(msg);
-
-// Process messages with priority handling
-while (mailbox.receive()) |received| {
-    defer received.deinit();
-    if (received.signal) |signal| {
-        switch (signal) {
-            .cpuWarning => handleCpuWarning(received),
-            .healthCheck => sendHealthStatus(),
-            else => handleOtherSignal(received),
-        }
-    }
-} else |err| switch (err) {
-    error.EmptyMailbox => break,
-    else => return err,
-}
-
-// Stop the GenServer
-try gen_server.stop();
-
-// Stop the worker group
-try worker_group.stop();
-
-// Stop the supervisor
-try supervisor.stop();
-
+zig build test
 ```
 
 ## Requirements
 
-- Zig 0.13.0 or later
+- Zig 0.15.1 or later
 - POSIX-compliant operating system
+
+## Migration from 0.2.x
+
+All 0.2.x code continues to work without changes. To use the new simplified API, see the examples above and the [migration guide in docs/api.md](docs/api.md#migration-from-02x-to-03x).
 
 ## License
 
@@ -168,4 +157,4 @@ MIT - see the [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit a Pull Request. 

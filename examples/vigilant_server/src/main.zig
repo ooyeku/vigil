@@ -298,160 +298,6 @@ const ConnectionPool = struct {
     }
 };
 
-// Network server using GenServer
-pub fn NetworkServer(comptime Config: type) type {
-    return struct {
-        server: *vigil.GenServer(ServerState),
-        config: Config,
-
-        pub fn init(allocator: std.mem.Allocator, config: Config) !@This() {
-            const state = try ServerState.init(allocator, config.address, config.port);
-
-            const server = try vigil.GenServer(ServerState).init(
-                allocator,
-                handleMessage,
-                startServer,
-                stopServer,
-                state,
-            );
-
-            return .{
-                .server = server,
-                .config = config,
-            };
-        }
-
-        fn startServer(server: *vigil.GenServer(ServerState)) !void {
-            const state = &server.state;
-
-            // Create TCP server using correct 0.13.0 API
-            const address = try net.Address.parseIp(state.address, state.port);
-            std.debug.print("Starting server on {s}:{d}\n", .{ state.address, state.port });
-
-            // Initialize socket with proper flags
-            const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-            const fd = try posix.socket(posix.AF.INET, sock_flags, posix.IPPROTO.TCP);
-            errdefer posix.close(fd);
-
-            // Enable address reuse
-            try posix.setsockopt(
-                fd,
-                posix.SOL.SOCKET,
-                posix.SO.REUSEADDR,
-                &std.mem.toBytes(@as(c_int, 1)),
-            );
-
-            // Bind the socket
-            try posix.bind(fd, &address.any, address.getOsSockLen());
-            std.debug.print("Socket bound successfully\n", .{});
-
-            // Start listening
-            try posix.listen(fd, 128);
-            std.debug.print("Listening for connections...\n", .{});
-
-            // Create heap-allocated server that outlives this function
-            const stream_server = try state.allocator.create(net.Server);
-            stream_server.* = .{
-                .stream = .{ .handle = fd },
-                .listen_address = address,
-            };
-            errdefer state.allocator.destroy(stream_server);
-
-            // Store server reference in state
-            state.server = stream_server;
-
-            // Accept connections in a separate thread
-            _ = try std.Thread.spawn(.{}, struct {
-                fn accept(l: *net.Server, s: *ServerState) !void {
-                    defer {
-                        std.debug.print("Stopping server on {s}:{d}\n", .{ s.address, s.port });
-                        s.allocator.destroy(l);
-                    }
-
-                    while (!s.is_shutting_down.load(.acquire)) { // Check shutdown flag in accept loop
-                        const conn = l.accept() catch |err| switch (err) {
-                            error.ProcessFdQuotaExceeded => {
-                                std.debug.print("WARNING: FD limit reached, waiting...\n", .{});
-                                std.Thread.sleep(100 * std.time.ns_per_ms);
-                                continue;
-                            },
-                            else => {
-                                if (s.is_shutting_down.load(.acquire)) break; // Break if shutting down
-                                return err;
-                            },
-                        };
-
-                        const connection = s.pool.acquire(conn.stream, conn.address, s) catch |err| {
-                            conn.stream.close();
-                            if (err == error.PoolExhausted) {
-                                std.debug.print("WARNING: Pool full, rejecting connection\n", .{});
-                                // Add backpressure delay
-                                std.Thread.sleep(10 * std.time.ns_per_ms);
-                            }
-                            continue;
-                        };
-
-                        _ = try std.Thread.spawn(.{}, struct {
-                            fn handler(c: *Connection, state_ref: *ServerState) !void {
-                                const addr = c.address; // Capture address before potential close
-                                defer {
-                                    state_ref.pool.release(c) catch {};
-                                    std.debug.print("Connection closed from {any}\n", .{addr});
-                                }
-                                try c.handle();
-                            }
-                        }.handler, .{ connection, s });
-                    }
-                    std.debug.print("Accept loop exiting...\n", .{});
-                }
-            }.accept, .{ stream_server, state });
-        }
-
-        fn stopServer(server: *vigil.GenServer(ServerState)) void {
-            const state = &server.state;
-            std.debug.print("Initiating graceful shutdown...\n", .{});
-
-            // Set shutdown flag first
-            state.is_shutting_down.store(true, .release);
-
-            // Close listening socket to interrupt accept()
-            if (state.server) |s| {
-                s.stream.close();
-            }
-
-            // Wait for active connections to finish
-            state.waitForActiveConnections();
-
-            std.debug.print("All connections finished, cleaning up...\n", .{});
-            state.deinit();
-
-            // Signal completion
-            state.shutdown_trigger.set();
-        }
-
-        fn handleMessage(server: *vigil.GenServer(ServerState), msg: vigil.Message) !void {
-            if (msg.payload) |payload| {
-                if (std.mem.eql(u8, payload, "status")) {
-                    const count = server.state.getActiveConnectionCount();
-                    const status = try std.fmt.allocPrint(server.state.allocator, "Active connections: {d}", .{count});
-                    defer server.state.allocator.free(status);
-
-                    const response = try vigil.Message.init(
-                        server.state.allocator,
-                        "status_response",
-                        msg.metadata.reply_to orelse "",
-                        status,
-                        .info,
-                        .normal,
-                        50000,
-                    );
-                    try server.cast(response);
-                }
-            }
-        }
-    };
-}
-
 const ServerConfig = struct {
     address: []const u8,
     port: u16,
@@ -460,6 +306,123 @@ const ServerConfig = struct {
 // Move this to global scope (before main)
 var sig_received = std.atomic.Value(bool).init(false);
 
+/// Simple server runner using the high-level Vigil API
+fn runServer(allocator: std.mem.Allocator, config: ServerConfig) !void {
+    var state = try ServerState.init(allocator, config.address, config.port);
+    defer state.deinit();
+
+    // Create TCP server
+    const address = try net.Address.parseIp(state.address, state.port);
+    std.debug.print("Starting server on {s}:{d}\n", .{ state.address, state.port });
+
+    // Initialize socket with proper flags
+    const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+    const fd = try posix.socket(posix.AF.INET, sock_flags, posix.IPPROTO.TCP);
+    errdefer posix.close(fd);
+
+    // Enable address reuse to allow quick restarts
+    try posix.setsockopt(
+        fd,
+        posix.SOL.SOCKET,
+        posix.SO.REUSEADDR,
+        &std.mem.toBytes(@as(c_int, 1)),
+    );
+
+    // Bind the socket
+    try posix.bind(fd, &address.any, address.getOsSockLen());
+    std.debug.print("Socket bound successfully\n", .{});
+
+    // Start listening
+    try posix.listen(fd, 128);
+    std.debug.print("Listening for connections...\n", .{});
+
+    // Create heap-allocated server that outlives this function
+    const stream_server = try allocator.create(net.Server);
+    stream_server.* = .{
+        .stream = .{ .handle = fd },
+        .listen_address = address,
+    };
+    errdefer allocator.destroy(stream_server);
+
+    // Store server reference in state
+    state.server = stream_server;
+
+    // Accept connections in a separate thread
+    const accept_thread = try std.Thread.spawn(.{}, struct {
+        fn accept(l: *net.Server, s: *ServerState, alloc: std.mem.Allocator) void {
+            defer {
+                std.debug.print("Accept loop exiting...\n", .{});
+                // Clean up the server struct (socket already closed by main thread)
+                alloc.destroy(l);
+            }
+
+            while (!s.is_shutting_down.load(.acquire)) {
+                const conn = l.accept() catch |err| switch (err) {
+                    error.ProcessFdQuotaExceeded => {
+                        std.debug.print("WARNING: FD limit reached, waiting...\n", .{});
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    error.SocketNotListening => {
+                        // Socket was closed, exit gracefully
+                        break;
+                    },
+                    else => {
+                        if (s.is_shutting_down.load(.acquire)) break;
+                        std.debug.print("Accept error: {}\n", .{err});
+                        break;
+                    },
+                };
+
+                const connection = s.pool.acquire(conn.stream, conn.address, s) catch |err| {
+                    conn.stream.close();
+                    if (err == error.PoolExhausted) {
+                        std.debug.print("WARNING: Pool full, rejecting connection\n", .{});
+                        // Add backpressure delay
+                        std.Thread.sleep(10 * std.time.ns_per_ms);
+                    }
+                    continue;
+                };
+
+                _ = std.Thread.spawn(.{}, struct {
+                    fn handler(c: *Connection, state_ref: *ServerState) void {
+                        const addr = c.address;
+                        defer {
+                            state_ref.pool.release(c) catch {};
+                            std.debug.print("Connection closed from {any}\n", .{addr});
+                        }
+                        c.handle() catch {};
+                    }
+                }.handler, .{ connection, s }) catch |err| {
+                    std.debug.print("Failed to spawn handler thread: {}\n", .{err});
+                    connection.stream.close();
+                };
+            }
+        }
+    }.accept, .{ stream_server, &state, allocator });
+
+    // Wait for shutdown signal
+    while (!sig_received.load(.acquire)) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+
+    // Graceful shutdown
+    std.debug.print("Initiating graceful shutdown...\n", .{});
+    state.is_shutting_down.store(true, .release);
+
+    // Close the socket to interrupt accept() - this will be cleaned up by accept thread
+    if (state.server) |s| {
+        s.stream.close();
+        state.server = null;
+    }
+
+    // Wait for accept thread to finish cleanup
+    accept_thread.join();
+
+    state.waitForActiveConnections();
+    std.debug.print("All connections finished, cleaning up...\n", .{});
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -467,11 +430,8 @@ pub fn main() !void {
 
     const config = ServerConfig{
         .address = "127.0.0.1",
-        .port = 8080,
+        .port = 9090,
     };
-
-    const server = try NetworkServer(ServerConfig).init(allocator, config);
-    try server.server.start();
 
     const handler = struct {
         fn handle(sig: c_int) callconv(.c) void {
@@ -486,7 +446,7 @@ pub fn main() !void {
     // Initialize it to empty (all bits 0)
     @memset(@as([*]u8, @ptrCast(&empty_set))[0..@sizeOf(std.posix.sigset_t)], 0);
 
-    // In Zig 0.14.1, sigaction returns void, not an error union
+    // In Zig 0.15.1, sigaction returns void, not an error union
     std.posix.sigaction(
         std.posix.SIG.INT,
         &std.posix.Sigaction{
@@ -500,22 +460,7 @@ pub fn main() !void {
     std.debug.print("Server started at {s}:{d}\n", .{ config.address, config.port });
     std.debug.print("Press Ctrl+C to initiate graceful shutdown...\n", .{});
 
-    // Wait for signal
-    while (!sig_received.load(.acquire)) {
-        std.Thread.sleep(100 * std.time.ns_per_ms);
-    }
-
-    // Initiate graceful shutdown
-    std.debug.print("Starting graceful shutdown sequence...\n", .{});
-    server.server.terminate_fn(server.server);
-
-    // Wait for shutdown with timeout
-    const SHUTDOWN_WAIT_MS: u64 = 5000;
-    if (server.server.state.shutdown_trigger.timedWait(SHUTDOWN_WAIT_MS * std.time.ns_per_ms)) {
-        std.debug.print("Server shutdown completed successfully\n", .{});
-    } else |err| {
-        std.debug.print("WARNING: Server shutdown timed out: {any}\n", .{err});
-    }
+    try runServer(allocator, config);
 
     std.debug.print("Server process exiting\n", .{});
 }

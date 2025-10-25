@@ -10,6 +10,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // Create the legacy submodule
+    _ = b.addModule("vigil/legacy", .{
+        .root_source_file = b.path("src/legacy.zig"),
+        .target = target,
+    });
 
     // Create example executable
     const exe = b.addExecutable(.{
