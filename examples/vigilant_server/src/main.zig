@@ -105,7 +105,7 @@ const ServerState = struct {
 
 // Connection handler
 const Connection = struct {
-    stream: net.Stream,
+    stream: ?net.Stream = null,
     address: net.Address,
     state: *ServerState,
     buffer: [1024]u8 = undefined,
@@ -127,7 +127,7 @@ const Connection = struct {
         };
     }
 
-    fn checkRateLimit(self: *Connection) !void {
+    fn checkRateLimit(self: *Connection, stream: net.Stream) !void {
         const current_time = std.time.timestamp();
         const window_elapsed = current_time - self.window_start;
 
@@ -139,7 +139,7 @@ const Connection = struct {
         if (self.request_count >= RATE_LIMIT_MAX_REQUESTS) {
             std.debug.print("WARNING: Rate limit exceeded for {any}\n", .{self.address});
             const response = "ERROR: Rate limit exceeded. Please try again later.\n";
-            _ = try self.stream.write(response);
+            _ = try stream.write(response);
             self.state.metrics.addBytesSent(response.len);
             return error.RateLimitExceeded;
         }
@@ -149,6 +149,8 @@ const Connection = struct {
 
     pub fn handle(self: *Connection) !void {
         std.debug.print("Waiting for data from {any}\n", .{self.address});
+        const stream = self.stream orelse return error.NoStream;
+
         while (true) {
             // Check shutdown flag before accepting new requests
             if (self.state.is_shutting_down.load(.acquire)) {
@@ -163,14 +165,14 @@ const Connection = struct {
                 return error.ConnectionTimeout;
             }
 
-            const bytes_read = try self.stream.read(&self.buffer);
+            const bytes_read = try stream.read(&self.buffer);
             if (bytes_read == 0) {
                 std.debug.print("Zero bytes read, closing connection\n", .{});
                 return;
             }
 
             // Check rate limit before processing request
-            try self.checkRateLimit();
+            try self.checkRateLimit(stream);
 
             // Update last activity time on successful read
             self.last_activity = std.time.timestamp();
@@ -179,7 +181,7 @@ const Connection = struct {
             if (std.mem.eql(u8, cmd, "STATUS")) {
                 const count = self.state.getActiveConnectionCount();
                 const response = try std.fmt.bufPrint(&self.buffer, "OK {d}\n", .{count});
-                _ = try self.stream.write(response[0..response.len]);
+                _ = try stream.write(response[0..response.len]);
                 self.state.metrics.addBytesSent(response.len);
                 std.debug.print("Sent status response\n", .{});
             } else if (std.mem.eql(u8, cmd, "HEALTHCHECK")) {
@@ -201,12 +203,12 @@ const Connection = struct {
                     self.state.metrics.total_bytes_received.load(.monotonic),
                     self.state.metrics.total_bytes_sent.load(.monotonic),
                 });
-                _ = try self.stream.write(response);
+                _ = try stream.write(response);
                 self.state.metrics.addBytesSent(response.len);
                 std.debug.print("Healthcheck responded with metrics\n", .{});
             } else {
                 std.debug.print("Received {} bytes: '{s}'\n", .{ bytes_read, cmd });
-                _ = try self.stream.write(self.buffer[0..bytes_read]);
+                _ = try stream.write(self.buffer[0..bytes_read]);
                 self.state.metrics.addBytesSent(bytes_read);
                 std.debug.print("Echoed {} bytes\n", .{bytes_read});
             }
@@ -238,7 +240,9 @@ const ConnectionPool = struct {
         defer self.mutex.unlock();
 
         for (self.connections.items) |conn| {
-            conn.stream.close();
+            if (conn.stream) |s| {
+                s.close();
+            }
             self.allocator.destroy(conn);
         }
         self.connections.deinit(self.allocator);
@@ -283,7 +287,10 @@ const ConnectionPool = struct {
         defer self.mutex.unlock();
 
         // Safely close the stream first
-        connection.stream.close();
+        if (connection.stream) |s| {
+            s.close();
+        }
+        connection.stream = null;
 
         // Only reset fields that are safe to reset
         connection.buffer = undefined;
@@ -395,7 +402,9 @@ fn runServer(allocator: std.mem.Allocator, config: ServerConfig) !void {
                     }
                 }.handler, .{ connection, s }) catch |err| {
                     std.debug.print("Failed to spawn handler thread: {}\n", .{err});
-                    connection.stream.close();
+                    if (connection.stream) |stream| {
+                        stream.close();
+                    }
                 };
             }
         }
