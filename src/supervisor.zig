@@ -316,6 +316,38 @@ pub const Supervisor = struct {
         return null;
     }
 
+    /// Terminate a child process by ID.
+    /// Stops the process but keeps it in the supervision tree.
+    /// Returns error.ChildNotFound if the child does not exist.
+    pub fn terminateChild(self: *Supervisor, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.children.items) |*child| {
+            if (std.mem.eql(u8, child.spec.id, id)) {
+                return child.stop();
+            }
+        }
+        return error.ChildNotFound;
+    }
+
+    /// Delete a child process by ID.
+    /// Stops the process and removes it from the supervision tree.
+    /// Returns error.ChildNotFound if the child does not exist.
+    pub fn deleteChild(self: *Supervisor, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.children.items, 0..) |*child, i| {
+            if (std.mem.eql(u8, child.spec.id, id)) {
+                child.stop() catch {};
+                _ = self.children.orderedRemove(i);
+                return;
+            }
+        }
+        return error.ChildNotFound;
+    }
+
     // Internal functions below this point
 
     /// Internal function to handle child process failure according to restart strategy

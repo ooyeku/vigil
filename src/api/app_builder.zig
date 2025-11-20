@@ -29,6 +29,7 @@ pub const AppBuilder = struct {
     allocator: std.mem.Allocator,
     supervisor: ?Supervisor = null,
     preset_config: PresetConfig,
+    allocated_ids: std.ArrayList([]const u8),
 
     pub fn init(allocator: std.mem.Allocator, preset: Preset) !*AppBuilder {
         const app_builder = try allocator.create(AppBuilder);
@@ -39,6 +40,7 @@ pub const AppBuilder = struct {
         app_builder.* = .{
             .allocator = allocator,
             .preset_config = preset_config,
+            .allocated_ids = std.ArrayList([]const u8){},
         };
 
         return app_builder;
@@ -59,6 +61,7 @@ pub const AppBuilder = struct {
 
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
+        try self.allocated_ids.append(self.allocator, id_copy);
 
         try self.supervisor.?.addChild(.{
             .id = id_copy,
@@ -94,6 +97,7 @@ pub const AppBuilder = struct {
                 .{ name_prefix, i },
             );
             errdefer self.allocator.free(worker_id);
+            try self.allocated_ids.append(self.allocator, worker_id);
 
             try self.supervisor.?.addChild(.{
                 .id = worker_id,
@@ -136,6 +140,13 @@ pub const AppBuilder = struct {
             sup.shutdown(self.preset_config.shutdown_timeout_ms) catch {};
             sup.deinit();
         }
+
+        // Free all allocated IDs
+        for (self.allocated_ids.items) |id| {
+            self.allocator.free(id);
+        }
+        self.allocated_ids.deinit(self.allocator);
+
         self.allocator.destroy(self);
     }
 };

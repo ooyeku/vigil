@@ -60,6 +60,13 @@ pub fn GenServer(comptime StateType: type) type {
             while (self.server_state == .running) {
                 if (self.mailbox.receive()) |msg_const| {
                     var msg = msg_const;
+
+                    // Check if we should stop (e.g. if stop() was called and sent a signal)
+                    if (self.server_state != .running or (msg.signal != null and msg.signal.? == .terminate)) {
+                        msg.deinit();
+                        break;
+                    }
+
                     defer if (msg.metadata.correlation_id == null) {
                         msg.deinit();
                     };
@@ -72,6 +79,12 @@ pub fn GenServer(comptime StateType: type) type {
                     else => return err,
                 }
             }
+
+            // Cleanup after loop exits
+            self.terminate_fn(self);
+            self.mailbox.deinit();
+            self.allocator.destroy(self.mailbox);
+            self.allocator.destroy(self);
         }
 
         /// Send an asynchronous message to the GenServer
@@ -122,16 +135,42 @@ pub fn GenServer(comptime StateType: type) type {
             }
         }
 
+        /// Register the GenServer with the global registry
+        pub fn register(self: *Self, name: []const u8) !void {
+            if (vigil.global_registry) |reg| {
+                try reg.register(name, self.mailbox);
+            } else {
+                return error.GlobalRegistryNotInitialized;
+            }
+        }
+
+        /// Schedule a message to be sent to self after a delay
+        pub fn schedule(self: *Self, msg: vigil.Message, delay_ms: u32) !void {
+            try vigil.Timer.sendAfter(self.allocator, delay_ms, self.mailbox, msg);
+        }
+
         /// Stop the GenServer
         pub fn stop(self: *Self) void {
-            self.server_state = .stopped;
-            self.terminate_fn(self);
-            // First deinit the mailbox contents
-            self.mailbox.deinit();
-            // Then destroy the mailbox struct itself since it was created with allocator.create()
-            self.allocator.destroy(self.mailbox);
-            // Finally destroy the GenServer itself
-            self.allocator.destroy(self);
+            switch (self.server_state) {
+                .initial => {
+                    // Not started yet, clean up immediately
+                    self.server_state = .stopped;
+                    self.terminate_fn(self);
+                    self.mailbox.deinit();
+                    self.allocator.destroy(self.mailbox);
+                    self.allocator.destroy(self);
+                },
+                .running => {
+                    // Running, signal to stop
+                    self.server_state = .stopped;
+                    // Send terminate signal to wake up loop
+                    const msg = vigil.Message.init(self.allocator, "stop", "system", null, .terminate, .critical, null) catch return;
+                    self.mailbox.send(msg) catch {};
+                },
+                .stopped => {
+                    // Already stopped or stopping
+                },
+            }
         }
 
         /// Register with a supervisor
@@ -208,15 +247,19 @@ test "GenServer initialization" {
 test "GenServer message handling" {
     const allocator = testing.allocator;
 
+    const Context = struct {
+        received: bool = false,
+        mutex: std.Thread.Mutex = .{},
+    };
+    var context = Context{};
+
     const State = struct {
-        count: u32,
-        received: bool,
+        ctx: *Context,
     };
     const ServerType = GenServer(State);
 
     const state = State{
-        .count = 0,
-        .received = false,
+        .ctx = &context,
     };
 
     const server = try ServerType.init(
@@ -224,7 +267,9 @@ test "GenServer message handling" {
         struct {
             fn handle(self: *ServerType, msg: vigil.Message) !void {
                 if (std.mem.eql(u8, msg.payload.?, "test")) {
-                    self.state.received = true;
+                    self.state.ctx.mutex.lock();
+                    defer self.state.ctx.mutex.unlock();
+                    self.state.ctx.received = true;
                     self.server_state = .stopped; // Stop after receiving the message
                 }
             }
@@ -241,7 +286,7 @@ test "GenServer message handling" {
         }.terminate,
         state,
     );
-    defer server.stop();
+    // defer server.stop(); // Unsafe if server stops itself
 
     // Create a copy of the message for the server
     var msg = try vigil.Message.init(allocator, "test_msg", "tester", "test", .info, .normal, 1000);
@@ -269,7 +314,9 @@ test "GenServer message handling" {
 
     thread.join();
 
-    try testing.expect(server.state.received);
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    try testing.expect(context.received);
 }
 
 // test "GenServer synchronous call" {
@@ -369,17 +416,27 @@ test "GenServer supervision" {
 test "GenServer state management" {
     const allocator = testing.allocator;
 
-    const State = struct { count: u32 };
+    const Context = struct {
+        count: u32 = 0,
+        mutex: std.Thread.Mutex = .{},
+    };
+    var context = Context{};
+
+    const State = struct {
+        ctx: *Context,
+    };
     const ServerType = GenServer(State);
 
-    const state = State{ .count = 0 };
+    const state = State{ .ctx = &context };
 
     const server = try ServerType.init(
         allocator,
         struct {
             fn handle(self: *ServerType, msg: vigil.Message) !void {
                 if (std.mem.eql(u8, msg.payload.?, "increment")) {
-                    self.state.count += 1;
+                    self.state.ctx.mutex.lock();
+                    defer self.state.ctx.mutex.unlock();
+                    self.state.ctx.count += 1;
                     self.server_state = .stopped; // Stop after incrementing
                 }
             }
@@ -396,7 +453,7 @@ test "GenServer state management" {
         }.terminate,
         state,
     );
-    defer server.stop();
+    // defer server.stop(); // Unsafe if server stops itself
 
     const msg = try vigil.Message.init(allocator, "inc_msg", "tester", "increment", .info, .normal, 1000);
     try server.cast(msg);
@@ -412,5 +469,7 @@ test "GenServer state management" {
 
     thread.join();
 
-    try testing.expect(server.state.count == 1);
+    context.mutex.lock();
+    defer context.mutex.unlock();
+    try testing.expect(context.count == 1);
 }

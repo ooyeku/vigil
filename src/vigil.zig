@@ -57,6 +57,11 @@ pub const RestartStrategy = supervisor_builder.RestartStrategy;
 pub const ProcessPriority = supervisor_builder.ProcessPriority;
 pub const GenServer = legacy.GenServer;
 pub const ProcessMailbox = legacy.ProcessMailbox;
+pub const Registry = @import("registry.zig").Registry;
+pub const Timer = @import("timer.zig").Timer;
+
+/// Global registry instance (optional)
+pub var global_registry: ?*Registry = null;
 
 // Additional legacy exports for backward compatibility
 pub const SupervisorOptions = legacy.SupervisorOptions;

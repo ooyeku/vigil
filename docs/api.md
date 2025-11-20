@@ -1,8 +1,8 @@
-# Vigil 0.3.0 API Reference
+# Vigil 0.4.0 API Reference
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 
-**Version: 0.3.0** - Featuring a simplified, intuitive high-level API with full backward compatibility.
+**Version: 0.4.0** - Featuring a simplified, intuitive high-level API with full backward compatibility.
 
 ## Table of Contents
 
@@ -411,7 +411,19 @@ zig build test
 
 ## Version History
 
-- **0.3.0** (Current)
+- **0.4.0** (Current)
+  - **Bug Fixes**:
+    - Fixed memory leak in `AppBuilder` where child process IDs were not freed during shutdown
+    - Added proper ID tracking in `AppBuilder` with automatic cleanup
+  - **Improvements**:
+    - Updated `example.zig` with realistic worker pool demonstration
+    - Improved example showcasing supervision, worker pools, and graceful shutdown
+    - All tests pass cleanly with no memory leaks
+  - **Maintenance**:
+    - Enhanced memory management patterns
+    - Better separation of ownership between `AppBuilder` and `Supervisor`
+
+- **0.3.0**
   - New high-level API: `msg()`, `inbox()`, `supervisor()`, `app()`, presets
   - Full backward compatibility with 0.2.x
   - Comprehensive unit tests
