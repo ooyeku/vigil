@@ -2,7 +2,7 @@ const std = @import("std");
 const vigil = @import("vigil.zig");
 const testing = std.testing;
 
-test "Verification of v0.4.0 features" {
+test "Verification of v0.5.0 features" {
     const allocator = testing.allocator;
 
     // 1. Initialize Global Registry

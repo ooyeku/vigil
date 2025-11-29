@@ -1,4 +1,4 @@
-//! High-level supervisor builder API for Vigil 0.3.0+
+//! High-level supervisor builder API for Vigil
 //! Provides a fluent builder pattern for creating and configuring supervisors.
 //!
 //! Example:
@@ -68,6 +68,9 @@ pub const SupervisorBuilder = struct {
 
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
+
+        // Track this allocation so it can be freed when the supervisor is deinitialized
+        try self.supervisor.?.trackAllocatedChildId(id_copy);
 
         try self.supervisor.?.addChild(.{
             .id = id_copy,

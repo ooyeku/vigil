@@ -1,4 +1,4 @@
-//! High-level application builder API for Vigil 0.3.0+
+//! High-level application builder API for Vigil
 //! Templates for common application patterns.
 //!
 //! Example:

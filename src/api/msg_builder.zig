@@ -1,4 +1,4 @@
-//! High-level message builder API for Vigil 0.3.0+
+//! High-level message builder API for Vigil
 //! Provides a fluent builder pattern for creating messages.
 //!
 //! Example:

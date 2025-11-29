@@ -1,4 +1,4 @@
-//! High-level inbox API for Vigil 0.3.0+
+//! High-level inbox API for Vigil
 //! Provides a channel-like interface for message passing.
 //!
 //! Example:
@@ -18,10 +18,18 @@ pub const ProcessMailbox = legacy.ProcessMailbox;
 pub const Signal = legacy.Signal;
 pub const MessageError = legacy.MessageError;
 
+/// Error returned when attempting to receive from a closed inbox
+pub const InboxError = error{
+    /// The inbox has been closed
+    InboxClosed,
+};
+
 /// High-level inbox wrapper around ProcessMailbox
 pub const Inbox = struct {
     mailbox: *ProcessMailbox,
     allocator: std.mem.Allocator,
+    /// Atomic flag indicating the inbox has been closed
+    closed: std.atomic.Value(bool),
 
     /// Create a new inbox
     pub fn init(allocator: std.mem.Allocator) !*Inbox {
@@ -41,20 +49,38 @@ pub const Inbox = struct {
         inbox_ptr.* = .{
             .mailbox = mailbox,
             .allocator = allocator,
+            .closed = std.atomic.Value(bool).init(false),
         };
 
         return inbox_ptr;
     }
 
-    /// Close and cleanup the inbox
+    /// Close and cleanup the inbox.
+    /// Sets the closed flag first to signal waiting threads, then waits briefly
+    /// before deallocating resources to allow threads to exit gracefully.
     pub fn close(self: *Inbox) void {
+        // Set closed flag first to signal waiting threads
+        self.closed.store(true, .release);
+
+        // Brief wait to allow threads in recv/recvTimeout to notice the flag and exit
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+
+        // Now safe to deallocate
         self.mailbox.deinit();
         self.allocator.destroy(self.mailbox);
         self.allocator.destroy(self);
     }
 
+    /// Check if the inbox has been closed
+    pub fn isClosed(self: *Inbox) bool {
+        return self.closed.load(.acquire);
+    }
+
     /// Send a message payload
     pub fn send(self: *Inbox, payload: []const u8) !void {
+        if (self.closed.load(.acquire)) {
+            return InboxError.InboxClosed;
+        }
         const message = try Message.init(
             self.allocator,
             try std.fmt.allocPrint(self.allocator, "inbox_msg_{d}", .{std.time.milliTimestamp()}),
@@ -67,9 +93,14 @@ pub const Inbox = struct {
         try self.mailbox.send(message);
     }
 
-    /// Receive a message (blocks until available)
+    /// Receive a message (blocks until available or inbox is closed)
+    /// Returns error.InboxClosed if the inbox is closed while waiting
     pub fn recv(self: *Inbox) !Message {
         while (true) {
+            // Check if inbox has been closed
+            if (self.closed.load(.acquire)) {
+                return InboxError.InboxClosed;
+            }
             if (self.mailbox.receive()) |msg| {
                 return msg;
             } else |err| switch (err) {
@@ -82,10 +113,15 @@ pub const Inbox = struct {
         }
     }
 
-    /// Receive with timeout
+    /// Receive with timeout.
+    /// Returns null on timeout, error.InboxClosed if closed while waiting.
     pub fn recvTimeout(self: *Inbox, timeout_ms: u32) !?Message {
         const start = std.time.milliTimestamp();
         while (true) {
+            // Check if inbox has been closed
+            if (self.closed.load(.acquire)) {
+                return InboxError.InboxClosed;
+            }
             if (std.time.milliTimestamp() - start > timeout_ms) {
                 return null;
             }
@@ -175,8 +211,7 @@ test "Inbox receive timeout with message" {
 
     try inbox_ptr.send("quick message");
 
-    if (try inbox_ptr.recvTimeout(100)) |msg_const| {
-        var msg = msg_const;
+    if (try inbox_ptr.recvTimeout(100)) |msg| {
         defer msg.deinit();
         try std.testing.expectEqualSlices(u8, "quick message", msg.payload.?);
     } else {

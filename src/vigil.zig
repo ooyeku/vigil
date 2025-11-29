@@ -1,9 +1,9 @@
-//! Vigil 0.3.0+ - Process Supervision and Communication Library
+//! Vigil - Process Supervision and Communication Library
 //!
 //! A robust framework for building reliable distributed systems with
 //! process supervision, message passing, and monitoring capabilities.
 //!
-//! New high-level API for 0.3.0+:
+//! High-level API:
 //! ```zig
 //! const vigil = @import("vigil");
 //!
@@ -80,7 +80,7 @@ const compat_0_2 = @import("compat_0_2.zig");
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
         .major = 0,
-        .minor = 3,
+        .minor = 5,
         .patch = 0,
     };
 }

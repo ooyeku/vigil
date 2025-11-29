@@ -295,7 +295,8 @@ pub const Message = struct {
 
     /// Free all allocated memory associated with the message.
     /// Must be called when message is no longer needed.
-    pub fn deinit(self: *Message) void {
+    /// Takes a const pointer to allow calling on const captures from recv/recvTimeout.
+    pub fn deinit(self: *const Message) void {
         self.allocator.free(self.id);
         self.allocator.free(self.sender);
 

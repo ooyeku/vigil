@@ -1,4 +1,4 @@
-//! High-level GenServer sugar API for Vigil 0.3.0+
+//! High-level GenServer sugar API for Vigil
 //! Simplified handler pattern for creating GenServers.
 //!
 //! Example:

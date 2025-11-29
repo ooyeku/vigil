@@ -110,12 +110,14 @@ pub const SupervisorState = enum {
 /// - monitor_thread: ?std.Thread,
 /// - is_shutting_down: bool,
 /// - state: SupervisorState,
+/// - allocated_child_ids: std.ArrayList([]const u8),
 ///
 /// methods:
 /// - init: fn (allocator: Allocator, options: SupervisorOptions) Supervisor,
 /// - deinit: fn (self: *Supervisor) void,
 /// - addChild: fn (self: *Supervisor, spec: Process.ChildSpec) !void,
 /// - start: fn (self: *Supervisor) !void,
+/// - stop: fn (self: *Supervisor) void,
 /// - startMonitoring: fn (self: *Supervisor) !void,
 /// - stopMonitoring: fn (self: *Supervisor) void,
 /// - getStats: fn (self: *Supervisor) SupervisorStats,
@@ -142,6 +144,8 @@ pub const Supervisor = struct {
     is_shutting_down: bool,
     /// Current state of the supervisor
     state: SupervisorState,
+    /// List of child IDs allocated by the builder that need to be freed
+    allocated_child_ids: std.ArrayList([]const u8),
 
     /// Initialize a new supervisor with the given options.
     /// The supervisor will use the provided allocator for memory management.
@@ -159,6 +163,7 @@ pub const Supervisor = struct {
             .monitor_thread = null,
             .is_shutting_down = false,
             .state = .initial,
+            .allocated_child_ids = std.ArrayList([]const u8){},
         };
     }
 
@@ -170,7 +175,24 @@ pub const Supervisor = struct {
             self.stopMonitoring();
             self.shutdown(5000) catch {};
         }
+        // Free all allocated child IDs (from builder)
+        for (self.allocated_child_ids.items) |id| {
+            self.allocator.free(id);
+        }
+        self.allocated_child_ids.deinit(self.allocator);
         self.children.deinit(self.allocator);
+    }
+
+    /// Convenience method to stop the supervisor with a default timeout.
+    /// This is an alias for shutdown(5000) that ignores errors.
+    pub fn stop(self: *Supervisor) void {
+        self.shutdown(5000) catch {};
+    }
+
+    /// Track a child ID allocation for cleanup during deinit.
+    /// This is used by the supervisor builder to register allocated IDs.
+    pub fn trackAllocatedChildId(self: *Supervisor, id: []const u8) !void {
+        try self.allocated_child_ids.append(self.allocator, id);
     }
 
     /// Add a child process to be supervised.

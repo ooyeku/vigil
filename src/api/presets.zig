@@ -1,4 +1,4 @@
-//! High-level configuration presets for Vigil 0.3.0+
+//! High-level configuration presets for Vigil
 //! Pre-configured settings for different deployment scenarios.
 
 pub const Preset = enum {
