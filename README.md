@@ -1,12 +1,10 @@
 # Vigil
 
-A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications.
+A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications. Inspired by Erlang/OTP.
 
-**Version: 0.5.0**
+**Version: 1.0.0**
 
 ## Installation
-
-Fetch latest release:
 
 ```bash
 zig fetch --save "git+https://github.com/ooyeku/vigil"
@@ -24,21 +22,7 @@ exe.root_module.addImport("vigil", vigil.module("vigil"));
 
 ## Quick Start
 
-### Basic Message Passing
-
-```zig
-const vigil = @import("vigil");
-
-// Create a simple message
-var msg = try vigil.msg("Hello World")
-    .from("sender")
-    .priority(.high)
-    .ttl(5000)
-    .build(allocator);
-defer msg.deinit();
-```
-
-### Simple Worker Pool
+### Simple Worker Application
 
 ```zig
 const std = @import("std");
@@ -54,110 +38,132 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var application = try vigil.app(allocator);
-    _ = try application.worker("task1", worker);
-    _ = try application.workerPool("pool", worker, 4);
-    try application.build();
-    defer application.shutdown();
-
-    try application.start();
+    var app = try vigil.app(allocator);
+    _ = try app.worker("task1", worker);
+    _ = try app.workerPool("pool", worker, 4);
+    try app.start();
+    defer app.shutdown();
 }
 ```
 
-### Channel-Like Message Inbox
+### Channel-Like Message Passing
 
 ```zig
 var inbox = try vigil.inbox(allocator);
 defer inbox.close();
 
-try inbox.send("message 1");
-try inbox.send("message 2");
+try inbox.send("hello");
 
-// Receive with timeout - returns null on timeout, error on inbox closed
 if (try inbox.recvTimeout(1000)) |msg| {
     defer msg.deinit();
     std.debug.print("Received: {s}\n", .{msg.payload.?});
 }
 ```
 
-### Supervisor with Child Processes
+### Circuit Breaker for Resilience
 
 ```zig
-var sup_builder = vigil.supervisor(allocator);
-_ = try sup_builder.child("worker_1", workerFn);
-_ = try sup_builder.child("worker_2", workerFn);
-sup_builder = sup_builder.strategy(.one_for_one);
+var breaker = try vigil.CircuitBreaker.init(allocator, "api", .{
+    .failure_threshold = 5,
+    .reset_timeout_ms = 30000,
+});
+defer breaker.deinit();
 
-var supervisor = sup_builder.build();
-defer supervisor.deinit();
-
-try supervisor.start();
-defer supervisor.stop();
+if (breaker.getState() == .open) {
+    // Service unavailable, fail fast
+}
 ```
 
-### Configuration Presets
+### Rate Limiting
 
 ```zig
-// Production preset: conservative restarts, monitoring enabled
-var app = try vigil.appWithPreset(allocator, .production);
+var limiter = vigil.RateLimiter.init(100); // 100 ops/sec
 
-// Development preset: verbose logging, quick restarts
-var dev_app = try vigil.appWithPreset(allocator, .development);
+if (limiter.allow()) {
+    // Process request
+} else {
+    // Rate limited
+}
+```
 
-// High availability mode: intensive health checks
-var ha_app = try vigil.appWithPreset(allocator, .high_availability);
+### Process Groups
 
-// Testing preset: minimal restarts, fast health checks
-var test_app = try vigil.appWithPreset(allocator, .testing);
+```zig
+var group = try vigil.ProcessGroup.init(allocator, "workers");
+defer group.deinit();
+
+try group.add("worker1", inbox1);
+try group.add("worker2", inbox2);
+
+try group.broadcast("message");  // Send to all
+try group.roundRobin("message"); // Load balance
 ```
 
 ## Features
 
-- **Intuitive High-Level API**: Fluent builders with sensible defaults
-- **Channel-Like Messaging**: `inbox()` for easy thread-safe message passing
-- **Process Supervision**: Automatic restart strategies (one_for_one, one_for_all, rest_for_one)
-- **Configuration Presets**: Built-in configurations for production, development, HA, and testing
-- **Priority Message Queues**: Route critical messages before background tasks
-- **Thread-Safe**: Safe concurrent close/receive operations on inboxes
-- **Memory Safe**: Proper cleanup of all allocated resources
+### Core
 
-## Advanced Usage
+- **Process Supervision** - Automatic restart strategies (one_for_one, one_for_all, rest_for_one)
+- **Message Passing** - Thread-safe inboxes with priority queues
+- **Fluent Builders** - Intuitive API with sensible defaults
+- **Configuration Presets** - Production, development, HA, and testing modes
 
-For advanced use cases, access the low-level API directly:
+### Resilience (v1.0.0)
+
+- **Circuit Breaker** - Protect services from cascading failures
+- **Rate Limiting** - Token bucket algorithm for flow control
+- **Backpressure** - Strategies for handling overload (drop_oldest, drop_newest, block, error)
+
+### Messaging (v1.0.0)
+
+- **Pub/Sub** - Topic-based messaging with wildcard support
+- **Process Groups** - Manage related processes with broadcast/round-robin routing
+- **Request/Reply** - Synchronous messaging with correlation IDs
+
+### Observability (v1.0.0)
+
+- **Telemetry** - Event hooks for monitoring (process, message, supervisor, circuit events)
+- **Testing Utilities** - Mock inboxes, mock supervisors, time control
+
+### Advanced (v1.0.0)
+
+- **Graceful Shutdown** - Coordinated cleanup with shutdown hooks
+- **State Checkpointing** - Persist and recover process state
+- **Distributed Registry** - Cross-process name resolution
+
+## Configuration Presets
 
 ```zig
-const vigil = @import("vigil");
+// Production: conservative restarts, monitoring enabled
+var app = try vigil.appWithPreset(allocator, .production);
 
-// Direct Supervisor creation with full control
-var supervisor = vigil.Supervisor.init(allocator, .{
-    .strategy = .one_for_all,
-    .max_restarts = 5,
-    .max_seconds = 30,
-});
-defer supervisor.deinit();
+// Development: verbose logging, quick restarts
+var app = try vigil.appWithPreset(allocator, .development);
 
-try supervisor.addChild(.{
-    .id = "worker",
-    .start_fn = workerFunction,
-    .restart_type = .permanent,
-    .shutdown_timeout_ms = 5000,
-    .priority = .normal,
-});
+// High availability: intensive health checks
+var app = try vigil.appWithPreset(allocator, .high_availability);
 
-try supervisor.start();
+// Testing: minimal restarts, fast health checks
+var app = try vigil.appWithPreset(allocator, .testing);
 ```
-
-See [docs/api.md](docs/api.md) for comprehensive API documentation.
 
 ## Examples
 
-See [examples/vigilant_server](examples/vigilant_server) for a complete TCP server implementation.
+See [examples/vigilant_server](examples/vigilant_server) for a complete TCP server with:
+- Circuit breaker protection
+- Rate limiting
+- Telemetry integration
+- Graceful shutdown
 
 ```bash
 cd examples/vigilant_server
 zig build
 ./zig-out/bin/vigilant_server
 ```
+
+## Documentation
+
+See [docs/api.md](docs/api.md) for comprehensive API documentation.
 
 ## Running Tests
 
@@ -167,17 +173,9 @@ zig build test
 
 ## Requirements
 
-- Zig 0.15.1 or later
+- Zig 0.15.x
 - POSIX-compliant operating system
 
 ## License
 
 MIT - see the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-Contributions are welcome! Please ensure all tests pass before submitting a Pull Request:
-
-```bash
-zig build test --summary all
-```

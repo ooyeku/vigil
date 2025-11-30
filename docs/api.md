@@ -1,18 +1,32 @@
-# Vigil API Reference
+# Vigil API Reference v1.0.0
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Message Builder](#message-builder)
-- [Inbox API](#inbox-api)
-- [Supervisor Builder](#supervisor-builder)
-- [App Builder](#app-builder)
+- [Core API](#core-api)
+  - [Message Builder](#message-builder)
+  - [Inbox API](#inbox-api)
+  - [Supervisor Builder](#supervisor-builder)
+  - [App Builder](#app-builder)
+- [Resilience](#resilience)
+  - [Circuit Breaker](#circuit-breaker)
+  - [Rate Limiter](#rate-limiter)
+  - [Backpressure](#backpressure)
+- [Messaging](#messaging)
+  - [Process Groups](#process-groups)
+  - [Pub/Sub](#pubsub)
+  - [Request/Reply](#requestreply)
+- [Observability](#observability)
+  - [Telemetry](#telemetry)
+  - [Testing Utilities](#testing-utilities)
+- [Advanced](#advanced)
+  - [Graceful Shutdown](#graceful-shutdown)
+  - [State Checkpointing](#state-checkpointing)
 - [Configuration Presets](#configuration-presets)
-- [Low-Level API](#low-level-api)
-- [Error Handling](#error-handling)
 - [Types Reference](#types-reference)
+- [Error Handling](#error-handling)
 
 ---
 
@@ -23,18 +37,16 @@ const std = @import("std");
 const vigil = @import("vigil");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
-    // Create a supervised application
-    var application = try vigil.app(allocator);
-    _ = try application.worker("service", serviceFunction);
-    _ = try application.workerPool("handlers", handlerFunction, 4);
-    try application.build();
-    defer application.shutdown();
-
-    try application.start();
+    // Create application with workers
+    var app = try vigil.app(allocator);
+    _ = try app.worker("service", serviceFunction);
+    _ = try app.workerPool("handlers", handlerFunction, 4);
+    try app.start();
+    defer app.shutdown();
 }
 
 fn serviceFunction() void {
@@ -48,36 +60,23 @@ fn handlerFunction() void {
 
 ---
 
-## Message Builder
+## Core API
+
+### Message Builder
 
 Create messages with a fluent, chainable API.
-
-### Basic Usage
 
 ```zig
 var msg = try vigil.msg("Hello World")
     .from("sender_id")
-    .build(allocator);
-defer msg.deinit();
-
-std.debug.print("Payload: {s}\n", .{msg.payload.?});
-```
-
-### Full Options
-
-```zig
-var msg = try vigil.msg("Request data")
-    .from("client_service")
     .priority(.high)
-    .ttl(5000)                          // 5 second TTL
+    .ttl(5000)
     .signal(.healthCheck)
     .withCorrelation("request_123")
     .replyTo("response_queue")
     .build(allocator);
 defer msg.deinit();
 ```
-
-### Builder Methods
 
 | Method | Description |
 |--------|-------------|
@@ -86,16 +85,14 @@ defer msg.deinit();
 | `ttl(ms)` | Set time-to-live in milliseconds |
 | `signal(sig)` | Attach a signal type |
 | `withCorrelation(id)` | Set correlation ID for request tracking |
-| `replyTo(addr)` | Set reply destination for responses |
-| `build(allocator)` | Build the message (returns `!Message`) |
+| `replyTo(addr)` | Set reply destination |
+| `build(allocator)` | Build the message |
 
 ---
 
-## Inbox API
+### Inbox API
 
-Channel-like message passing for send/receive patterns between threads.
-
-### Basic Usage
+Channel-like message passing between threads.
 
 ```zig
 var inbox = try vigil.inbox(allocator);
@@ -105,27 +102,18 @@ defer inbox.close();
 try inbox.send("message 1");
 try inbox.send("message 2");
 
-// Receive messages (blocking)
+// Receive (blocking)
 const msg = try inbox.recv();
 defer msg.deinit();
-std.debug.print("Received: {s}\n", .{msg.payload.?});
-```
 
-### Receive with Timeout
-
-```zig
-// Returns null on timeout, error on inbox closed
+// Receive with timeout (returns null on timeout)
 if (try inbox.recvTimeout(1000)) |msg| {
     defer msg.deinit();
     // Process message
-} else {
-    std.debug.print("No message within 1 second\n", .{});
 }
 ```
 
-### Thread-Safe Close
-
-The inbox can be safely closed while other threads are waiting in `recv()` or `recvTimeout()`. Waiting threads will receive `error.InboxClosed`.
+**Thread-Safe Close:**
 
 ```zig
 // Thread 1: Waiting for messages
@@ -135,66 +123,41 @@ while (true) {
         return err;
     };
     defer msg.deinit();
-    // Process message
 }
 
 // Thread 2: Signal shutdown
 inbox.close();
 ```
 
-### Inbox Methods
-
 | Method | Description |
 |--------|-------------|
 | `send(payload)` | Send a message payload |
-| `recv()` | Block until message received (returns `!Message`) |
-| `recvTimeout(ms)` | Receive with timeout (returns `!?Message`) |
-| `isClosed()` | Check if inbox has been closed |
+| `recv()` | Block until message received |
+| `recvTimeout(ms)` | Receive with timeout |
+| `isClosed()` | Check if inbox is closed |
 | `stats()` | Get mailbox statistics |
-| `close()` | Close and cleanup the inbox |
-
-### Inbox Errors
-
-| Error | Description |
-|-------|-------------|
-| `InboxClosed` | Inbox was closed while waiting |
-| `EmptyMailbox` | Internal - handled automatically |
-| `OutOfMemory` | Memory allocation failed |
+| `close()` | Close the inbox |
 
 ---
 
-## Supervisor Builder
+### Supervisor Builder
 
 Configure process supervision with restart strategies.
 
-### Basic Usage
-
 ```zig
-var sup_builder = vigil.supervisor(allocator);
-_ = try sup_builder.child("worker_1", workerFunction);
-_ = try sup_builder.child("worker_2", workerFunction);
-sup_builder = sup_builder.strategy(.one_for_one);
-sup_builder = sup_builder.maxRestarts(5);
-sup_builder = sup_builder.maxSeconds(30);
+var builder = vigil.supervisor(allocator);
+_ = try builder.child("worker_1", workerFunction);
+_ = try builder.child("worker_2", workerFunction);
+builder = builder.strategy(.one_for_one)
+    .maxRestarts(5)
+    .maxSeconds(30);
 
-var supervisor = sup_builder.build();
+var supervisor = builder.build();
 defer supervisor.deinit();
 
 try supervisor.start();
 defer supervisor.stop();
 ```
-
-### Configuration Methods
-
-| Method | Description |
-|--------|-------------|
-| `strategy(s)` | Set restart strategy |
-| `maxRestarts(count)` | Maximum restarts within time window |
-| `maxSeconds(seconds)` | Time window for restart counting |
-| `child(id, fn)` | Add a child process |
-| `build()` | Create the supervisor |
-
-### Restart Strategies
 
 | Strategy | Description |
 |----------|-------------|
@@ -202,242 +165,305 @@ defer supervisor.stop();
 | `.one_for_all` | Restart all processes when any fails |
 | `.rest_for_one` | Restart failed process and all started after it |
 
-### Supervisor Lifecycle
+---
+
+### App Builder
+
+Build applications with pre-configured supervision.
 
 ```zig
-var supervisor = sup_builder.build();
-defer supervisor.deinit();      // Cleanup resources
-
-try supervisor.start();          // Start all children
-try supervisor.startMonitoring(); // Start failure monitoring
-
-// ... application runs ...
-
-supervisor.stop();               // Graceful shutdown with 5s timeout
-// Or for custom timeout:
-try supervisor.shutdown(10000);  // 10 second timeout
+var app = try vigil.app(allocator);
+_ = try app.worker("service", serviceFunction);
+_ = try app.workerPool("handlers", handlerFunction, 4);
+try app.start();
+defer app.shutdown();
 ```
-
-### Supervisor Methods
-
-| Method | Description |
-|--------|-------------|
-| `start()` | Start all child processes |
-| `stop()` | Graceful shutdown (5 second timeout) |
-| `shutdown(timeout_ms)` | Shutdown with custom timeout |
-| `startMonitoring()` | Start the failure monitoring thread |
-| `stopMonitoring()` | Stop the monitoring thread |
-| `getStats()` | Get supervisor statistics |
-| `findChild(id)` | Find child by ID |
-| `terminateChild(id)` | Stop a specific child |
-| `deleteChild(id)` | Remove child from supervision |
-| `deinit()` | Cleanup all resources |
 
 ---
 
-## App Builder
+## Resilience
 
-Build applications with pre-configured supervision and sensible defaults.
+### Circuit Breaker
 
-### Basic Usage
-
-```zig
-var application = try vigil.app(allocator);
-_ = try application.worker("service", serviceFunction);
-_ = try application.workerPool("handlers", handlerFunction, 4);
-try application.build();
-defer application.shutdown();
-
-try application.start();
-```
-
-### With Preset Configuration
+Protect services from cascading failures.
 
 ```zig
-var application = try vigil.appWithPreset(allocator, .development);
-_ = try application.worker("debug_service", debugFunction);
-try application.build();
-defer application.shutdown();
+var breaker = try vigil.CircuitBreaker.init(allocator, "api_service", .{
+    .failure_threshold = 5,        // Open after 5 failures
+    .reset_timeout_ms = 30_000,    // Try again after 30s
+    .half_open_requests = 3,       // Allow 3 test requests
+    .half_open_success_threshold = 2, // Close after 2 successes
+});
+defer breaker.deinit();
 
-try application.start();
+// Check state before calling
+if (breaker.getState() == .open) {
+    return error.ServiceUnavailable;
+}
+
+// Execute with protection
+const result = try breaker.call(u32, riskyFunction);
+
+// Manual control
+breaker.forceOpen();
+breaker.forceClose();
 ```
 
-### App Builder Methods
+| State | Description |
+|-------|-------------|
+| `.closed` | Normal operation |
+| `.open` | Failing fast, rejecting calls |
+| `.half_open` | Testing if service recovered |
 
-| Method | Description |
-|--------|-------------|
-| `worker(id, fn)` | Add a single worker process |
-| `workerPool(prefix, fn, count)` | Add multiple workers with numbered IDs |
-| `build()` | Finalize the application |
-| `start()` | Start all processes |
-| `stop()` | Stop all processes |
-| `shutdown()` | Graceful shutdown and cleanup |
+---
+
+### Rate Limiter
+
+Token bucket algorithm for flow control.
+
+```zig
+var limiter = vigil.RateLimiter.init(100); // 100 ops/second
+
+if (limiter.allow()) {
+    // Process request
+} else {
+    // Rate limited - reject or queue
+}
+
+// Check available tokens
+const available = limiter.available();
+
+// Reset limiter
+limiter.reset();
+```
+
+---
+
+### Backpressure
+
+Handle overload with configurable strategies.
+
+```zig
+var flow_inbox = vigil.FlowControlledInbox.init(
+    allocator,
+    inbox,
+    .{ .max_per_second = 100 },  // Rate limit config
+    .{
+        .strategy = .drop_oldest,  // Backpressure strategy
+        .high_watermark = 1000,
+        .low_watermark = 500,
+    },
+);
+
+try flow_inbox.send("message");
+```
+
+| Strategy | Description |
+|----------|-------------|
+| `.drop_oldest` | Drop oldest messages when full |
+| `.drop_newest` | Drop new messages when full |
+| `.block` | Block until space available |
+| `.return_error` | Return error immediately |
+
+---
+
+## Messaging
+
+### Process Groups
+
+Manage related processes with routing strategies.
+
+```zig
+var group = try vigil.ProcessGroup.init(allocator, "workers");
+defer group.deinit();
+
+// Add members
+try group.add("worker1", inbox1);
+try group.add("worker2", inbox2);
+
+// Routing strategies
+try group.broadcast("message");           // Send to all
+try group.roundRobin("message");          // Distribute evenly
+try group.route("message", "user_123");   // Consistent hash by key
+
+// Manage members
+_ = group.remove("worker1");
+const count = group.count();
+```
+
+---
+
+### Pub/Sub
+
+Topic-based messaging with wildcard support.
+
+```zig
+// Initialize global broker
+try vigil.pubsub.initGlobal(allocator);
+
+// Create subscriber
+var subscriber = vigil.Subscriber.init(allocator, inbox);
+defer subscriber.deinit();
+try subscriber.subscribe(&.{"events.user.*", "events.system.#"});
+
+// Publish messages
+try vigil.publish("events.user.created", "user_data");
+try vigil.publish("events.system.alert", "alert_data");
+```
+
+**Wildcard Patterns:**
+- `*` - Match single level (e.g., `events.*` matches `events.user`)
+- `#` - Match multiple levels (e.g., `events.#` matches `events.user.created`)
+
+---
+
+### Request/Reply
+
+Synchronous messaging with automatic correlation.
+
+```zig
+// Create request
+var request_msg = try vigil.Message.init(allocator, "req1", "client", "request_data", null, .normal, null);
+defer request_msg.deinit();
+try request_msg.setCorrelationId("corr_123");
+
+// Create reply
+var response = try vigil.reply(request_msg, "response_data", allocator);
+defer response.deinit();
+// response.metadata.correlation_id == "corr_123"
+```
+
+---
+
+## Observability
+
+### Telemetry
+
+Event hooks for monitoring and debugging.
+
+```zig
+// Initialize global telemetry
+try vigil.telemetry.initGlobal(allocator);
+
+// Register event handlers
+if (vigil.telemetry.getGlobal()) |emitter| {
+    try emitter.on(.process_started, struct {
+        fn handler(event: vigil.telemetry.Event) void {
+            std.debug.print("Event: {s}\n", .{@tagName(event.event_type)});
+        }
+    }.handler);
+}
+
+// Emit custom events
+vigil.telemetry.emit(.{
+    .event_type = .message_sent,
+    .timestamp_ms = std.time.milliTimestamp(),
+    .metadata = null,
+});
+```
+
+**Event Types:**
+
+| Category | Events |
+|----------|--------|
+| Process | `process_started`, `process_stopped`, `process_crashed`, `process_suspended`, `process_resumed` |
+| Message | `message_sent`, `message_received`, `message_expired`, `message_dropped` |
+| Supervisor | `supervisor_started`, `supervisor_stopped`, `supervisor_restart`, `supervisor_child_added` |
+| Circuit | `circuit_opened`, `circuit_closed`, `circuit_half_open` |
+
+---
+
+### Testing Utilities
+
+Mock components for testing.
+
+```zig
+var ctx = vigil.TestContext.init(allocator);
+defer ctx.deinit();
+
+// Time control
+ctx.advanceTime(1000);
+const now = ctx.now();
+
+// Mock inbox
+var mock_inbox = try ctx.mockInbox();
+try mock_inbox.send(msg);
+const received = mock_inbox.recv();
+try std.testing.expect(mock_inbox.count() == 0);
+
+// Mock supervisor
+var mock_sup = try ctx.mockSupervisor();
+try mock_sup.addChild("worker", workerFn);
+try mock_sup.start();
+try mock_sup.failChild("worker");
+```
+
+---
+
+## Advanced
+
+### Graceful Shutdown
+
+Coordinated shutdown with hooks.
+
+```zig
+// Initialize shutdown manager
+try vigil.shutdown.initGlobal(allocator);
+
+// Register shutdown hooks
+try vigil.onShutdown(struct {
+    fn cleanup() void {
+        std.debug.print("Cleaning up...\n", .{});
+    }
+}.cleanup);
+
+// Trigger shutdown (hooks run in reverse order)
+vigil.shutdownAll(.{
+    .timeout_ms = 30_000,
+    .order = .reverse,
+});
+```
+
+---
+
+### State Checkpointing
+
+Persist and recover process state.
+
+```zig
+// File-based checkpointer
+var file_ckpt = try vigil.FileCheckpointer.init(allocator, "/tmp/checkpoints");
+defer file_ckpt.deinit();
+const ckpt = file_ckpt.toCheckpointer();
+
+// Save state
+try ckpt.save("server_state", state_bytes);
+
+// Load state
+if (try ckpt.load("server_state", allocator)) |state| {
+    defer allocator.free(state);
+    // Restore state
+}
+
+// Memory checkpointer (for testing)
+var mem_ckpt = vigil.MemoryCheckpointer.init(allocator);
+defer mem_ckpt.deinit();
+```
 
 ---
 
 ## Configuration Presets
 
-Built-in presets for common deployment scenarios.
-
-### Available Presets
-
-```zig
-// Production: Conservative restarts, longer health checks
-var prod = try vigil.appWithPreset(allocator, .production);
-
-// Development: Quick restarts, verbose logging
-var dev = try vigil.appWithPreset(allocator, .development);
-
-// High Availability: Balanced for uptime
-var ha = try vigil.appWithPreset(allocator, .high_availability);
-
-// Testing: Minimal restarts, fast health checks
-var test_app = try vigil.appWithPreset(allocator, .testing);
-```
-
-### Preset Configuration Values
-
-| Preset | Max Restarts | Window | Health Check | Shutdown Timeout | Mailbox Capacity |
-|--------|-------------|--------|--------------|------------------|------------------|
-| `.production` | 3 | 60s | 5000ms | 30000ms | 1000 |
-| `.development` | 10 | 5s | 1000ms | 5000ms | 100 |
-| `.high_availability` | 5 | 30s | 2000ms | 20000ms | 5000 |
-| `.testing` | 1 | 10s | 100ms | 1000ms | 50 |
-
----
-
-## Low-Level API
-
-For advanced use cases, access the full low-level API:
+| Preset | Max Restarts | Window | Health Check | Shutdown Timeout |
+|--------|-------------|--------|--------------|------------------|
+| `.production` | 3 | 60s | 5000ms | 30000ms |
+| `.development` | 10 | 5s | 1000ms | 5000ms |
+| `.high_availability` | 5 | 30s | 2000ms | 20000ms |
+| `.testing` | 1 | 10s | 100ms | 1000ms |
 
 ```zig
-const vigil = @import("vigil");
-
-// Direct Supervisor creation
-var supervisor = vigil.Supervisor.init(allocator, .{
-    .strategy = .one_for_all,
-    .max_restarts = 5,
-    .max_seconds = 30,
-});
-defer supervisor.deinit();
-
-try supervisor.addChild(.{
-    .id = "worker",
-    .start_fn = workerFunction,
-    .restart_type = .permanent,
-    .shutdown_timeout_ms = 5000,
-    .priority = .normal,
-    .max_memory_bytes = null,
-    .health_check_fn = healthCheckFunction,
-    .health_check_interval_ms = 1000,
-});
-
-try supervisor.start();
+var app = try vigil.appWithPreset(allocator, .production);
 ```
-
-### Direct Message Creation
-
-```zig
-var msg = try vigil.Message.init(
-    allocator,
-    "msg_id",           // Unique message ID
-    "sender",           // Sender identifier
-    "payload",          // Message content
-    .alert,             // Signal type (optional)
-    .high,              // Priority
-    5000,               // TTL in milliseconds (optional)
-);
-defer msg.deinit();
-
-// Set correlation for request tracking
-try msg.setCorrelationId("correlation_123");
-
-// Set reply destination
-try msg.setReplyTo("response_mailbox");
-
-// Check if expired
-if (msg.isExpired()) {
-    // Handle expired message
-}
-```
-
-### Direct Mailbox Creation
-
-```zig
-var mailbox = vigil.ProcessMailbox.init(allocator, .{
-    .capacity = 1000,
-    .priority_queues = true,
-    .enable_deadletter = true,
-    .default_ttl_ms = 30_000,
-    .max_message_size = 1024 * 1024,  // 1MB
-});
-defer mailbox.deinit();
-
-try mailbox.send(msg);
-
-const received = try mailbox.receive();
-defer received.deinit();
-```
-
----
-
-## Error Handling
-
-### Message Errors
-
-```zig
-mailbox.send(msg) catch |err| switch (err) {
-    error.MailboxFull => {
-        // Queue is at capacity
-    },
-    error.MessageExpired => {
-        // Message TTL elapsed before send
-    },
-    error.MessageTooLarge => {
-        // Message exceeds max_message_size
-    },
-    error.OutOfMemory => {
-        // Allocation failed
-    },
-    else => return err,
-};
-```
-
-| Error | Description |
-|-------|-------------|
-| `EmptyMailbox` | No messages available |
-| `MailboxFull` | Mailbox capacity reached |
-| `MessageExpired` | Message TTL expired |
-| `MessageTooLarge` | Message exceeds size limits |
-| `DuplicateMessage` | Message ID already exists |
-| `OutOfMemory` | Memory allocation failed |
-
-### Supervisor Errors
-
-```zig
-supervisor.shutdown(5000) catch |err| switch (err) {
-    error.TooManyRestarts => {
-        // Exceeded restart limit
-    },
-    error.ShutdownTimeout => {
-        // Children didn't stop in time
-    },
-    else => return err,
-};
-```
-
-| Error | Description |
-|-------|-------------|
-| `TooManyRestarts` | Exceeded restart limit within time window |
-| `ShutdownTimeout` | Graceful shutdown timed out |
-| `AlreadyMonitoring` | Monitoring thread already active |
-| `ChildNotFound` | Child with given ID doesn't exist |
-
-### Inbox Errors
-
-| Error | Description |
-|-------|-------------|
-| `InboxClosed` | Inbox was closed |
 
 ---
 
@@ -447,10 +473,10 @@ supervisor.shutdown(5000) catch |err| switch (err) {
 
 ```zig
 pub const MessagePriority = enum {
-    critical,  // Immediate handling required
-    high,      // Urgent but not critical
-    normal,    // Standard operations (default)
-    low,       // Background tasks
+    critical,  // Immediate handling
+    high,      // Urgent
+    normal,    // Standard (default)
+    low,       // Background
     batch,     // Bulk operations
 };
 ```
@@ -459,9 +485,19 @@ pub const MessagePriority = enum {
 
 ```zig
 pub const RestartStrategy = enum {
-    one_for_one,   // Restart only failed process
-    one_for_all,   // Restart all processes
-    rest_for_one,  // Restart failed + subsequent processes
+    one_for_one,   // Restart only failed
+    one_for_all,   // Restart all
+    rest_for_one,  // Restart failed + subsequent
+};
+```
+
+### CircuitState
+
+```zig
+pub const CircuitState = enum {
+    closed,     // Normal operation
+    open,       // Failing fast
+    half_open,  // Testing recovery
 };
 ```
 
@@ -469,73 +505,47 @@ pub const RestartStrategy = enum {
 
 ```zig
 pub const Signal = enum {
-    // Lifecycle
     restart, shutdown, terminate, exit,
-    
-    // Execution control
     @"suspend", @"resume",
-    
-    // Health and monitoring
     healthCheck, memoryWarning, cpuWarning, deadlockDetected,
-    
-    // Operational
     messageErr, info, warning, debug, log, alert, metric, event, heartbeat,
-    
-    // Custom
     custom,
 };
 ```
 
-### ChildSpec
+---
 
-```zig
-pub const ChildSpec = struct {
-    id: []const u8,                              // Unique identifier
-    start_fn: *const fn () void,                 // Function to execute
-    restart_type: enum { permanent, transient, temporary },
-    shutdown_timeout_ms: u32,                    // Shutdown wait time
-    priority: ProcessPriority = .normal,
-    max_memory_bytes: ?usize = null,             // Memory limit
-    health_check_fn: ?*const fn () bool = null,  // Health check callback
-    health_check_interval_ms: u32 = 1000,
-};
-```
+## Error Handling
 
-### ProcessPriority
+### Inbox Errors
 
-```zig
-pub const ProcessPriority = enum {
-    critical,  // Essential system processes
-    high,      // Important business logic
-    normal,    // Default priority
-    low,       // Non-essential tasks
-    batch,     // Lowest priority
-};
-```
+| Error | Description |
+|-------|-------------|
+| `InboxClosed` | Inbox was closed while waiting |
+| `OutOfMemory` | Memory allocation failed |
 
-### SupervisorStats
+### Message Errors
 
-```zig
-pub const SupervisorStats = struct {
-    total_restarts: u32,      // Total restarts since start
-    uptime_ms: i64,           // Supervisor uptime
-    last_failure_time: i64,   // Last failure timestamp
-    active_children: u32,     // Currently running children
-};
-```
+| Error | Description |
+|-------|-------------|
+| `MailboxFull` | Queue at capacity |
+| `MessageExpired` | TTL elapsed |
+| `MessageTooLarge` | Exceeds size limit |
+| `DeliveryTimeout` | Send/receive timed out |
 
-### MailboxStats
+### Circuit Breaker Errors
 
-```zig
-pub const MailboxStats = struct {
-    messages_received: usize,
-    messages_sent: usize,
-    messages_expired: usize,
-    messages_dropped: usize,
-    peak_usage: usize,
-    total_size_bytes: usize,
-};
-```
+| Error | Description |
+|-------|-------------|
+| `CircuitOpen` | Circuit is open, rejecting calls |
+
+### Supervisor Errors
+
+| Error | Description |
+|-------|-------------|
+| `TooManyRestarts` | Exceeded restart limit |
+| `ShutdownTimeout` | Graceful shutdown timed out |
+| `ChildNotFound` | Child ID not found |
 
 ---
 
@@ -548,23 +558,21 @@ zig build
 # Run all tests
 zig build test
 
-# Run tests with summary
-zig build test --summary all
+# Run example
+zig build run
 ```
 
 ---
 
 ## Examples
 
-See `examples/vigilant_server` for a complete TCP server implementation demonstrating:
-
-- Connection pooling
-- Graceful shutdown handling
-- Signal handling (Ctrl-C)
-- Server metrics and health checks
+See `examples/vigilant_server` for a complete TCP server with:
+- Circuit breaker protection
+- Rate limiting
+- Telemetry integration
+- Graceful shutdown
 
 ```bash
-# Build and run the example server
 cd examples/vigilant_server
 zig build
 ./zig-out/bin/vigilant_server

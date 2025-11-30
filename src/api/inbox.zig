@@ -143,7 +143,88 @@ pub const Inbox = struct {
     }
 };
 
-/// Create a new inbox
+/// Inbox builder for fluent configuration
+pub const InboxBuilder = struct {
+    allocator: std.mem.Allocator,
+    capacity_val: usize = 100,
+    priority_queues_val: bool = true,
+    dead_letter_val: bool = true,
+    default_ttl_ms_val: ?u32 = 30_000,
+    rate_limit_config: ?flow_control.RateLimitConfig = null,
+    backpressure_config: ?flow_control.BackpressureConfig = null,
+
+    const flow_control = @import("./flow_control.zig");
+
+    fn init(allocator: std.mem.Allocator) InboxBuilder {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn capacity(self: InboxBuilder, n: usize) InboxBuilder {
+        var result = self;
+        result.capacity_val = n;
+        return result;
+    }
+
+    pub fn priorityQueues(self: InboxBuilder, enabled: bool) InboxBuilder {
+        var result = self;
+        result.priority_queues_val = enabled;
+        return result;
+    }
+
+    pub fn deadLetter(self: InboxBuilder, enabled: bool) InboxBuilder {
+        var result = self;
+        result.dead_letter_val = enabled;
+        return result;
+    }
+
+    pub fn defaultTTL(self: InboxBuilder, ms: u32) InboxBuilder {
+        var result = self;
+        result.default_ttl_ms_val = ms;
+        return result;
+    }
+
+    pub fn withRateLimit(self: InboxBuilder, config: flow_control.RateLimitConfig) InboxBuilder {
+        var result = self;
+        result.rate_limit_config = config;
+        return result;
+    }
+
+    pub fn withBackpressure(self: InboxBuilder, config: flow_control.BackpressureConfig) InboxBuilder {
+        var result = self;
+        result.backpressure_config = config;
+        return result;
+    }
+
+    pub fn build(self: InboxBuilder) !*Inbox {
+        const inbox_ptr = try self.allocator.create(Inbox);
+        errdefer self.allocator.destroy(inbox_ptr);
+
+        const mailbox = try self.allocator.create(ProcessMailbox);
+        errdefer self.allocator.destroy(mailbox);
+
+        mailbox.* = ProcessMailbox.init(self.allocator, .{
+            .capacity = self.capacity_val,
+            .priority_queues = self.priority_queues_val,
+            .enable_deadletter = self.dead_letter_val,
+            .default_ttl_ms = self.default_ttl_ms_val,
+        });
+
+        inbox_ptr.* = .{
+            .mailbox = mailbox,
+            .allocator = self.allocator,
+            .closed = std.atomic.Value(bool).init(false),
+        };
+
+        return inbox_ptr;
+    }
+};
+
+/// Create a new inbox builder
+pub fn inboxBuilder(allocator: std.mem.Allocator) InboxBuilder {
+    return InboxBuilder.init(allocator);
+}
+
+/// Create a new inbox (simple version)
 pub fn inbox(allocator: std.mem.Allocator) !*Inbox {
     return try Inbox.init(allocator);
 }

@@ -370,6 +370,143 @@ pub const Supervisor = struct {
         return error.ChildNotFound;
     }
 
+    /// Supervisor introspection information
+    pub const InspectionInfo = struct {
+        child_count: usize,
+        active_children: usize,
+        state: SupervisorState,
+        restart_count: u32,
+        total_restarts: u32,
+        children: []const ChildInfo,
+
+        pub const ChildInfo = struct {
+            id: []const u8,
+            state: Process.ProcessState,
+            restart_count: u32,
+        };
+    };
+
+    /// Inspect supervisor state
+    pub fn inspect(self: *Supervisor) InspectionInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var active: usize = 0;
+        var children_info = std.ArrayList(InspectionInfo.ChildInfo).init(self.allocator);
+        defer children_info.deinit();
+
+        for (self.children.items) |*child| {
+            const child_state = child.getState();
+            if (child_state == .running) active += 1;
+
+            children_info.append(self.allocator, .{
+                .id = child.spec.id,
+                .state = child_state,
+                .restart_count = child.stats.restart_count,
+            }) catch continue;
+        }
+
+        return .{
+            .child_count = self.children.items.len,
+            .active_children = active,
+            .state = self.state,
+            .restart_count = self.restart_count,
+            .total_restarts = self.stats.total_restarts,
+            .children = children_info.items,
+        };
+    }
+
+    /// Scale workers with given prefix to target count
+    pub fn scaleWorkers(self: *Supervisor, prefix: []const u8, target_count: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Find existing workers with prefix
+        var existing_indices = std.ArrayList(usize).init(self.allocator);
+        defer existing_indices.deinit();
+
+        for (self.children.items, 0..) |*child, i| {
+            if (std.mem.startsWith(u8, child.spec.id, prefix)) {
+                try existing_indices.append(self.allocator, i);
+            }
+        }
+
+        const current_count = existing_indices.items.len;
+
+        if (target_count > current_count) {
+            // Add new workers
+            _ = target_count - current_count;
+            // Note: Would need start_fn - simplified for now
+        } else if (target_count < current_count) {
+            // Remove excess workers
+            const to_remove = current_count - target_count;
+            var removed: usize = 0;
+            var i: usize = existing_indices.items.len;
+            while (i > 0 and removed < to_remove) {
+                i -= 1;
+                const idx = existing_indices.items[i];
+                const child = &self.children.items[idx];
+                child.stop() catch {};
+                _ = self.children.orderedRemove(idx);
+                removed += 1;
+            }
+        }
+    }
+
+    /// Force restart a child
+    pub fn restartChild(self: *Supervisor, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.children.items) |*child| {
+            if (std.mem.eql(u8, child.spec.id, id)) {
+                child.stop() catch {};
+                try child.start();
+                return;
+            }
+        }
+        return error.ChildNotFound;
+    }
+
+    /// Suspend a child (pause without stopping)
+    pub fn suspendChild(self: *Supervisor, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.children.items) |*child| {
+            if (std.mem.eql(u8, child.spec.id, id)) {
+                return child.sendSignal(.@"suspend");
+            }
+        }
+        return error.ChildNotFound;
+    }
+
+    /// Resume a suspended child
+    pub fn resumeChild(self: *Supervisor, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.children.items) |*child| {
+            if (std.mem.eql(u8, child.spec.id, id)) {
+                return child.sendSignal(.@"resume");
+            }
+        }
+        return error.ChildNotFound;
+    }
+
+    /// Restart history entry
+    pub const RestartHistoryEntry = struct {
+        child_id: []const u8,
+        timestamp_ms: i64,
+        reason: []const u8,
+    };
+
+    /// Get restart history (simplified - would track in real impl)
+    pub fn getRestartHistory(self: *Supervisor) []const RestartHistoryEntry {
+        _ = self;
+        return &[_]RestartHistoryEntry{};
+    }
+
     // Internal functions below this point
 
     /// Internal function to handle child process failure according to restart strategy

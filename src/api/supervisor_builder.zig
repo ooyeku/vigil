@@ -21,6 +21,29 @@ pub const RestartStrategy = legacy.RestartStrategy;
 pub const ChildSpec = legacy.ChildSpec;
 pub const ProcessPriority = legacy.ProcessPriority;
 
+/// Restart type enum for child processes
+pub const RestartType = enum {
+    /// Always restart the process when it terminates
+    permanent,
+    /// Restart only if the process terminates abnormally
+    transient,
+    /// Never restart the process
+    temporary,
+};
+
+/// Child options for supervisor builder
+pub const ChildOptions = struct {
+    restart_type: RestartType = .permanent,
+    shutdown_timeout_ms: u32 = 5000,
+    priority: ProcessPriority = .normal,
+    max_memory_bytes: ?usize = null,
+    health_check_fn: ?*const fn () bool = null,
+    health_check_interval_ms: u32 = 1000,
+};
+
+/// Crash handler function type
+pub const CrashHandler = *const fn (child_id: []const u8) void;
+
 /// High-level supervisor builder
 pub const SupervisorBuilder = struct {
     allocator: std.mem.Allocator,
@@ -28,6 +51,8 @@ pub const SupervisorBuilder = struct {
     max_restarts_val: u32 = 3,
     max_seconds_val: u32 = 5,
     supervisor: ?Supervisor = null,
+    crash_handler: ?CrashHandler = null,
+    enable_telemetry: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) SupervisorBuilder {
         return .{
@@ -58,6 +83,15 @@ pub const SupervisorBuilder = struct {
     }
 
     pub fn child(self: *SupervisorBuilder, id: []const u8, start_fn: *const fn () void) !*SupervisorBuilder {
+        return self.childWithOptions(id, start_fn, .{});
+    }
+
+    pub fn childWithOptions(
+        self: *SupervisorBuilder,
+        id: []const u8,
+        start_fn: *const fn () void,
+        options: ChildOptions,
+    ) !*SupervisorBuilder {
         if (self.supervisor == null) {
             self.supervisor = Supervisor.init(self.allocator, .{
                 .strategy = self.strategy_val,
@@ -75,14 +109,40 @@ pub const SupervisorBuilder = struct {
         try self.supervisor.?.addChild(.{
             .id = id_copy,
             .start_fn = start_fn,
-            .restart_type = .permanent,
-            .shutdown_timeout_ms = 5000,
-            .priority = .normal,
-            .max_memory_bytes = null,
-            .health_check_fn = null,
-            .health_check_interval_ms = 1000,
+            .restart_type = @enumFromInt(@intFromEnum(options.restart_type)),
+            .shutdown_timeout_ms = options.shutdown_timeout_ms,
+            .priority = options.priority,
+            .max_memory_bytes = options.max_memory_bytes,
+            .health_check_fn = options.health_check_fn,
+            .health_check_interval_ms = options.health_check_interval_ms,
         });
         return self;
+    }
+
+    pub fn childPool(
+        self: *SupervisorBuilder,
+        prefix: []const u8,
+        start_fn: *const fn () void,
+        count: usize,
+    ) !*SupervisorBuilder {
+        for (0..count) |i| {
+            const child_id = try std.fmt.allocPrint(self.allocator, "{s}_{d}", .{ prefix, i });
+            defer self.allocator.free(child_id);
+            _ = try self.child(child_id, start_fn);
+        }
+        return self;
+    }
+
+    pub fn onCrash(self: *SupervisorBuilder, handler: CrashHandler) *SupervisorBuilder {
+        var result = self;
+        result.crash_handler = handler;
+        return result;
+    }
+
+    pub fn withTelemetry(self: *SupervisorBuilder, enabled: bool) SupervisorBuilder {
+        var result = self.*;
+        result.enable_telemetry = enabled;
+        return result;
     }
 
     pub fn build(self: SupervisorBuilder) Supervisor {
