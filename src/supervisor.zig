@@ -377,7 +377,6 @@ pub const Supervisor = struct {
         state: SupervisorState,
         restart_count: u32,
         total_restarts: u32,
-        children: []const ChildInfo,
 
         pub const ChildInfo = struct {
             id: []const u8,
@@ -386,24 +385,14 @@ pub const Supervisor = struct {
         };
     };
 
-    /// Inspect supervisor state
+    /// Inspect supervisor state (returns snapshot without child details to avoid memory issues)
     pub fn inspect(self: *Supervisor) InspectionInfo {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         var active: usize = 0;
-        var children_info = std.ArrayList(InspectionInfo.ChildInfo).init(self.allocator);
-        defer children_info.deinit();
-
         for (self.children.items) |*child| {
-            const child_state = child.getState();
-            if (child_state == .running) active += 1;
-
-            children_info.append(self.allocator, .{
-                .id = child.spec.id,
-                .state = child_state,
-                .restart_count = child.stats.restart_count,
-            }) catch continue;
+            if (child.getState() == .running) active += 1;
         }
 
         return .{
@@ -412,8 +401,24 @@ pub const Supervisor = struct {
             .state = self.state,
             .restart_count = self.restart_count,
             .total_restarts = self.stats.total_restarts,
-            .children = children_info.items,
         };
+    }
+
+    /// Get child info by ID (caller does not own returned data)
+    pub fn getChildInfo(self: *Supervisor, id: []const u8) ?InspectionInfo.ChildInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.children.items) |*child| {
+            if (std.mem.eql(u8, child.spec.id, id)) {
+                return .{
+                    .id = child.spec.id,
+                    .state = child.getState(),
+                    .restart_count = child.stats.restart_count,
+                };
+            }
+        }
+        return null;
     }
 
     /// Scale workers with given prefix to target count
@@ -421,34 +426,42 @@ pub const Supervisor = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Find existing workers with prefix
-        var existing_indices = std.ArrayList(usize).init(self.allocator);
-        defer existing_indices.deinit();
+        // Collect IDs of workers to remove (safer than indices)
+        var workers_to_remove = std.ArrayList([]const u8).init(self.allocator);
+        defer workers_to_remove.deinit();
 
-        for (self.children.items, 0..) |*child, i| {
+        var current_count: usize = 0;
+        for (self.children.items) |*child| {
             if (std.mem.startsWith(u8, child.spec.id, prefix)) {
-                try existing_indices.append(self.allocator, i);
+                current_count += 1;
             }
         }
 
-        const current_count = existing_indices.items.len;
-
         if (target_count > current_count) {
-            // Add new workers
+            // Add new workers - would need start_fn, simplified for now
             _ = target_count - current_count;
-            // Note: Would need start_fn - simplified for now
         } else if (target_count < current_count) {
-            // Remove excess workers
+            // Collect IDs of workers to remove (from end to preserve order)
             const to_remove = current_count - target_count;
-            var removed: usize = 0;
-            var i: usize = existing_indices.items.len;
-            while (i > 0 and removed < to_remove) {
+            var found: usize = 0;
+            var i: usize = self.children.items.len;
+            while (i > 0 and found < to_remove) {
                 i -= 1;
-                const idx = existing_indices.items[i];
-                const child = &self.children.items[idx];
-                child.stop() catch {};
-                _ = self.children.orderedRemove(idx);
-                removed += 1;
+                if (std.mem.startsWith(u8, self.children.items[i].spec.id, prefix)) {
+                    workers_to_remove.append(self.allocator, self.children.items[i].spec.id) catch continue;
+                    found += 1;
+                }
+            }
+
+            // Remove workers by ID (safe approach)
+            for (workers_to_remove.items) |id| {
+                for (self.children.items, 0..) |*child, idx| {
+                    if (std.mem.eql(u8, child.spec.id, id)) {
+                        child.stop() catch {};
+                        _ = self.children.orderedRemove(idx);
+                        break;
+                    }
+                }
             }
         }
     }

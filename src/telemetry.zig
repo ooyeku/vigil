@@ -149,11 +149,17 @@ pub const TelemetryEmitter = struct {
     pub fn emit(self: *TelemetryEmitter, event: Event) void {
         if (!self.enabled) return;
 
+        // Make a true copy of handlers to avoid use-after-free if handlers are modified
         self.mutex.lock();
-        const handlers_copy = self.handlers.items;
+        const handlers_snapshot = self.allocator.alloc(HandlerEntry, self.handlers.items.len) catch {
+            self.mutex.unlock();
+            return;
+        };
+        @memcpy(handlers_snapshot, self.handlers.items);
         self.mutex.unlock();
+        defer self.allocator.free(handlers_snapshot);
 
-        for (handlers_copy) |entry| {
+        for (handlers_snapshot) |entry| {
             if (entry.event_type == event.event_type) {
                 entry.handler(event);
             }

@@ -61,14 +61,21 @@ pub const ReplyMailbox = struct {
             try self.correlation_map.put(corr_id_copy, event);
         }
 
+        // Helper to cleanup map entry using the copied key
+        const cleanup = struct {
+            fn remove(map: *std.StringHashMap(*std.Thread.ResetEvent), mutex: *std.Thread.Mutex, key: []const u8) void {
+                mutex.lock();
+                _ = map.remove(key);
+                mutex.unlock();
+            }
+        };
+
         // Wait for reply
         const start_ms = std.time.milliTimestamp();
         while (true) {
             const elapsed = std.time.milliTimestamp() - start_ms;
             if (elapsed > timeout_ms) {
-                self.mutex.lock();
-                _ = self.correlation_map.remove(correlation_id);
-                self.mutex.unlock();
+                cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
                 self.allocator.free(corr_id_copy);
                 self.allocator.destroy(event);
                 return MessageError.DeliveryTimeout;
@@ -78,12 +85,10 @@ pub const ReplyMailbox = struct {
             if (self.inbox.recvTimeout(100)) |msg_opt| {
                 if (msg_opt) |msg| {
                     defer msg.deinit();
-                    if (msg.metadata.correlation_id) |_| {
-                        if (std.mem.eql(u8, msg.metadata.correlation_id.?, correlation_id)) {
+                    if (msg.metadata.correlation_id) |msg_corr_id| {
+                        if (std.mem.eql(u8, msg_corr_id, corr_id_copy)) {
                             // Found matching reply
-                            self.mutex.lock();
-                            _ = self.correlation_map.remove(correlation_id);
-                            self.mutex.unlock();
+                            cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
                             self.allocator.free(corr_id_copy);
                             self.allocator.destroy(event);
 
@@ -96,9 +101,7 @@ pub const ReplyMailbox = struct {
             } else |err| {
                 // Check if inbox is closed
                 if (err == InboxError.InboxClosed) {
-                    self.mutex.lock();
-                    _ = self.correlation_map.remove(correlation_id);
-                    self.mutex.unlock();
+                    cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
                     self.allocator.free(corr_id_copy);
                     self.allocator.destroy(event);
                     return MessageError.ReceiverUnavailable;
