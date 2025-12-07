@@ -83,7 +83,7 @@ pub const Inbox = struct {
         }
         const message = try Message.init(
             self.allocator,
-            "inbox_msg",  // Static string - Message.init will dupe it
+            "inbox_msg", // Static string - Message.init will dupe it
             "inbox_sender",
             payload,
             null,
@@ -356,4 +356,98 @@ test "Inbox send and receive ordering" {
     var msg3 = try inbox_ptr.recv();
     defer msg3.deinit();
     try std.testing.expectEqualSlices(u8, "third", msg3.payload.?);
+}
+
+test "Inbox memory leak fix - many sends without leaks" {
+    // Use testing allocator to detect memory leaks
+    var testing_allocator = std.testing.allocator;
+
+    var inbox_ptr = try inbox(testing_allocator);
+    defer inbox_ptr.close();
+
+    // Send many messages to ensure no memory leaks occur
+    // Use fewer messages than default capacity (100) to avoid blocking
+    const num_messages = 50;
+    var i: usize = 0;
+    while (i < num_messages) : (i += 1) {
+        const msg_buf = try std.fmt.allocPrint(testing_allocator, "message_{d}", .{i});
+        defer testing_allocator.free(msg_buf);
+        try inbox_ptr.send(msg_buf);
+    }
+
+    // Receive all messages to ensure they're processed
+    i = 0;
+    while (i < num_messages) : (i += 1) {
+        var msg = try inbox_ptr.recv();
+        defer msg.deinit();
+
+        const expected_buf = try std.fmt.allocPrint(testing_allocator, "message_{d}", .{i});
+        defer testing_allocator.free(expected_buf);
+        try std.testing.expectEqualSlices(u8, expected_buf, msg.payload.?);
+    }
+
+    // The testing allocator will detect any leaks automatically
+}
+
+test "Inbox memory leak fix - repeated sends and cleanup" {
+    // Use testing allocator to detect memory leaks
+    var testing_allocator = std.testing.allocator;
+
+    // Test multiple cycles of create/send/receive/cleanup
+    const cycles = 5;
+    const messages_per_cycle = 25; // Keep well below capacity of 100
+
+    var cycle: usize = 0;
+    while (cycle < cycles) : (cycle += 1) {
+        var inbox_ptr = try inbox(testing_allocator);
+        defer inbox_ptr.close();
+
+        // Send messages
+        var i: usize = 0;
+        while (i < messages_per_cycle) : (i += 1) {
+            const msg_buf = try std.fmt.allocPrint(testing_allocator, "cycle_{d}_msg_{d}", .{ cycle, i });
+            defer testing_allocator.free(msg_buf);
+            try inbox_ptr.send(msg_buf);
+        }
+
+        // Receive and cleanup all messages
+        i = 0;
+        while (i < messages_per_cycle) : (i += 1) {
+            var msg = try inbox_ptr.recv();
+            defer msg.deinit();
+
+            const expected_buf = try std.fmt.allocPrint(testing_allocator, "cycle_{d}_msg_{d}", .{ cycle, i });
+            defer testing_allocator.free(expected_buf);
+            try std.testing.expectEqualSlices(u8, expected_buf, msg.payload.?);
+        }
+    }
+
+    // The testing allocator will detect any leaks across all cycles
+}
+
+test "Inbox message ID is consistent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var inbox_ptr = try inbox(allocator);
+    defer inbox_ptr.close();
+
+    // Send multiple messages
+    try inbox_ptr.send("msg1");
+    try inbox_ptr.send("msg2");
+    try inbox_ptr.send("msg3");
+
+    // Receive and verify message IDs are all "inbox_msg"
+    var msg1 = try inbox_ptr.recv();
+    defer msg1.deinit();
+    try std.testing.expectEqualSlices(u8, "inbox_msg", msg1.id);
+
+    var msg2 = try inbox_ptr.recv();
+    defer msg2.deinit();
+    try std.testing.expectEqualSlices(u8, "inbox_msg", msg2.id);
+
+    var msg3 = try inbox_ptr.recv();
+    defer msg3.deinit();
+    try std.testing.expectEqualSlices(u8, "inbox_msg", msg3.id);
 }
