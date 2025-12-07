@@ -2,7 +2,7 @@
 
 A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications. Inspired by Erlang/OTP.
 
-**Version: 1.0.0**
+**Version: 1.0.1**
 
 ## Installation
 
@@ -108,24 +108,24 @@ try group.roundRobin("message"); // Load balance
 - **Fluent Builders** - Intuitive API with sensible defaults
 - **Configuration Presets** - Production, development, HA, and testing modes
 
-### Resilience (v1.0.0)
+### Resilience 
 
 - **Circuit Breaker** - Protect services from cascading failures
 - **Rate Limiting** - Token bucket algorithm for flow control
 - **Backpressure** - Strategies for handling overload (drop_oldest, drop_newest, block, error)
 
-### Messaging (v1.0.0)
+### Messaging 
 
 - **Pub/Sub** - Topic-based messaging with wildcard support
 - **Process Groups** - Manage related processes with broadcast/round-robin routing
 - **Request/Reply** - Synchronous messaging with correlation IDs
 
-### Observability (v1.0.0)
+### Observability
 
 - **Telemetry** - Event hooks for monitoring (process, message, supervisor, circuit events)
 - **Testing Utilities** - Mock inboxes, mock supervisors, time control
 
-### Advanced (v1.0.0)
+### Advanced
 
 - **Graceful Shutdown** - Coordinated cleanup with shutdown hooks
 - **State Checkpointing** - Persist and recover process state
