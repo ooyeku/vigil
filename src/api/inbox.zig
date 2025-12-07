@@ -83,7 +83,7 @@ pub const Inbox = struct {
         }
         const message = try Message.init(
             self.allocator,
-            try std.fmt.allocPrint(self.allocator, "inbox_msg_{d}", .{std.time.milliTimestamp()}),
+            "inbox_msg",  // Static string - Message.init will dupe it
             "inbox_sender",
             payload,
             null,
