@@ -24,12 +24,21 @@ pub const InboxError = error{
     InboxClosed,
 };
 
-/// High-level inbox wrapper around ProcessMailbox
+/// High-level inbox wrapper around ProcessMailbox.
+///
+/// Uses an atomic reference count to prevent use-after-free: every
+/// in-flight `send`, `recv`, or `recvTimeout` call increments the
+/// count while it accesses the mailbox.  `close()` sets the closed
+/// flag and then spins until all in-flight operations have finished
+/// before deallocating.
 pub const Inbox = struct {
     mailbox: *ProcessMailbox,
     allocator: std.mem.Allocator,
-    /// Atomic flag indicating the inbox has been closed
+    /// Atomic flag indicating the inbox has been closed.
     closed: std.atomic.Value(bool),
+    /// Number of in-flight operations (send / recv / recvTimeout).
+    /// `close()` waits for this to reach zero before deallocating.
+    active_ops: std.atomic.Value(u32),
 
     /// Create a new inbox
     pub fn init(allocator: std.mem.Allocator) !*Inbox {
@@ -50,22 +59,27 @@ pub const Inbox = struct {
             .mailbox = mailbox,
             .allocator = allocator,
             .closed = std.atomic.Value(bool).init(false),
+            .active_ops = std.atomic.Value(u32).init(0),
         };
 
         return inbox_ptr;
     }
 
     /// Close and cleanup the inbox.
-    /// Sets the closed flag first to signal waiting threads, then waits briefly
-    /// before deallocating resources to allow threads to exit gracefully.
+    /// Sets the closed flag to signal waiting threads, then waits for
+    /// all in-flight operations to finish before deallocating resources.
     pub fn close(self: *Inbox) void {
         // Set closed flag first to signal waiting threads
         self.closed.store(true, .release);
 
-        // Brief wait to allow threads in recv/recvTimeout to notice the flag and exit
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        // Spin-wait until all in-flight operations have exited.
+        // Each operation increments active_ops on entry and decrements
+        // on exit, so reaching zero means nothing is touching the mailbox.
+        while (self.active_ops.load(.acquire) != 0) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
 
-        // Now safe to deallocate
+        // Now safe to deallocate — no threads are inside send/recv
         self.mailbox.deinit();
         self.allocator.destroy(self.mailbox);
         self.allocator.destroy(self);
@@ -81,6 +95,15 @@ pub const Inbox = struct {
         if (self.closed.load(.acquire)) {
             return InboxError.InboxClosed;
         }
+        // Track this operation so close() waits for us
+        _ = self.active_ops.fetchAdd(1, .acq_rel);
+        defer _ = self.active_ops.fetchSub(1, .acq_rel);
+
+        // Re-check after incrementing to handle close() racing with us
+        if (self.closed.load(.acquire)) {
+            return InboxError.InboxClosed;
+        }
+
         const message = try Message.init(
             self.allocator,
             "inbox_msg", // Static string - Message.init will dupe it
@@ -101,14 +124,30 @@ pub const Inbox = struct {
             if (self.closed.load(.acquire)) {
                 return InboxError.InboxClosed;
             }
+            // Track this operation so close() waits for us
+            _ = self.active_ops.fetchAdd(1, .acq_rel);
+
+            // Re-check after incrementing
+            if (self.closed.load(.acquire)) {
+                _ = self.active_ops.fetchSub(1, .acq_rel);
+                return InboxError.InboxClosed;
+            }
+
             if (self.mailbox.receive()) |msg| {
+                _ = self.active_ops.fetchSub(1, .acq_rel);
                 return msg;
             } else |err| switch (err) {
                 error.EmptyMailbox => {
+                    // Release the op count while sleeping so close()
+                    // can make progress if this is the only thread.
+                    _ = self.active_ops.fetchSub(1, .acq_rel);
                     std.Thread.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
-                else => return err,
+                else => {
+                    _ = self.active_ops.fetchSub(1, .acq_rel);
+                    return err;
+                },
             }
         }
     }
@@ -125,14 +164,28 @@ pub const Inbox = struct {
             if (std.time.milliTimestamp() - start > timeout_ms) {
                 return null;
             }
+            // Track this operation so close() waits for us
+            _ = self.active_ops.fetchAdd(1, .acq_rel);
+
+            // Re-check after incrementing
+            if (self.closed.load(.acquire)) {
+                _ = self.active_ops.fetchSub(1, .acq_rel);
+                return InboxError.InboxClosed;
+            }
+
             if (self.mailbox.receive()) |msg| {
+                _ = self.active_ops.fetchSub(1, .acq_rel);
                 return msg;
             } else |err| switch (err) {
                 error.EmptyMailbox => {
+                    _ = self.active_ops.fetchSub(1, .acq_rel);
                     std.Thread.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
-                else => return err,
+                else => {
+                    _ = self.active_ops.fetchSub(1, .acq_rel);
+                    return err;
+                },
             }
         }
     }
@@ -213,6 +266,7 @@ pub const InboxBuilder = struct {
             .mailbox = mailbox,
             .allocator = self.allocator,
             .closed = std.atomic.Value(bool).init(false),
+            .active_ops = std.atomic.Value(u32).init(0),
         };
 
         return inbox_ptr;

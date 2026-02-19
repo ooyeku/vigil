@@ -4,6 +4,13 @@
 const std = @import("std");
 const Message = @import("messages.zig").Message;
 const Inbox = @import("api/inbox.zig").Inbox;
+const telemetry = @import("telemetry.zig");
+
+/// Result of a publish operation, reporting delivery outcomes.
+pub const PublishResult = struct {
+    delivered: usize = 0,
+    failed: usize = 0,
+};
 
 /// Topic pattern matching
 pub const TopicPattern = struct {
@@ -138,8 +145,10 @@ pub const PubSubBroker = struct {
         }
     }
 
-    /// Publish a message to all matching subscribers
-    pub fn publish(self: *PubSubBroker, topic: []const u8, payload: []const u8) !void {
+    /// Publish a message to all matching subscribers.
+    /// Returns a `PublishResult` with delivery/failure counts.
+    /// Emits `message_dropped` telemetry events for each failed delivery.
+    pub fn publish(self: *PubSubBroker, topic: []const u8, payload: []const u8) !PublishResult {
         self.mutex.lock();
         const subscribers_copy = self.allocator.alloc(*Subscriber, self.subscribers.items.len) catch {
             self.mutex.unlock();
@@ -149,11 +158,25 @@ pub const PubSubBroker = struct {
         self.mutex.unlock();
         defer self.allocator.free(subscribers_copy);
 
+        var result = PublishResult{};
         for (subscribers_copy) |subscriber| {
             if (subscriber.matches(topic)) {
-                subscriber.inbox.send(payload) catch {};
+                subscriber.inbox.send(payload) catch {
+                    result.failed += 1;
+                    // Emit telemetry for failed delivery
+                    if (telemetry.getGlobal()) |t| {
+                        t.emit(.{
+                            .event_type = .message_dropped,
+                            .timestamp_ms = std.time.milliTimestamp(),
+                            .metadata = topic,
+                        });
+                    }
+                    continue;
+                };
+                result.delivered += 1;
             }
         }
+        return result;
     }
 };
 
@@ -171,18 +194,37 @@ pub fn initGlobal(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Get global broker
+/// Deinitialize and release the global broker.
+/// Must only be called during shutdown when no other threads are
+/// publishing or subscribing.
+pub fn deinitGlobal() void {
+    broker_mutex.lock();
+    defer broker_mutex.unlock();
+
+    if (global_broker) |*b| {
+        b.deinit();
+        global_broker = null;
+    }
+}
+
+/// Get global broker.
+///
+/// SAFETY: The returned pointer is valid as long as `deinitGlobal()` has
+/// not been called.  Callers must ensure `deinitGlobal()` is only invoked
+/// during shutdown after all publish/subscribe operations have completed.
 pub fn getGlobal() ?*PubSubBroker {
     broker_mutex.lock();
     defer broker_mutex.unlock();
     return if (global_broker) |*b| b else null;
 }
 
-/// Publish to global broker
-pub fn publish(topic: []const u8, payload: []const u8) !void {
+/// Publish to global broker.
+/// Returns a `PublishResult` with delivery/failure counts, or null if no global broker is initialized.
+pub fn publish(topic: []const u8, payload: []const u8) !?PublishResult {
     if (getGlobal()) |broker| {
-        try broker.publish(topic, payload);
+        return try broker.publish(topic, payload);
     }
+    return null;
 }
 
 /// Create a subscriber
@@ -238,8 +280,13 @@ test "PubSubBroker publish/subscribe" {
     try broker.subscribe(&sub1);
     try broker.subscribe(&sub2);
 
-    try broker.publish("events.user.created", "user123");
-    try broker.publish("events.system.alert", "alert1");
+    const user_result = try broker.publish("events.user.created", "user123");
+    try std.testing.expectEqual(@as(usize, 1), user_result.delivered);
+    try std.testing.expectEqual(@as(usize, 0), user_result.failed);
+
+    const sys_result = try broker.publish("events.system.alert", "alert1");
+    try std.testing.expectEqual(@as(usize, 1), sys_result.delivered);
+    try std.testing.expectEqual(@as(usize, 0), sys_result.failed);
 
     // Check inbox1 received user event
     if (try inbox1.recvTimeout(100)) |msg| {

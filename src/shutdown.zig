@@ -92,7 +92,24 @@ pub fn initGlobal(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Get global shutdown manager
+/// Deinitialize and release the global shutdown manager.
+/// Must only be called during shutdown when no other threads are
+/// registering hooks or calling shutdownAll.
+pub fn deinitGlobal() void {
+    shutdown_mutex.lock();
+    defer shutdown_mutex.unlock();
+
+    if (global_shutdown) |*s| {
+        s.deinit();
+        global_shutdown = null;
+    }
+}
+
+/// Get global shutdown manager.
+///
+/// SAFETY: The returned pointer is valid as long as `deinitGlobal()` has
+/// not been called.  Callers must ensure `deinitGlobal()` is only invoked
+/// after all shutdown operations have completed.
 pub fn getGlobal() ?*ShutdownManager {
     shutdown_mutex.lock();
     defer shutdown_mutex.unlock();

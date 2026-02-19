@@ -22,6 +22,8 @@ pub const VigilError = error{
     MessageTooLarge,
     InvalidMessage,
     DeliveryTimeout,
+    RateLimitExceeded,
+    DeliveryFailed,
 
     // Registry errors
     AlreadyRegistered,

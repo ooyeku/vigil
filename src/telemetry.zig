@@ -203,7 +203,24 @@ pub fn initGlobal(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Get global telemetry instance
+/// Deinitialize and release the global telemetry emitter.
+/// Must only be called during shutdown when no other threads are
+/// emitting events or registering handlers.
+pub fn deinitGlobal() void {
+    telemetry_mutex.lock();
+    defer telemetry_mutex.unlock();
+
+    if (global_telemetry) |*t| {
+        t.deinit();
+        global_telemetry = null;
+    }
+}
+
+/// Get global telemetry instance.
+///
+/// SAFETY: The returned pointer is valid as long as `deinitGlobal()` has
+/// not been called.  Callers must ensure `deinitGlobal()` is only invoked
+/// during shutdown after all event emission has completed.
 pub fn getGlobal() ?*TelemetryEmitter {
     telemetry_mutex.lock();
     defer telemetry_mutex.unlock();

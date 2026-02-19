@@ -4,6 +4,13 @@
 const std = @import("std");
 const Message = @import("messages.zig").Message;
 const Inbox = @import("api/inbox.zig").Inbox;
+const telemetry = @import("telemetry.zig");
+
+/// Result of a broadcast operation, reporting delivery outcomes.
+pub const BroadcastResult = struct {
+    delivered: usize = 0,
+    failed: usize = 0,
+};
 
 /// Routing strategy for process groups
 pub const RoutingStrategy = enum {
@@ -88,8 +95,10 @@ pub const ProcessGroup = struct {
         return self.members.items.len;
     }
 
-    /// Broadcast a message to all members
-    pub fn broadcast(self: *ProcessGroup, payload: []const u8) !void {
+    /// Broadcast a message to all members.
+    /// Returns a `BroadcastResult` with delivery/failure counts.
+    /// Emits `message_dropped` telemetry events for each failed delivery.
+    pub fn broadcast(self: *ProcessGroup, payload: []const u8) !BroadcastResult {
         self.mutex.lock();
         const members_copy = self.allocator.alloc(GroupMember, self.members.items.len) catch {
             self.mutex.unlock();
@@ -99,9 +108,23 @@ pub const ProcessGroup = struct {
         self.mutex.unlock();
         defer self.allocator.free(members_copy);
 
+        var result = BroadcastResult{};
         for (members_copy) |member| {
-            member.inbox.send(payload) catch {};
+            member.inbox.send(payload) catch {
+                result.failed += 1;
+                // Emit telemetry for failed delivery
+                if (telemetry.getGlobal()) |t| {
+                    t.emit(.{
+                        .event_type = .message_dropped,
+                        .timestamp_ms = std.time.milliTimestamp(),
+                        .metadata = self.name,
+                    });
+                }
+                continue;
+            };
+            result.delivered += 1;
         }
+        return result;
     }
 
     /// Send message using round-robin distribution
@@ -136,12 +159,8 @@ pub const ProcessGroup = struct {
         try member.inbox.send(payload);
     }
 
-    /// Get member count
-    pub fn count(self: *ProcessGroup) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.members.items.len;
-    }
+    /// Deprecated: use `memberCount()` instead.
+    pub const count = memberCount;
 };
 
 pub const ProcessGroupError = error{
@@ -165,11 +184,13 @@ test "ProcessGroup basic operations" {
     try group.add("worker1", inbox1);
     try group.add("worker2", inbox2);
 
-    try std.testing.expect(group.count() == 2);
+    try std.testing.expect(group.memberCount() == 2);
 
-    try group.broadcast("test");
+    const result = try group.broadcast("test");
+    try std.testing.expectEqual(@as(usize, 2), result.delivered);
+    try std.testing.expectEqual(@as(usize, 0), result.failed);
     try std.testing.expect(group.remove("worker1"));
-    try std.testing.expect(group.count() == 1);
+    try std.testing.expect(group.memberCount() == 1);
 }
 
 test "ProcessGroup round robin" {

@@ -113,7 +113,7 @@ pub const FlowControlledInbox = struct {
         // Check rate limit
         if (self.rate_limiter) |*limiter| {
             if (!limiter.allow()) {
-                return MessageError.MessageTooLarge; // Use as rate limit error
+                return MessageError.RateLimitExceeded;
             }
         }
 

@@ -12,10 +12,15 @@ pub const RequestOptions = struct {
     timeout_ms: u32 = 5000,
 };
 
-/// Reply mailbox for handling responses
+/// Reply mailbox for handling responses.
+/// Non-matching messages are re-queued to avoid dropping messages
+/// intended for other pending requests.
 pub const ReplyMailbox = struct {
     inbox: *Inbox,
     correlation_map: std.StringHashMap(*std.Thread.ResetEvent),
+    /// Buffer for messages that didn't match the awaited correlation ID.
+    /// These are re-sent to the inbox so other consumers can process them.
+    stash: std.ArrayListUnmanaged(Message),
     mutex: std.Thread.Mutex,
     allocator: std.mem.Allocator,
 
@@ -24,6 +29,7 @@ pub const ReplyMailbox = struct {
         return .{
             .inbox = inbox,
             .correlation_map = std.StringHashMap(*std.Thread.ResetEvent).init(allocator),
+            .stash = .{},
             .mutex = .{},
             .allocator = allocator,
         };
@@ -40,9 +46,38 @@ pub const ReplyMailbox = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.correlation_map.deinit();
+
+        // Clean up any stashed messages
+        for (self.stash.items) |*msg| {
+            msg.deinit();
+        }
+        self.stash.deinit(self.allocator);
     }
 
-    /// Wait for a reply with the given correlation ID
+    /// Flush stashed (non-matching) messages back to the inbox so they
+    /// are available for other consumers or future waitForReply calls.
+    fn flushStash(self: *ReplyMailbox) void {
+        while (self.stash.items.len > 0) {
+            const stashed = self.stash.items[0];
+            if (stashed.payload) |payload| {
+                self.inbox.send(payload) catch {
+                    // If inbox is closed or full, keep in stash and stop
+                    break;
+                };
+                // Sent successfully, free the stashed message and remove
+                var removed = self.stash.orderedRemove(0);
+                removed.deinit();
+            } else {
+                // No payload to re-send, discard
+                var removed = self.stash.orderedRemove(0);
+                removed.deinit();
+            }
+        }
+    }
+
+    /// Wait for a reply with the given correlation ID.
+    /// Non-matching messages are stashed and re-queued to the inbox
+    /// when the wait completes (on match, timeout, or error).
     pub fn waitForReply(
         self: *ReplyMailbox,
         correlation_id: []const u8,
@@ -78,13 +113,13 @@ pub const ReplyMailbox = struct {
                 cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
                 self.allocator.free(corr_id_copy);
                 self.allocator.destroy(event);
+                self.flushStash();
                 return MessageError.DeliveryTimeout;
             }
 
             // Check inbox for reply
             if (self.inbox.recvTimeout(100)) |msg_opt| {
                 if (msg_opt) |msg| {
-                    defer msg.deinit();
                     if (msg.metadata.correlation_id) |msg_corr_id| {
                         if (std.mem.eql(u8, msg_corr_id, corr_id_copy)) {
                             // Found matching reply
@@ -92,11 +127,25 @@ pub const ReplyMailbox = struct {
                             self.allocator.free(corr_id_copy);
                             self.allocator.destroy(event);
 
-                            // Return a copy of the message
-                            return msg.dupe();
+                            // Return a copy of the message, free original
+                            const duped = msg.dupe() catch |err| {
+                                var m = msg;
+                                m.deinit();
+                                self.flushStash();
+                                return err;
+                            };
+                            var orig = msg;
+                            orig.deinit();
+                            self.flushStash();
+                            return duped;
                         }
                     }
-                    // Not our reply, put it back (simplified - in real impl might need a queue)
+                    // Not our reply — stash it for re-queuing
+                    self.stash.append(self.allocator, msg) catch {
+                        // If we can't stash, deinit to avoid leak
+                        var m = msg;
+                        m.deinit();
+                    };
                 }
             } else |err| {
                 // Check if inbox is closed
@@ -104,6 +153,7 @@ pub const ReplyMailbox = struct {
                     cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
                     self.allocator.free(corr_id_copy);
                     self.allocator.destroy(event);
+                    self.flushStash();
                     return MessageError.ReceiverUnavailable;
                 }
             }

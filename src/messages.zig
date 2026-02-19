@@ -60,6 +60,8 @@ pub const MessageError = error{
     MessageTooLarge, // Message exceeds size limits
     DuplicateMessage, // Message with same ID already exists
     OutOfMemory, // Memory allocation failed
+    RateLimitExceeded, // Operation rejected by rate limiter
+    DeliveryFailed, // Message could not be delivered to subscriber
 };
 
 /// Message priority levels for handling urgent communications.

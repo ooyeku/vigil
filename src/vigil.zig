@@ -83,11 +83,13 @@ pub const CircuitState = circuit_breaker.CircuitState;
 
 // Process groups
 pub const ProcessGroup = process_group.ProcessGroup;
+pub const BroadcastResult = process_group.BroadcastResult;
 
 // Pub/Sub
 pub const publish = pubsub.publish;
 pub const subscribe = pubsub.subscribe;
 pub const Subscriber = pubsub.Subscriber;
+pub const PublishResult = pubsub.PublishResult;
 
 // Checkpointing
 pub const Checkpointer = checkpoint.Checkpointer;
@@ -138,7 +140,7 @@ const compat_0_2 = @import("compat_0_2.zig");
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
         .major = 1,
-        .minor = 0,
+        .minor = 1,
         .patch = 0,
     };
 }
