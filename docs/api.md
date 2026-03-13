@@ -1,4 +1,4 @@
-# Vigil API Reference v1.0.0
+# Vigil API Reference v1.2.0
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 
@@ -648,30 +648,148 @@ const test_ckpt = mem_ckpt.toCheckpointer();
 
 ---
 
+### GenServer
+
+Generic stateful server with synchronous call/reply and optional state checkpointing.
+
+```zig
+const vigil = @import("vigil");
+
+const State = struct { count: u32 };
+const MyServer = vigil.GenServer(State);
+
+const server = try MyServer.init(
+    allocator,
+    struct {
+        fn handle(self: *MyServer, msg: vigil.Message) !void {
+            if (msg.payload) |payload| {
+                if (std.mem.eql(u8, payload, "increment")) {
+                    self.state.count += 1;
+                }
+                // Reply to synchronous call() requests
+                if (msg.metadata.correlation_id != null) {
+                    const result = try std.fmt.allocPrint(self.allocator, "{d}", .{self.state.count});
+                    defer self.allocator.free(result);
+                    try self.reply(msg, result);
+                }
+            }
+        }
+    }.handle,
+    struct { fn init_cb(self: *MyServer) !void { _ = self; } }.init_cb,
+    struct { fn terminate(self: *MyServer) void { _ = self; } }.terminate,
+    State{ .count = 0 },
+);
+
+// Start in a background thread
+const thread = try std.Thread.spawn(.{}, struct {
+    fn run(s: *MyServer) void { s.start() catch {}; }
+}.run, .{server});
+
+// Asynchronous message (fire-and-forget)
+try server.cast(try vigil.Message.init(allocator, "m1", "client", "increment", null, .normal, null));
+
+// Synchronous call (blocks until handler calls self.reply())
+var request = try vigil.Message.init(allocator, "m2", "client", "increment", null, .normal, null);
+defer request.deinit();
+var response = try server.call(&request, 2000); // 2s timeout
+defer response.deinit();
+
+// Shutdown: signal stop, join thread, then free resources
+server.stop();
+thread.join();
+server.deinit();
+```
+
+**State Checkpointing:**
+
+```zig
+var mem_ckpt = vigil.MemoryCheckpointer.init(allocator);
+defer mem_ckpt.deinit();
+
+try server.setCheckpointer(mem_ckpt.toCheckpointer(), "my_server", 5000, .{
+    .serialize = struct {
+        fn f(state: *const State, alloc: std.mem.Allocator) ![]u8 {
+            return try std.fmt.allocPrint(alloc, "{d}", .{state.count});
+        }
+    }.f,
+    .deserialize = struct {
+        fn f(data: []const u8, _: std.mem.Allocator) !State {
+            return State{ .count = try std.fmt.parseInt(u32, data, 10) };
+        }
+    }.f,
+});
+// State is auto-saved every 5s and on shutdown.
+// On init, existing checkpoints are auto-restored.
+```
+
+| Method | Description |
+|--------|-------------|
+| `init(allocator, handler, init_fn, terminate_fn, state)` | Create a new GenServer |
+| `deinit()` | Free resources (call after stop + thread join) |
+| `start()` | Run the message loop (blocks) |
+| `stop()` | Signal the server to stop |
+| `cast(msg)` | Send async message |
+| `call(msg, timeout_ms)` | Send sync message, wait for reply |
+| `reply(msg, payload)` | Reply to a call() from within the handler |
+| `setCheckpointer(ckpt, id, interval_ms, fns)` | Enable state checkpointing |
+| `register(name)` | Register with the global registry |
+| `schedule(msg, delay_ms)` | Send a delayed message to self |
+| `supervise(supervisor, id)` | Register with a supervisor |
+
+---
+
 ### Distributed Registry
 
-Cross-process name resolution for distributed systems.
+Cross-process name resolution with TCP-based cluster communication.
 
 ```zig
 var registry = try vigil.DistributedRegistry.init(allocator, .{
     .cluster_nodes = &.{"node1:9001", "node2:9002"},
     .sync_interval_ms = 1000,
     .heartbeat_timeout_ms = 5000,
+    .listen_port = 9100, // TCP port for incoming queries
 });
 defer registry.deinit();
 
 // Register process (local or global scope)
 try registry.register("my_service", mailbox, .global);
 
-// Lookup process
-if (registry.whereis("my_service")) |mailbox| {
-    // Use mailbox
+// Local lookup (returns *ProcessMailbox)
+if (registry.whereis("my_service")) |mb| {
+    // Use mailbox directly
+    _ = mb;
 }
 
-// Start/stop cluster synchronization
+// Global lookup (checks local + remote cache, returns RemoteProcessInfo)
+if (registry.whereisGlobal("remote_service")) |info| {
+    std.debug.print("Found on {s}:{d}\n", .{ info.node_address, info.node_port });
+}
+
+// Active query to all peer nodes (updates cache)
+if (registry.queryPeers("remote_service")) |info| {
+    std.debug.print("Found on {s}:{d}\n", .{ info.node_address, info.node_port });
+}
+
+// Start listener + sync threads (heartbeats, registration propagation)
 try registry.startSync();
+
+// Stop synchronization
 registry.stopSync();
 ```
+
+**Cluster Protocol (TCP, newline-delimited):**
+- `HEART` -> `ALIVE` (liveness check)
+- `WHERE <name>` -> `FOUND` / `NOTFOUND` (name lookup)
+- `REG <name>` -> `OK` (registration propagation)
+
+| Method | Description |
+|--------|-------------|
+| `register(name, mailbox, scope)` | Register locally; if `.global`, sync to peers |
+| `whereis(name)` | Local-only lookup, returns `?*ProcessMailbox` |
+| `whereisGlobal(name)` | Check local + remote cache, returns `?RemoteProcessInfo` |
+| `queryPeers(name)` | Actively query all peer nodes via TCP |
+| `startSync()` | Start listener and sync threads |
+| `stopSync()` | Stop listener and sync threads |
 
 ---
 
@@ -868,19 +986,20 @@ pub const ProcessPriority = enum {
 pub const VigilError = error{
     // Process
     ProcessNotFound, ProcessAlreadyRunning, ProcessStartFailed, ProcessStopFailed,
-    
+
     // Supervisor
     SupervisorNotFound, ChildNotFound, TooManyRestarts, ShutdownTimeout, AlreadyMonitoring,
-    
+
     // Message
     EmptyMailbox, MailboxFull, MessageExpired, MessageTooLarge, InvalidMessage, DeliveryTimeout,
-    
+    RateLimitExceeded, DeliveryFailed,
+
     // Registry
     AlreadyRegistered, NotRegistered,
-    
+
     // Circuit Breaker
     CircuitOpen,
-    
+
     // General
     OutOfMemory, InvalidConfiguration, OperationTimeout, InvalidState,
 };
@@ -907,6 +1026,8 @@ pub const VigilError = error{
 | `DeliveryTimeout` | Send/receive timed out |
 | `InvalidMessage` | Message validation failed |
 | `ReceiverUnavailable` | Receiver not available |
+| `RateLimitExceeded` | Rejected by rate limiter |
+| `DeliveryFailed` | Subscriber delivery failure |
 
 ### Circuit Breaker Errors
 

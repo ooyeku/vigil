@@ -1,7 +1,9 @@
 //! Distributed registry for Vigil
-//! Cross-process name resolution.
+//! Cross-process name resolution with TCP-based cluster communication.
 
 const std = @import("std");
+const net = std.net;
+const posix = std.posix;
 const Registry = @import("registry.zig").Registry;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 
@@ -13,22 +15,54 @@ pub const ClusterNode = struct {
     is_alive: bool,
 };
 
+/// Information about a process registered on a remote node
+pub const RemoteProcessInfo = struct {
+    name: []const u8,
+    node_address: []const u8,
+    node_port: u16,
+};
+
 /// Distributed registry configuration
 pub const DistributedRegistryConfig = struct {
     cluster_nodes: []const []const u8, // "host:port" format
     sync_interval_ms: u32 = 1000,
     heartbeat_timeout_ms: u32 = 5000,
+    listen_port: u16 = 9100,
 };
 
-/// Distributed registry extends local registry
+/// Text-based protocol opcodes (newline-delimited)
+/// REG <name>    -> OK | ERR <msg>
+/// UNREG <name>  -> OK
+/// WHERE <name>  -> FOUND | NOTFOUND
+/// HEART         -> ALIVE
+const Protocol = struct {
+    fn sendFrame(stream: net.Stream, data: []const u8) void {
+        _ = stream.write(data) catch {};
+    }
+
+    fn readLine(stream: net.Stream, buffer: []u8) ?[]const u8 {
+        const n = stream.read(buffer) catch return null;
+        if (n == 0) return null;
+        return std.mem.trim(u8, buffer[0..n], "\r\n");
+    }
+};
+
+/// Distributed registry extends local registry with TCP-based cluster communication.
 pub const DistributedRegistry = struct {
     local_registry: Registry,
     allocator: std.mem.Allocator,
     config: DistributedRegistryConfig,
     nodes: std.ArrayListUnmanaged(ClusterNode),
+    /// Names that were registered locally with global scope
+    global_names: std.StringArrayHashMap(void),
+    /// Cache of names known to exist on remote nodes
+    remote_registrations: std.StringHashMap(RemoteProcessInfo),
     mutex: std.Thread.Mutex,
     sync_thread: ?std.Thread = null,
-    should_sync: bool = false,
+    listener_thread: ?std.Thread = null,
+    should_sync: std.atomic.Value(bool),
+    /// Listening socket fd, stored so stopSync() can close it to unblock accept()
+    listener_fd: ?posix.socket_t = null,
 
     /// Initialize distributed registry
     pub fn init(allocator: std.mem.Allocator, config: DistributedRegistryConfig) !DistributedRegistry {
@@ -58,32 +92,55 @@ pub const DistributedRegistry = struct {
             .allocator = allocator,
             .config = config,
             .nodes = nodes,
+            .global_names = std.StringArrayHashMap(void).init(allocator),
+            .remote_registrations = std.StringHashMap(RemoteProcessInfo).init(allocator),
             .mutex = .{},
             .sync_thread = null,
-            .should_sync = false,
+            .listener_thread = null,
+            .should_sync = std.atomic.Value(bool).init(false),
+            .listener_fd = null,
         };
     }
 
     /// Cleanup resources
     pub fn deinit(self: *DistributedRegistry) void {
-        self.should_sync = false;
-        if (self.sync_thread) |thread| {
-            thread.join();
-        }
+        self.stopSync();
 
         for (self.nodes.items) |*node| {
             self.allocator.free(node.address);
         }
         self.nodes.deinit(self.allocator);
+
+        // Free global_names keys
+        {
+            var it = self.global_names.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            self.global_names.deinit();
+        }
+
+        // Free remote_registrations
+        {
+            var it = self.remote_registrations.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*.name);
+                self.allocator.free(entry.value_ptr.*.node_address);
+            }
+            self.remote_registrations.deinit();
+        }
+
         self.local_registry.deinit();
     }
 
-    /// Register a process with scope
+    /// Registration scope
     pub const RegistrationScope = enum {
         local, // Only visible on this node
         global, // Visible across cluster
     };
 
+    /// Register a process with scope
     pub fn register(
         self: *DistributedRegistry,
         name: []const u8,
@@ -93,72 +150,302 @@ pub const DistributedRegistry = struct {
         // Always register locally
         try self.local_registry.register(name, mailbox);
 
-        // If global, sync to cluster
+        // If global, track the name for sync
         if (scope == .global) {
-            try self.syncToCluster(name, mailbox);
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const name_copy = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(name_copy);
+            try self.global_names.put(name_copy, {});
         }
     }
 
-    /// Lookup process (checks local first, then cluster)
+    /// Lookup process locally
     pub fn whereis(self: *DistributedRegistry, name: []const u8) ?*ProcessMailbox {
+        return self.local_registry.whereis(name);
+    }
+
+    /// Lookup process across the cluster.
+    /// Checks local registry first, then the remote registration cache.
+    pub fn whereisGlobal(self: *DistributedRegistry, name: []const u8) ?RemoteProcessInfo {
         // Check local first
-        if (self.local_registry.whereis(name)) |mailbox| {
-            return mailbox;
+        if (self.local_registry.whereis(name) != null) {
+            return RemoteProcessInfo{
+                .name = name,
+                .node_address = "local",
+                .node_port = self.config.listen_port,
+            };
         }
 
-        // Check cluster (simplified - would query remote nodes)
+        // Check remote cache
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.remote_registrations.get(name);
+    }
+
+    /// Actively query all peer nodes for a name.
+    /// Updates the remote registration cache on success.
+    pub fn queryPeers(self: *DistributedRegistry, name: []const u8) ?RemoteProcessInfo {
+        self.mutex.lock();
+        const nodes_snapshot = self.allocator.dupe(ClusterNode, self.nodes.items) catch return null;
+        self.mutex.unlock();
+        defer self.allocator.free(nodes_snapshot);
+
+        for (nodes_snapshot) |node| {
+            if (!node.is_alive) continue;
+            if (self.queryNode(node, name)) {
+                const info = RemoteProcessInfo{
+                    .name = name,
+                    .node_address = node.address,
+                    .node_port = node.port,
+                };
+                // Cache result
+                self.cacheRemoteRegistration(name, info) catch {};
+                return info;
+            }
+        }
         return null;
     }
 
-    /// Sync registration to cluster (simplified)
-    fn syncToCluster(self: *DistributedRegistry, name: []const u8, mailbox: *ProcessMailbox) !void {
+    /// Query a single node for a name via TCP
+    fn queryNode(self: *DistributedRegistry, node: ClusterNode, name: []const u8) bool {
         _ = self;
-        _ = name;
-        _ = mailbox;
-        // Would send registration message to all cluster nodes
+        const addr = net.Address.parseIp4(node.address, node.port) catch return false;
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return false;
+        defer posix.close(fd);
+
+        // Set connect timeout via SO_SNDTIMEO
+        const timeout = posix.timeval{ .sec = 1, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
+        const stream = net.Stream{ .handle = fd };
+
+        var buf: [256]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "WHERE {s}\n", .{name}) catch return false;
+        _ = stream.write(cmd) catch return false;
+
+        var resp_buf: [256]u8 = undefined;
+        const line = Protocol.readLine(stream, &resp_buf) orelse return false;
+        return std.mem.eql(u8, line, "FOUND");
     }
 
-    /// Start synchronization thread
-    pub fn startSync(self: *DistributedRegistry) !void {
+    fn cacheRemoteRegistration(self: *DistributedRegistry, name: []const u8, info: RemoteProcessInfo) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.sync_thread != null) return error.AlreadySyncing;
+        // Remove old entry if exists
+        if (self.remote_registrations.fetchRemove(name)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value.name);
+            self.allocator.free(old.value.node_address);
+        }
 
-        self.should_sync = true;
-        self.sync_thread = try std.Thread.spawn(.{}, syncLoop, .{self});
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+        const info_name = try self.allocator.dupe(u8, info.name);
+        errdefer self.allocator.free(info_name);
+        const info_addr = try self.allocator.dupe(u8, info.node_address);
+        errdefer self.allocator.free(info_addr);
+
+        try self.remote_registrations.put(name_copy, .{
+            .name = info_name,
+            .node_address = info_addr,
+            .node_port = info.node_port,
+        });
     }
 
-    /// Stop synchronization
-    pub fn stopSync(self: *DistributedRegistry) void {
-        self.mutex.lock();
-        self.should_sync = false;
-        const thread = self.sync_thread;
-        self.sync_thread = null;
-        self.mutex.unlock();
+    /// Send heartbeat to a node and update liveness
+    fn sendHeartbeat(_: *DistributedRegistry, node: *ClusterNode) void {
+        const addr = net.Address.parseIp4(node.address, node.port) catch {
+            node.is_alive = false;
+            return;
+        };
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
+            node.is_alive = false;
+            return;
+        };
+        defer posix.close(fd);
 
-        if (thread) |t| {
-            t.join();
+        const timeout = posix.timeval{ .sec = 1, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
+            node.is_alive = false;
+            return;
+        };
+        const stream = net.Stream{ .handle = fd };
+
+        _ = stream.write("HEART\n") catch {
+            node.is_alive = false;
+            return;
+        };
+
+        var buf: [64]u8 = undefined;
+        if (Protocol.readLine(stream, &buf)) |line| {
+            if (std.mem.eql(u8, line, "ALIVE")) {
+                node.last_seen_ms = std.time.milliTimestamp();
+                node.is_alive = true;
+                return;
+            }
+        }
+        node.is_alive = false;
+    }
+
+    /// Sync a global registration to a single peer node
+    fn syncRegistration(self: *DistributedRegistry, node: ClusterNode, name: []const u8) void {
+        _ = self;
+        const addr = net.Address.parseIp4(node.address, node.port) catch return;
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
+        defer posix.close(fd);
+
+        const timeout = posix.timeval{ .sec = 1, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return;
+        const stream = net.Stream{ .handle = fd };
+
+        var buf: [256]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "REG {s}\n", .{name}) catch return;
+        _ = stream.write(cmd) catch {};
+    }
+
+    /// Handle a single incoming connection on the listener
+    fn handleIncoming(self: *DistributedRegistry, stream: net.Stream, peer_addr: net.Address) void {
+        defer stream.close();
+
+        var buffer: [1024]u8 = undefined;
+        const line = Protocol.readLine(stream, &buffer) orelse return;
+
+        if (std.mem.startsWith(u8, line, "WHERE ")) {
+            const name = line["WHERE ".len..];
+            if (self.local_registry.whereis(name) != null) {
+                Protocol.sendFrame(stream, "FOUND\n");
+            } else {
+                Protocol.sendFrame(stream, "NOTFOUND\n");
+            }
+        } else if (std.mem.startsWith(u8, line, "REG ")) {
+            const name = line["REG ".len..];
+            // Extract peer address info
+            var addr_buf: [64]u8 = undefined;
+            const addr_str = std.fmt.bufPrint(&addr_buf, "{}", .{peer_addr}) catch {
+                Protocol.sendFrame(stream, "OK\n");
+                return;
+            };
+            // Parse port from peer address (format: "ip:port")
+            const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse {
+                Protocol.sendFrame(stream, "OK\n");
+                return;
+            };
+            const peer_port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch {
+                Protocol.sendFrame(stream, "OK\n");
+                return;
+            };
+            const peer_ip = addr_str[0..colon];
+
+            self.cacheRemoteRegistration(name, .{
+                .name = name,
+                .node_address = peer_ip,
+                .node_port = peer_port,
+            }) catch {};
+            Protocol.sendFrame(stream, "OK\n");
+        } else if (std.mem.eql(u8, line, "HEART")) {
+            Protocol.sendFrame(stream, "ALIVE\n");
+        } else {
+            Protocol.sendFrame(stream, "ERR unknown command\n");
         }
     }
 
-    /// Synchronization loop
+    /// Start listener and synchronization threads
+    pub fn startSync(self: *DistributedRegistry) !void {
+        if (self.should_sync.load(.acquire)) return error.AlreadySyncing;
+
+        self.should_sync.store(true, .release);
+
+        // Start listener thread
+        self.listener_thread = try std.Thread.spawn(.{}, listenerLoop, .{self});
+
+        // Start sync thread
+        self.sync_thread = try std.Thread.spawn(.{}, syncLoop, .{self});
+    }
+
+    /// Stop synchronization and listener
+    pub fn stopSync(self: *DistributedRegistry) void {
+        if (!self.should_sync.load(.acquire)) return;
+
+        self.should_sync.store(false, .release);
+
+        // Close listener socket to unblock accept()
+        if (self.listener_fd) |fd| {
+            posix.close(fd);
+            self.listener_fd = null;
+        }
+
+        if (self.listener_thread) |t| {
+            t.join();
+            self.listener_thread = null;
+        }
+        if (self.sync_thread) |t| {
+            t.join();
+            self.sync_thread = null;
+        }
+    }
+
+    /// TCP listener loop - accepts incoming protocol connections
+    fn listenerLoop(self: *DistributedRegistry) void {
+        const addr = net.Address.parseIp4("0.0.0.0", self.config.listen_port) catch return;
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
+
+        self.listener_fd = fd;
+
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        posix.bind(fd, &addr.any, addr.getOsSockLen()) catch return;
+        posix.listen(fd, 32) catch return;
+
+        var server = net.Server{
+            .stream = .{ .handle = fd },
+            .listen_address = addr,
+        };
+
+        while (self.should_sync.load(.acquire)) {
+            const conn = server.accept() catch |err| switch (err) {
+                error.SocketNotListening => break,
+                else => {
+                    if (!self.should_sync.load(.acquire)) break;
+                    continue;
+                },
+            };
+            self.handleIncoming(conn.stream, conn.address);
+        }
+    }
+
+    /// Synchronization loop - heartbeats and registration sync
     fn syncLoop(self: *DistributedRegistry) void {
-        while (true) {
-            {
-                self.mutex.lock();
-                const should_continue = self.should_sync;
-                self.mutex.unlock();
-
-                if (!should_continue) break;
-            }
-
-            // Sync with cluster nodes
+        while (self.should_sync.load(.acquire)) {
+            // Heartbeat all nodes
             self.mutex.lock();
             for (self.nodes.items) |*node| {
+                self.sendHeartbeat(node);
+
+                // Mark dead if heartbeat timeout exceeded
                 const now_ms = std.time.milliTimestamp();
                 if (now_ms - node.last_seen_ms > self.config.heartbeat_timeout_ms) {
                     node.is_alive = false;
+                }
+            }
+            self.mutex.unlock();
+
+            // Sync global registrations to live peers
+            self.mutex.lock();
+            var name_it = self.global_names.iterator();
+            while (name_it.next()) |entry| {
+                for (self.nodes.items) |node| {
+                    if (node.is_alive) {
+                        self.syncRegistration(node, entry.key_ptr.*);
+                    }
                 }
             }
             self.mutex.unlock();
@@ -189,4 +476,63 @@ test "DistributedRegistry basic operations" {
     try registry.register("test_proc", &mailbox, .local);
     const found = registry.whereis("test_proc");
     try std.testing.expect(found != null);
+}
+
+test "DistributedRegistry global scope tracks names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var registry = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+    });
+    defer registry.deinit();
+
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 10 });
+    defer mailbox.deinit();
+
+    try registry.register("global_proc", &mailbox, .global);
+
+    // Should be findable locally
+    const found = registry.whereis("global_proc");
+    try std.testing.expect(found != null);
+
+    // Should be tracked as a global name
+    try std.testing.expect(registry.global_names.contains("global_proc"));
+}
+
+test "DistributedRegistry whereisGlobal returns local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var registry = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .listen_port = 9199,
+    });
+    defer registry.deinit();
+
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 10 });
+    defer mailbox.deinit();
+
+    try registry.register("my_service", &mailbox, .local);
+
+    const info = registry.whereisGlobal("my_service");
+    try std.testing.expect(info != null);
+    try std.testing.expectEqualSlices(u8, "local", info.?.node_address);
+    try std.testing.expectEqual(@as(u16, 9199), info.?.node_port);
+}
+
+test "DistributedRegistry whereisGlobal returns null for unknown" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var registry = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+    });
+    defer registry.deinit();
+
+    const info = registry.whereisGlobal("nonexistent");
+    try std.testing.expect(info == null);
 }

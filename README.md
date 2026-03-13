@@ -2,7 +2,6 @@
 
 A process supervision and inter-process communication library for Zig, designed for building reliable distributed systems and concurrent applications. Inspired by Erlang/OTP.
 
-
 ## Installation
 
 ```bash

@@ -98,6 +98,7 @@ pub const MemoryCheckpointer = checkpoint.MemoryCheckpointer;
 
 // Distributed registry
 pub const DistributedRegistry = distributed_registry.DistributedRegistry;
+pub const RemoteProcessInfo = distributed_registry.RemoteProcessInfo;
 
 // Shutdown
 pub const onShutdown = shutdown.onShutdown;
@@ -140,7 +141,7 @@ const compat_0_2 = @import("compat_0_2.zig");
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
         .major = 1,
-        .minor = 1,
+        .minor = 2,
         .patch = 0,
     };
 }
