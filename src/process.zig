@@ -35,7 +35,8 @@
 const ProcessMod = @This();
 const std = @import("std");
 const Thread = std.Thread;
-const Mutex = std.Thread.Mutex;
+const compat = @import("compat.zig");
+const Mutex = compat.Mutex;
 const Allocator = std.mem.Allocator;
 
 /// Comprehensive error set for process operations.
@@ -355,10 +356,10 @@ pub const ChildProcess = struct {
         self.state = .stopping;
 
         if (self.thread) |thread| {
-            const start_time = std.time.milliTimestamp();
+            const start_time = compat.milliTimestamp();
 
             while (true) {
-                const elapsed = std.time.milliTimestamp() - start_time;
+                const elapsed = compat.milliTimestamp() - start_time;
                 if (elapsed > self.spec.shutdown_timeout_ms) {
                     thread.detach();
                     self.thread = null;
@@ -375,7 +376,7 @@ pub const ChildProcess = struct {
 
                 // Release lock while sleeping
                 self.mutex.unlock();
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                compat.sleep(10 * std.time.ns_per_ms);
                 self.mutex.lock();
             }
         }
@@ -487,7 +488,7 @@ pub const ChildProcess = struct {
     /// Update process statistics.
     /// Called internally at key points to maintain accurate stats.
     fn updateStats(self: *ChildProcess) void {
-        const current_time = std.time.milliTimestamp();
+        const current_time = compat.milliTimestamp();
         if (self.stats.start_time == 0) {
             self.stats.start_time = current_time;
         }
@@ -517,7 +518,7 @@ test "ChildProcess basic lifecycle" {
         .start_fn = struct {
             fn testFn() void {
                 // Simple function that just sleeps briefly
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                compat.sleep(10 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .temporary,
@@ -540,7 +541,7 @@ test "ChildProcess basic lifecycle" {
     try std.testing.expectError(ProcessError.AlreadyRunning, process.start());
 
     // Wait for process to complete
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    compat.sleep(20 * std.time.ns_per_ms);
 
     // Test stopping
     try process.stop();
@@ -555,7 +556,7 @@ test "ChildProcess timeout handling" {
             fn testFn() void {
                 // Function that runs longer than timeout
                 while (true) {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    compat.sleep(10 * std.time.ns_per_ms);
                 }
             }
         }.testFn,
@@ -580,7 +581,7 @@ test "ChildProcess error handling" {
         .start_fn = struct {
             fn testFn() void {
                 // Function that exits quickly
-                std.Thread.sleep(5 * std.time.ns_per_ms);
+                compat.sleep(5 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,
@@ -601,11 +602,11 @@ test "ChildProcess error handling" {
     try std.testing.expect(process.thread != null);
 
     // Wait for completion and verify cleanup
-    std.Thread.sleep(50 * std.time.ns_per_ms); // Increased wait time to ensure completion
+    compat.sleep(50 * std.time.ns_per_ms); // Increased wait time to ensure completion
     try process.stop();
 
     // Add a small delay after stop to ensure cleanup completes
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
 
     // Verify final state
     try std.testing.expectEqual(ProcessState.stopped, process.getState());
@@ -617,7 +618,7 @@ test "ChildProcess state transitions" {
         .id = "test_states",
         .start_fn = struct {
             fn testFn() void {
-                std.Thread.sleep(10 * std.time.ns_per_ms); // Reduced sleep time
+                compat.sleep(10 * std.time.ns_per_ms); // Reduced sleep time
             }
         }.testFn,
         .restart_type = .temporary,
@@ -633,7 +634,7 @@ test "ChildProcess state transitions" {
     try std.testing.expectEqual(ProcessState.running, process.getState());
 
     // Let it run a bit
-    std.Thread.sleep(20 * std.time.ns_per_ms); // Increased wait time
+    compat.sleep(20 * std.time.ns_per_ms); // Increased wait time
 
     // Stop and verify final state
     try process.stop();
@@ -648,7 +649,7 @@ test "Process health checks" {
             fn testFn() void {
                 var i: usize = 0;
                 while (i < 5) : (i += 1) {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    compat.sleep(10 * std.time.ns_per_ms);
                 }
             }
         }.testFn,
@@ -670,7 +671,7 @@ test "Process health checks" {
     try std.testing.expect(process.checkHealth());
 
     // Let it run and check stats
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    compat.sleep(20 * std.time.ns_per_ms);
     const stats = process.getStats();
     try std.testing.expect(stats.health_check_failures == 0);
     try std.testing.expect(stats.start_time > 0);
@@ -684,7 +685,7 @@ test "Process signals" {
             fn testFn() void {
                 var i: usize = 0;
                 while (i < 10) : (i += 1) {
-                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    compat.sleep(10 * std.time.ns_per_ms);
                 }
             }
         }.testFn,
@@ -706,7 +707,7 @@ test "Process signals" {
     try std.testing.expectEqual(ProcessState.running, process.getState());
 
     // Let it run a bit to ensure state is stable
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    compat.sleep(5 * std.time.ns_per_ms);
     try std.testing.expectEqual(ProcessState.running, process.getState());
 }
 
@@ -715,7 +716,7 @@ test "Process resource limits" {
         .id = "test_resources",
         .start_fn = struct {
             fn testFn() void {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                compat.sleep(50 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .temporary,

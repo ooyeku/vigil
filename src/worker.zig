@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat.zig");
 
 /// Errors that might occur during worker operation
 pub const WorkerError = error{
@@ -29,7 +30,7 @@ pub const WorkerState = struct {
     /// Total number of process restarts
     total_restarts: usize = 0,
     /// Mutex for thread-safe operations
-    mutex: std.Thread.Mutex = .{},
+    mutex: compat.Mutex = .{},
 
     /// Initialize a new worker state
     pub fn init() WorkerState {

@@ -13,6 +13,7 @@
 //! ```
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const legacy = @import("../legacy.zig");
 
 pub const Supervisor = legacy.Supervisor;
@@ -163,7 +164,7 @@ pub fn supervisor(allocator: std.mem.Allocator) SupervisorBuilder {
 }
 
 fn dummyWorker() void {
-    std.Thread.sleep(1 * std.time.ns_per_ms);
+    compat.sleep(1 * std.time.ns_per_ms);
 }
 
 test "SupervisorBuilder basic creation" {

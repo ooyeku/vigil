@@ -32,7 +32,7 @@ fn worker() void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -171,7 +171,7 @@ zig build test
 
 ## Requirements
 
-- Zig 0.15.x
+- Zig 0.16.x
 - POSIX-compliant operating system
 
 ## License

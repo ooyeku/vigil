@@ -1,5 +1,6 @@
 const std = @import("std");
-const Mutex = std.Thread.Mutex;
+const compat = @import("compat.zig");
+const Mutex = compat.Mutex;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 
 /// Global process registry for mapping names to process mailboxes.

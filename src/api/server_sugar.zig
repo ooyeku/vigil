@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const legacy = @import("../legacy.zig");
+const compat = @import("../compat.zig");
 
 pub const Message = legacy.Message;
 pub const GenServer = legacy.GenServer;
@@ -42,7 +43,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
         pub fn cast(self: *Self, payload: []const u8) !void {
             const message = try Message.init(
                 self.allocator,
-                try std.fmt.allocPrint(self.allocator, "cast_{d}", .{std.time.milliTimestamp()}),
+                try std.fmt.allocPrint(self.allocator, "cast_{d}", .{compat.milliTimestamp()}),
                 "anonymous",
                 payload,
                 null,
@@ -55,7 +56,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
         pub fn call(self: *Self, payload: []const u8, options: CallOptions) !Message {
             const message = try Message.init(
                 self.allocator,
-                try std.fmt.allocPrint(self.allocator, "call_{d}", .{std.time.milliTimestamp()}),
+                try std.fmt.allocPrint(self.allocator, "call_{d}", .{compat.milliTimestamp()}),
                 "anonymous",
                 payload,
                 null,
@@ -129,7 +130,7 @@ test "server sugar cast message" {
     try srv.cast(message);
 
     // Give it a moment to process
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
 
     // Note: actual state change depends on GenServer implementation
     try std.testing.expect(srv.state.counter >= 0);

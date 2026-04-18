@@ -39,7 +39,8 @@
 //! ```
 const MessageMod = @This();
 const std = @import("std");
-const Mutex = std.Thread.Mutex;
+const compat = @import("compat.zig");
+const Mutex = compat.Mutex;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Time = std.time.Time;
@@ -283,7 +284,7 @@ pub const Message = struct {
             .signal = signal,
             .priority = priority,
             .metadata = .{
-                .timestamp = std.time.timestamp(),
+                .timestamp = compat.timestamp(),
                 .ttl_ms = ttl_ms,
                 .correlation_id = null,
                 .reply_to = null,
@@ -317,7 +318,7 @@ pub const Message = struct {
     /// Returns: true if message has expired, false otherwise
     pub fn isExpired(self: Message) bool {
         if (self.metadata.ttl_ms) |ttl| {
-            const current_time = std.time.timestamp();
+            const current_time = compat.timestamp();
             const elapsed_ms = @as(u64, @intCast(current_time - self.metadata.timestamp)) * 1000;
             return elapsed_ms >= ttl;
         }
@@ -499,21 +500,15 @@ pub const ProcessMailbox = struct {
 
     pub fn init(allocator: Allocator, config: MailboxConfig) ProcessMailbox {
         const priority_queues: ?[5]std.ArrayList(Message) = if (config.priority_queues)
-            .{
-                std.ArrayList(Message){}, // critical
-                std.ArrayList(Message){}, // high
-                std.ArrayList(Message){}, // normal
-                std.ArrayList(Message){}, // low
-                std.ArrayList(Message){}, // batch
-            }
+            .{ .empty, .empty, .empty, .empty, .empty }
         else
             null;
 
         return .{
-            .messages = std.ArrayList(Message){},
+            .messages = .empty,
             .priority_queues = priority_queues,
             .deadletter_queue = if (config.enable_deadletter)
-                std.ArrayList(Message){}
+                .empty
             else
                 null,
             .mutex = .{},

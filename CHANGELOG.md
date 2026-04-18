@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-04-18
+
+### Changed
+- **Zig 0.16 compatibility**: Minimum required Zig version bumped from `0.15.1` to `0.16.0`. The project no longer compiles on 0.15.x. `build.zig.zon`, `README.md`, and `docs/api.md` all updated to reflect the new requirement.
+- **Mutex primitives migrated off `std.Thread`**: Zig 0.16 moved `std.Thread.Mutex`/`Condition`/etc. under `std.Io`, where lock/unlock now require an `Io` instance. Introduced `src/compat.zig` exposing a thin `compat.Mutex` that wraps `std.Io.Mutex` and drives it via `std.Io.Threaded.mutexLock`/`mutexUnlock` (futex-direct, no VTable). All internal `std.Thread.Mutex` fields across `circuit_breaker`, `worker`, `shutdown`, `genserver`, `api/testing`, `api/request_reply`, `api/flow_control`, `sup_tree`, `process`, `messages`, `pubsub`, `telemetry`, `registry`, `process_group`, `supervisor`, and `distributed_registry` now use `compat.Mutex`.
+- **Time primitives migrated to `compat`**: `std.time.milliTimestamp`/`timestamp`/`nanoTimestamp` and `std.Thread.sleep` were removed in 0.16. `compat.zig` now provides `compat.milliTimestamp`, `compat.timestamp`, `compat.nanoTimestamp`, and `compat.sleep` implemented directly on `std.posix.system.clock_gettime` and `std.c.nanosleep`. All call sites have been switched over.
+- **Networking shim replaces `std.net`**: `std.net` (and `std.posix.socket`/`connect`/`bind`/`listen`/`accept`/`close`/`write`) were removed in 0.16 in favor of `std.Io.net`, which requires an `Io` handle. Added `compat.net` (`Ip4Address`, `parseIp4`, `Stream`, `Server`) and `compat.sockets` (thin wrappers over `std.c.socket`/`connect`/`bind`/`listen`/`accept`/`close`/`write`/`read`). `distributed_registry.zig` and the `vigilant_server` example now build against this shim.
+- **`std.ArrayList` init idioms updated**: 0.16 deprecated `std.ArrayListUnmanaged` in favor of the new unmanaged-by-default `std.ArrayList`. Empty-literal initializers (`.{}`, `std.ArrayList(T){}`) were replaced with `.empty` throughout. Managed-variant call sites (`std.ArrayList([]const u8).init(allocator)` → `.empty` + pass allocator to `deinit`) were updated too.
+- **`std.heap.GeneralPurposeAllocator` → `std.heap.DebugAllocator`**: The allocator was renamed; `README.md` and `examples/vigilant_server/src/main.zig` now use `std.heap.DebugAllocator(.{}) = .init`.
+- **`std.StringArrayHashMap` removed**: Only `StringArrayHashMapUnmanaged` exists in 0.16. `DistributedRegistry.global_names` switched to `StringArrayHashMapUnmanaged` with explicit allocator passing on `put`/`deinit`.
+- **Signal handler signature**: macOS signal handlers now receive `std.c.SIG` (the enum) rather than `c_int`. The Ctrl+C handler in the `vigilant_server` example was updated.
+
+### Added
+- **`src/compat.zig` module**: Centralized Zig 0.15→0.16 compatibility layer exposing `Mutex`, `sleep`, `milliTimestamp`, `timestamp`, `nanoTimestamp`, a minimal `net` submodule (`Ip4Address`, `parseIp4`, `Stream`, `Server`), and a `sockets` submodule (`socket`, `connect`, `bind`, `listen`, `accept`, `close`).
+- **`vigil.compat` re-export**: The compat layer is exposed through the public module so downstream examples and users of the `vigil` module can reach `vigil.compat.sleep`, `vigil.compat.milliTimestamp`, `vigil.compat.net.*`, etc. without reaching into library internals.
+
+### Fixed
+- **`ReplyMailbox` on 0.16**: `std.Thread.ResetEvent` was removed. The type was already tracked in `correlation_map` purely for the correlation-id lifecycle (the actual reply wait is polling-based on the inbox), so it's now a no-op local struct in `api/request_reply.zig`. No behavior change.
+
 ## [1.2.0] - 2026-03-13
 
 ### Fixed

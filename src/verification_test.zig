@@ -1,5 +1,6 @@
 const std = @import("std");
 const vigil = @import("vigil.zig");
+const compat = @import("compat.zig");
 const testing = std.testing;
 
 test "Verification of v0.5.0 features" {
@@ -59,12 +60,12 @@ test "Verification of v0.5.0 features" {
 
     // 5. Verify Registry
     // Wait for async registration
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
     try std.testing.expect(vigil.global_registry.?.whereis("my_server") != null);
 
     // 6. Verify Timer (wait for message)
     // We wait enough time for timer to fire and server to process it
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    compat.sleep(100 * std.time.ns_per_ms);
 
     // Server should be running and have count = 1
     try std.testing.expectEqual(@as(u32, 1), server.state.count);
@@ -120,10 +121,10 @@ test "Verification of v0.5.0 features" {
     }
 
     // Wait for async registration
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
     try std.testing.expect(vigil.global_registry.?.whereis("my_server_persistent") != null);
 
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    compat.sleep(100 * std.time.ns_per_ms);
 
     // Server should be running and have count = 1
     try std.testing.expectEqual(@as(u32, 1), server_persistent.state.count);

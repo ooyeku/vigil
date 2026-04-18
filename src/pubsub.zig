@@ -5,6 +5,7 @@ const std = @import("std");
 const Message = @import("messages.zig").Message;
 const Inbox = @import("api/inbox.zig").Inbox;
 const telemetry = @import("telemetry.zig");
+const compat = @import("compat.zig");
 
 /// Result of a publish operation, reporting delivery outcomes.
 pub const PublishResult = struct {
@@ -53,14 +54,14 @@ pub const Subscriber = struct {
     allocator: std.mem.Allocator,
     inbox: *Inbox,
     patterns: std.ArrayListUnmanaged(TopicPattern),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     /// Initialize a new subscriber
     pub fn init(allocator: std.mem.Allocator, inbox: *Inbox) Subscriber {
         return .{
             .allocator = allocator,
             .inbox = inbox,
-            .patterns = .{},
+            .patterns = .empty,
             .mutex = .{},
         };
     }
@@ -107,13 +108,13 @@ pub const Subscriber = struct {
 pub const PubSubBroker = struct {
     allocator: std.mem.Allocator,
     subscribers: std.ArrayListUnmanaged(*Subscriber),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     /// Initialize a new broker
     pub fn init(allocator: std.mem.Allocator) PubSubBroker {
         return .{
             .allocator = allocator,
-            .subscribers = .{},
+            .subscribers = .empty,
             .mutex = .{},
         };
     }
@@ -167,7 +168,7 @@ pub const PubSubBroker = struct {
                     if (telemetry.getGlobal()) |t| {
                         t.emit(.{
                             .event_type = .message_dropped,
-                            .timestamp_ms = std.time.milliTimestamp(),
+                            .timestamp_ms = compat.milliTimestamp(),
                             .metadata = topic,
                         });
                     }
@@ -182,7 +183,7 @@ pub const PubSubBroker = struct {
 
 /// Global pub/sub broker
 var global_broker: ?PubSubBroker = null;
-var broker_mutex: std.Thread.Mutex = .{};
+var broker_mutex: compat.Mutex = .{};
 
 /// Initialize global broker
 pub fn initGlobal(allocator: std.mem.Allocator) !void {

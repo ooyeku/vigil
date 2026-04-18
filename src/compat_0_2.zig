@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const legacy = @import("legacy.zig");
+const compat = @import("compat.zig");
 
 // Re-export all legacy types and functions
 pub const ProcessMod = legacy.ProcessMod;
@@ -179,6 +180,6 @@ pub fn createResponse(
 /// Default worker function that can be used as a starting point
 fn genericWorker() void {
     while (true) {
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        compat.sleep(100 * std.time.ns_per_ms);
     }
 }

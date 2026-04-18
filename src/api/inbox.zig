@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const legacy = @import("../legacy.zig");
+const compat = @import("../compat.zig");
 
 pub const Message = legacy.Message;
 pub const ProcessMailbox = legacy.ProcessMailbox;
@@ -76,7 +77,7 @@ pub const Inbox = struct {
         // Each operation increments active_ops on entry and decrements
         // on exit, so reaching zero means nothing is touching the mailbox.
         while (self.active_ops.load(.acquire) != 0) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            compat.sleep(1 * std.time.ns_per_ms);
         }
 
         // Now safe to deallocate — no threads are inside send/recv
@@ -141,7 +142,7 @@ pub const Inbox = struct {
                     // Release the op count while sleeping so close()
                     // can make progress if this is the only thread.
                     _ = self.active_ops.fetchSub(1, .acq_rel);
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    compat.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
                 else => {
@@ -155,13 +156,13 @@ pub const Inbox = struct {
     /// Receive with timeout.
     /// Returns null on timeout, error.InboxClosed if closed while waiting.
     pub fn recvTimeout(self: *Inbox, timeout_ms: u32) !?Message {
-        const start = std.time.milliTimestamp();
+        const start = compat.milliTimestamp();
         while (true) {
             // Check if inbox has been closed
             if (self.closed.load(.acquire)) {
                 return InboxError.InboxClosed;
             }
-            if (std.time.milliTimestamp() - start > timeout_ms) {
+            if (compat.milliTimestamp() - start > timeout_ms) {
                 return null;
             }
             // Track this operation so close() waits for us
@@ -179,7 +180,7 @@ pub const Inbox = struct {
             } else |err| switch (err) {
                 error.EmptyMailbox => {
                     _ = self.active_ops.fetchSub(1, .acq_rel);
-                    std.Thread.sleep(1 * std.time.ns_per_ms);
+                    compat.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
                 else => {

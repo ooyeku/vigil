@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const legacy = @import("../legacy.zig");
+const compat = @import("../compat.zig");
 
 pub const Message = legacy.Message;
 pub const MessagePriority = legacy.MessagePriority;
@@ -67,7 +68,7 @@ pub const MessageBuilder = struct {
     pub fn build(self: MessageBuilder, allocator: std.mem.Allocator) !Message {
         var message = try Message.init(
             allocator,
-            try std.fmt.allocPrint(allocator, "msg_{d}", .{std.time.milliTimestamp()}),
+            try std.fmt.allocPrint(allocator, "msg_{d}", .{compat.milliTimestamp()}),
             self.sender orelse "anonymous",
             self.payload,
             self.signal_val,

@@ -7,6 +7,7 @@ const MessagePriority = @import("../messages.zig").MessagePriority;
 const Signal = @import("../messages.zig").Signal;
 const Inbox = @import("./inbox.zig").Inbox;
 const Supervisor = @import("../supervisor.zig").Supervisor;
+const compat = @import("../compat.zig");
 
 /// Test context manages test lifecycle, time control, and mocks
 pub const TestContext = struct {
@@ -20,8 +21,8 @@ pub const TestContext = struct {
         return .{
             .allocator = allocator,
             .current_time_ms = 0,
-            .mock_inboxes = .{},
-            .mock_supervisors = .{},
+            .mock_inboxes = .empty,
+            .mock_supervisors = .empty,
         };
     }
 
@@ -75,12 +76,12 @@ pub const TestContext = struct {
 pub const MockInbox = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayListUnmanaged(Message),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     fn init(allocator: std.mem.Allocator) MockInbox {
         return .{
             .allocator = allocator,
-            .messages = .{},
+            .messages = .empty,
             .mutex = .{},
         };
     }
@@ -145,7 +146,7 @@ pub const MockInbox = struct {
 pub const MockSupervisor = struct {
     allocator: std.mem.Allocator,
     children: std.ArrayListUnmanaged(ChildInfo),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
     restart_count: u32,
     state: SupervisorState,
 
@@ -172,7 +173,7 @@ pub const MockSupervisor = struct {
     fn init(allocator: std.mem.Allocator) MockSupervisor {
         return .{
             .allocator = allocator,
-            .children = .{},
+            .children = .empty,
             .mutex = .{},
             .restart_count = 0,
             .state = .initial,

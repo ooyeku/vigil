@@ -23,7 +23,8 @@
 const SupervisorMod = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
+const compat = @import("compat.zig");
+const Mutex = compat.Mutex;
 const Process = @import("process.zig");
 
 /// Defines how the supervisor should handle process restarts.
@@ -152,18 +153,18 @@ pub const Supervisor = struct {
     pub fn init(allocator: Allocator, options: SupervisorOptions) Supervisor {
         return .{
             .allocator = allocator,
-            .children = std.ArrayList(Process.ChildProcess){},
+            .children = .empty,
             .options = options,
             .restart_count = 0,
             .last_restart_time = 0,
             .mutex = Mutex{},
             .stats = .{
-                .uptime_ms = std.time.milliTimestamp(),
+                .uptime_ms = compat.milliTimestamp(),
             },
             .monitor_thread = null,
             .is_shutting_down = false,
             .state = .initial,
-            .allocated_child_ids = std.ArrayList([]const u8){},
+            .allocated_child_ids = .empty,
         };
     }
 
@@ -290,7 +291,7 @@ pub const Supervisor = struct {
         }
 
         // Wait for children to stop (without holding the mutex continuously)
-        const start_time = std.time.milliTimestamp();
+        const start_time = compat.milliTimestamp();
         while (true) {
             var all_stopped = true;
 
@@ -309,11 +310,11 @@ pub const Supervisor = struct {
 
             if (all_stopped) break;
 
-            const elapsed = std.time.milliTimestamp() - start_time;
+            const elapsed = compat.milliTimestamp() - start_time;
             if (elapsed > timeout_ms) return error.ShutdownTimeout;
 
             // Sleep without holding the mutex
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+            compat.sleep(50 * std.time.ns_per_ms);
         }
 
         // Set final state
@@ -427,8 +428,8 @@ pub const Supervisor = struct {
         defer self.mutex.unlock();
 
         // Collect IDs of workers to remove (safer than indices)
-        var workers_to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer workers_to_remove.deinit();
+        var workers_to_remove: std.ArrayList([]const u8) = .empty;
+        defer workers_to_remove.deinit(self.allocator);
 
         var current_count: usize = 0;
         for (self.children.items) |*child| {
@@ -527,7 +528,7 @@ pub const Supervisor = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const current_time = std.time.milliTimestamp();
+        const current_time = compat.milliTimestamp();
         self.stats.last_failure_time = current_time;
 
         // Reset restart count if outside time window
@@ -584,7 +585,7 @@ pub const Supervisor = struct {
             if (should_shutdown) break;
 
             // Sleep at the start to prevent tight loop
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            compat.sleep(100 * std.time.ns_per_ms);
 
             // Now check children with proper locking
             self.mutex.lock();
@@ -594,7 +595,7 @@ pub const Supervisor = struct {
                 const child_state = child.getState();
                 if (child_state == .failed and child.spec.restart_type != .temporary) {
                     // Handle failure according to restart strategy
-                    const current_time = std.time.milliTimestamp();
+                    const current_time = compat.milliTimestamp();
                     self.stats.last_failure_time = current_time;
 
                     const time_diff = current_time - self.last_restart_time;
@@ -662,7 +663,7 @@ test "supervisor basic operations" {
         .id = "test1",
         .start_fn = struct {
             fn testFn() void {
-                std.Thread.sleep(200 * std.time.ns_per_ms);
+                compat.sleep(200 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,
@@ -672,7 +673,7 @@ test "supervisor basic operations" {
     try supervisor.start();
 
     // Wait for process to start
-    std.Thread.sleep(150 * std.time.ns_per_ms);
+    compat.sleep(150 * std.time.ns_per_ms);
 
     const stats = supervisor.getStats();
     try std.testing.expect(stats.active_children == 1);
@@ -708,7 +709,7 @@ test "supervisor monitoring" {
         .id = "monitor_test",
         .start_fn = struct {
             fn testFn() void {
-                std.Thread.sleep(300 * std.time.ns_per_ms);
+                compat.sleep(300 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,
@@ -719,7 +720,7 @@ test "supervisor monitoring" {
     try supervisor.startMonitoring();
 
     // Wait for process to start
-    std.Thread.sleep(150 * std.time.ns_per_ms);
+    compat.sleep(150 * std.time.ns_per_ms);
 
     const stats = supervisor.getStats();
     try std.testing.expect(stats.active_children == 1);
@@ -728,7 +729,7 @@ test "supervisor monitoring" {
     supervisor.stopMonitoring();
 
     // Wait a bit for monitoring thread to fully stop
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    compat.sleep(50 * std.time.ns_per_ms);
 
     try supervisor.shutdown(5000);
 
@@ -752,7 +753,7 @@ test "supervisor restart strategies" {
         });
         defer {
             supervisor.stopMonitoring();
-            std.Thread.sleep(200 * std.time.ns_per_ms);
+            compat.sleep(200 * std.time.ns_per_ms);
             supervisor.deinit();
         }
 
@@ -761,7 +762,7 @@ test "supervisor restart strategies" {
             .start_fn = struct {
                 fn testFn() void {
                     while (true) {
-                        std.Thread.sleep(50 * std.time.ns_per_ms);
+                        compat.sleep(50 * std.time.ns_per_ms);
                     }
                 }
             }.testFn,
@@ -773,7 +774,7 @@ test "supervisor restart strategies" {
         try supervisor.startMonitoring();
 
         // Wait for process to start
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        compat.sleep(200 * std.time.ns_per_ms);
 
         // Force single failure
         {
@@ -784,7 +785,7 @@ test "supervisor restart strategies" {
         }
 
         // Wait for restart to complete
-        std.Thread.sleep(500 * std.time.ns_per_ms);
+        compat.sleep(500 * std.time.ns_per_ms);
 
         // Get stats with mutex protection
         const stats = supervisor.getStats();
@@ -802,7 +803,7 @@ test "supervisor max restarts" {
     });
     defer {
         supervisor.stopMonitoring();
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        compat.sleep(200 * std.time.ns_per_ms);
         supervisor.deinit();
     }
 
@@ -810,7 +811,7 @@ test "supervisor max restarts" {
         .id = "test_restart",
         .start_fn = struct {
             fn testFn() void {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                compat.sleep(50 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,
@@ -821,7 +822,7 @@ test "supervisor max restarts" {
     try supervisor.startMonitoring();
 
     // Wait for initial start
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    compat.sleep(100 * std.time.ns_per_ms);
 
     // Force exactly two failures
     {
@@ -830,13 +831,13 @@ test "supervisor max restarts" {
             child.mutex.lock();
             child.state = .failed;
             child.mutex.unlock();
-            std.Thread.sleep(200 * std.time.ns_per_ms);
+            compat.sleep(200 * std.time.ns_per_ms);
         }
     }
 
     // Stop monitoring before checking stats
     supervisor.stopMonitoring();
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    compat.sleep(200 * std.time.ns_per_ms);
 
     // Get stats with mutex protection
     supervisor.mutex.lock();
@@ -859,7 +860,7 @@ test "supervisor findChild" {
         .id = "test_find",
         .start_fn = struct {
             fn testFn() void {
-                std.Thread.sleep(50 * std.time.ns_per_ms);
+                compat.sleep(50 * std.time.ns_per_ms);
             }
         }.testFn,
         .restart_type = .permanent,

@@ -2,6 +2,7 @@
 //! Coordinated shutdown of all components.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 /// Shutdown hook function type
 pub const ShutdownHook = *const fn () void;
@@ -22,13 +23,13 @@ pub const ShutdownOptions = struct {
 pub const ShutdownManager = struct {
     allocator: std.mem.Allocator,
     hooks: std.ArrayListUnmanaged(ShutdownHook),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     /// Initialize shutdown manager
     pub fn init(allocator: std.mem.Allocator) ShutdownManager {
         return .{
             .allocator = allocator,
-            .hooks = .{},
+            .hooks = .empty,
             .mutex = .{},
         };
     }
@@ -58,19 +59,19 @@ pub const ShutdownManager = struct {
         self.mutex.unlock();
         defer self.allocator.free(hooks_copy);
 
-        const start_ms = std.time.milliTimestamp();
+        const start_ms = compat.milliTimestamp();
 
         if (options.order == .reverse) {
             var i: usize = hooks_copy.len;
             while (i > 0) {
                 i -= 1;
-                const elapsed = std.time.milliTimestamp() - start_ms;
+                const elapsed = compat.milliTimestamp() - start_ms;
                 if (elapsed > options.timeout_ms) break;
                 hooks_copy[i]();
             }
         } else {
             for (hooks_copy) |hook| {
-                const elapsed = std.time.milliTimestamp() - start_ms;
+                const elapsed = compat.milliTimestamp() - start_ms;
                 if (elapsed > options.timeout_ms) break;
                 hook();
             }
@@ -80,7 +81,7 @@ pub const ShutdownManager = struct {
 
 /// Global shutdown manager instance
 var global_shutdown: ?ShutdownManager = null;
-var shutdown_mutex: std.Thread.Mutex = .{};
+var shutdown_mutex: compat.Mutex = .{};
 
 /// Initialize global shutdown manager
 pub fn initGlobal(allocator: std.mem.Allocator) !void {

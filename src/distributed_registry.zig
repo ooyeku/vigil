@@ -2,10 +2,11 @@
 //! Cross-process name resolution with TCP-based cluster communication.
 
 const std = @import("std");
-const net = std.net;
 const posix = std.posix;
 const Registry = @import("registry.zig").Registry;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
+const compat = @import("compat.zig");
+const net = compat.net;
 
 /// Cluster node representation
 pub const ClusterNode = struct {
@@ -54,10 +55,10 @@ pub const DistributedRegistry = struct {
     config: DistributedRegistryConfig,
     nodes: std.ArrayListUnmanaged(ClusterNode),
     /// Names that were registered locally with global scope
-    global_names: std.StringArrayHashMap(void),
+    global_names: std.StringArrayHashMapUnmanaged(void),
     /// Cache of names known to exist on remote nodes
     remote_registrations: std.StringHashMap(RemoteProcessInfo),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
     sync_thread: ?std.Thread = null,
     listener_thread: ?std.Thread = null,
     should_sync: std.atomic.Value(bool),
@@ -66,7 +67,7 @@ pub const DistributedRegistry = struct {
 
     /// Initialize distributed registry
     pub fn init(allocator: std.mem.Allocator, config: DistributedRegistryConfig) !DistributedRegistry {
-        var nodes: std.ArrayListUnmanaged(ClusterNode) = .{};
+        var nodes: std.ArrayListUnmanaged(ClusterNode) = .empty;
         errdefer nodes.deinit(allocator);
 
         // Parse cluster nodes
@@ -82,7 +83,7 @@ pub const DistributedRegistry = struct {
             try nodes.append(allocator, .{
                 .address = address_copy,
                 .port = port,
-                .last_seen_ms = std.time.milliTimestamp(),
+                .last_seen_ms = compat.milliTimestamp(),
                 .is_alive = true,
             });
         }
@@ -92,7 +93,7 @@ pub const DistributedRegistry = struct {
             .allocator = allocator,
             .config = config,
             .nodes = nodes,
-            .global_names = std.StringArrayHashMap(void).init(allocator),
+            .global_names = .empty,
             .remote_registrations = std.StringHashMap(RemoteProcessInfo).init(allocator),
             .mutex = .{},
             .sync_thread = null,
@@ -117,7 +118,7 @@ pub const DistributedRegistry = struct {
             while (it.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
             }
-            self.global_names.deinit();
+            self.global_names.deinit(self.allocator);
         }
 
         // Free remote_registrations
@@ -157,7 +158,7 @@ pub const DistributedRegistry = struct {
 
             const name_copy = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(name_copy);
-            try self.global_names.put(name_copy, {});
+            try self.global_names.put(self.allocator, name_copy, {});
         }
     }
 
@@ -211,16 +212,16 @@ pub const DistributedRegistry = struct {
     /// Query a single node for a name via TCP
     fn queryNode(self: *DistributedRegistry, node: ClusterNode, name: []const u8) bool {
         _ = self;
-        const addr = net.Address.parseIp4(node.address, node.port) catch return false;
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return false;
-        defer posix.close(fd);
+        const addr = net.parseIp4(node.address, node.port) catch return false;
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return false;
+        defer compat.sockets.close(fd);
 
         // Set connect timeout via SO_SNDTIMEO
         const timeout = posix.timeval{ .sec = 1, .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
+        compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
         const stream = net.Stream{ .handle = fd };
 
         var buf: [256]u8 = undefined;
@@ -259,21 +260,21 @@ pub const DistributedRegistry = struct {
 
     /// Send heartbeat to a node and update liveness
     fn sendHeartbeat(_: *DistributedRegistry, node: *ClusterNode) void {
-        const addr = net.Address.parseIp4(node.address, node.port) catch {
+        const addr = net.parseIp4(node.address, node.port) catch {
             node.is_alive = false;
             return;
         };
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
             node.is_alive = false;
             return;
         };
-        defer posix.close(fd);
+        defer compat.sockets.close(fd);
 
         const timeout = posix.timeval{ .sec = 1, .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
+        compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch {
             node.is_alive = false;
             return;
         };
@@ -287,7 +288,7 @@ pub const DistributedRegistry = struct {
         var buf: [64]u8 = undefined;
         if (Protocol.readLine(stream, &buf)) |line| {
             if (std.mem.eql(u8, line, "ALIVE")) {
-                node.last_seen_ms = std.time.milliTimestamp();
+                node.last_seen_ms = compat.milliTimestamp();
                 node.is_alive = true;
                 return;
             }
@@ -298,14 +299,14 @@ pub const DistributedRegistry = struct {
     /// Sync a global registration to a single peer node
     fn syncRegistration(self: *DistributedRegistry, node: ClusterNode, name: []const u8) void {
         _ = self;
-        const addr = net.Address.parseIp4(node.address, node.port) catch return;
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
-        defer posix.close(fd);
+        const addr = net.parseIp4(node.address, node.port) catch return;
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
+        defer compat.sockets.close(fd);
 
         const timeout = posix.timeval{ .sec = 1, .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
 
-        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return;
+        compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch return;
         const stream = net.Stream{ .handle = fd };
 
         var buf: [256]u8 = undefined;
@@ -314,7 +315,7 @@ pub const DistributedRegistry = struct {
     }
 
     /// Handle a single incoming connection on the listener
-    fn handleIncoming(self: *DistributedRegistry, stream: net.Stream, peer_addr: net.Address) void {
+    fn handleIncoming(self: *DistributedRegistry, stream: net.Stream, peer_addr: net.Ip4Address) void {
         defer stream.close();
 
         var buffer: [1024]u8 = undefined;
@@ -329,22 +330,18 @@ pub const DistributedRegistry = struct {
             }
         } else if (std.mem.startsWith(u8, line, "REG ")) {
             const name = line["REG ".len..];
-            // Extract peer address info
+            const peer_ip_be = std.mem.bigToNative(u32, peer_addr.in.addr);
+            const peer_port = std.mem.bigToNative(u16, peer_addr.in.port);
             var addr_buf: [64]u8 = undefined;
-            const addr_str = std.fmt.bufPrint(&addr_buf, "{}", .{peer_addr}) catch {
+            const peer_ip = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
+                (peer_ip_be >> 24) & 0xff,
+                (peer_ip_be >> 16) & 0xff,
+                (peer_ip_be >> 8) & 0xff,
+                peer_ip_be & 0xff,
+            }) catch {
                 Protocol.sendFrame(stream, "OK\n");
                 return;
             };
-            // Parse port from peer address (format: "ip:port")
-            const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse {
-                Protocol.sendFrame(stream, "OK\n");
-                return;
-            };
-            const peer_port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch {
-                Protocol.sendFrame(stream, "OK\n");
-                return;
-            };
-            const peer_ip = addr_str[0..colon];
 
             self.cacheRemoteRegistration(name, .{
                 .name = name,
@@ -380,7 +377,7 @@ pub const DistributedRegistry = struct {
 
         // Close listener socket to unblock accept()
         if (self.listener_fd) |fd| {
-            posix.close(fd);
+            compat.sockets.close(fd);
             self.listener_fd = null;
         }
 
@@ -396,14 +393,14 @@ pub const DistributedRegistry = struct {
 
     /// TCP listener loop - accepts incoming protocol connections
     fn listenerLoop(self: *DistributedRegistry) void {
-        const addr = net.Address.parseIp4("0.0.0.0", self.config.listen_port) catch return;
-        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
+        const addr = net.parseIp4("0.0.0.0", self.config.listen_port) catch return;
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
 
         self.listener_fd = fd;
 
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-        posix.bind(fd, &addr.any, addr.getOsSockLen()) catch return;
-        posix.listen(fd, 32) catch return;
+        compat.sockets.bind(fd, &addr.any, addr.getOsSockLen()) catch return;
+        compat.sockets.listen(fd, 32) catch return;
 
         var server = net.Server{
             .stream = .{ .handle = fd },
@@ -431,7 +428,7 @@ pub const DistributedRegistry = struct {
                 self.sendHeartbeat(node);
 
                 // Mark dead if heartbeat timeout exceeded
-                const now_ms = std.time.milliTimestamp();
+                const now_ms = compat.milliTimestamp();
                 if (now_ms - node.last_seen_ms > self.config.heartbeat_timeout_ms) {
                     node.is_alive = false;
                 }
@@ -450,7 +447,7 @@ pub const DistributedRegistry = struct {
             }
             self.mutex.unlock();
 
-            std.Thread.sleep(@as(u64, self.config.sync_interval_ms) * std.time.ns_per_ms);
+            compat.sleep(@as(u64, self.config.sync_interval_ms) * std.time.ns_per_ms);
         }
     }
 };

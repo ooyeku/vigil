@@ -28,6 +28,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vigil = @import("vigil.zig");
 const Supervisor = vigil.Supervisor;
+const compat = @import("compat.zig");
 const Process = vigil.Process;
 const ProcessState = vigil.ProcessState;
 
@@ -223,7 +224,7 @@ pub const SupervisorTree = struct {
     /// Runtime statistics
     stats: TreeStats,
     /// Thread synchronization
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     /// Initialize a new supervisor tree with the given root supervisor.
     /// The root supervisor forms the base of the supervision hierarchy.
@@ -246,7 +247,7 @@ pub const SupervisorTree = struct {
                 .supervisor = main_supervisor,
                 .id = main_id,
             },
-            .children = std.ArrayList(SupervisorNode){},
+            .children = .empty,
             .config = config,
             .stats = .{},
             .mutex = .{},

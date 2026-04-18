@@ -1,6 +1,6 @@
 const std = @import("std");
 const vigil = @import("vigil");
-const net = std.net;
+const net = vigil.compat.net;
 const posix = std.posix;
 
 // Configuration
@@ -23,7 +23,7 @@ const ServerMetrics = struct {
             .total_connections = std.atomic.Value(usize).init(0),
             .active_connections = std.atomic.Value(usize).init(0),
             .requests_handled = std.atomic.Value(usize).init(0),
-            .start_time = std.time.timestamp(),
+            .start_time = vigil.compat.timestamp(),
         };
     }
 
@@ -41,7 +41,7 @@ const ServerMetrics = struct {
     }
 
     pub fn getUptime(self: *ServerMetrics) i64 {
-        return std.time.timestamp() - self.start_time;
+        return vigil.compat.timestamp() - self.start_time;
     }
 };
 
@@ -93,7 +93,7 @@ fn handleConnection(stream: net.Stream, state: *ServerState) void {
         if (state.circuit_breaker.getState() == .open) {
             const response = "ERROR: Service temporarily unavailable\n";
             _ = stream.write(response) catch break;
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            vigil.compat.sleep(100 * std.time.ns_per_ms);
             continue;
         }
 
@@ -168,16 +168,16 @@ fn runServer(allocator: std.mem.Allocator) !void {
     }.cleanup);
 
     // Create TCP server
-    const address = try net.Address.parseIp(SERVER_ADDRESS, SERVER_PORT);
+    const address = try net.parseIp4(SERVER_ADDRESS, SERVER_PORT);
     std.debug.print("Starting Vigilant Server on {s}:{d}\n", .{ SERVER_ADDRESS, SERVER_PORT });
 
     const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-    const fd = try posix.socket(posix.AF.INET, sock_flags, posix.IPPROTO.TCP);
-    errdefer posix.close(fd);
+    const fd = try vigil.compat.sockets.socket(posix.AF.INET, sock_flags, posix.IPPROTO.TCP);
+    errdefer vigil.compat.sockets.close(fd);
 
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(fd, &address.any, address.getOsSockLen());
-    try posix.listen(fd, 128);
+    try vigil.compat.sockets.bind(fd, &address.any, address.getOsSockLen());
+    try vigil.compat.sockets.listen(fd, 128);
 
     var server = net.Server{
         .stream = .{ .handle = fd },
@@ -214,14 +214,14 @@ fn runServer(allocator: std.mem.Allocator) !void {
     // Graceful shutdown
     std.debug.print("\nInitiating graceful shutdown...\n", .{});
     state.is_shutting_down.store(true, .release);
-    posix.close(fd);
+    vigil.compat.sockets.close(fd);
 
     // Wait for active connections
     while (state.metrics.active_connections.load(.monotonic) > 0) {
         std.debug.print("Waiting for {d} connections...\n", .{
             state.metrics.active_connections.load(.monotonic),
         });
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        vigil.compat.sleep(100 * std.time.ns_per_ms);
     }
 
     // Run shutdown hooks
@@ -231,13 +231,13 @@ fn runServer(allocator: std.mem.Allocator) !void {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Setup signal handler
     const handler = struct {
-        fn handle(_: c_int) callconv(.c) void {
+        fn handle(_: std.c.SIG) callconv(.c) void {
             sig_received.store(true, .release);
             std.debug.print("\nReceived shutdown signal...\n", .{});
         }

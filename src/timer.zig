@@ -1,6 +1,7 @@
 const std = @import("std");
 const Message = @import("messages.zig").Message;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
+const compat = @import("compat.zig");
 
 /// Timer utilities for scheduling messages.
 pub const Timer = struct {
@@ -32,7 +33,7 @@ pub const Timer = struct {
             fn run(ctx: *Context) void {
                 defer ctx.allocator.destroy(ctx);
 
-                std.Thread.sleep(@as(u64, ctx.delay) * std.time.ns_per_ms);
+                compat.sleep(@as(u64, ctx.delay) * std.time.ns_per_ms);
 
                 // Send the message (this copies it into the mailbox)
                 // If successful, ownership is transferred to the mailbox.
@@ -62,7 +63,7 @@ test "Timer sendAfter" {
     try Timer.sendAfter(allocator, 10, &mailbox, msg_copy);
 
     // Wait for timer
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    compat.sleep(50 * std.time.ns_per_ms);
 
     // Check mailbox
     var received = try mailbox.receive();

@@ -1,4 +1,4 @@
-# Vigil API Reference v1.2.0
+# Vigil API Reference v1.3.0
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 

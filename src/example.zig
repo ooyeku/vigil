@@ -8,7 +8,7 @@ fn MessageWorker() void {
 
     var count: usize = 0;
     while (count < 5) : (count += 1) {
-        std.Thread.sleep(200 * std.time.ns_per_ms);
+        vigil.compat.sleep(200 * std.time.ns_per_ms);
         std.debug.print("[MessageWorker {d}] Processing batch {d}/5\n", .{ thread_id, count + 1 });
     }
 
@@ -22,7 +22,7 @@ fn HeartbeatWorker() void {
 
     var heartbeat: usize = 0;
     while (heartbeat < 8) : (heartbeat += 1) {
-        std.Thread.sleep(300 * std.time.ns_per_ms);
+        vigil.compat.sleep(300 * std.time.ns_per_ms);
         std.debug.print("[Heartbeat {d}] Pulse {d}\n", .{ thread_id, heartbeat + 1 });
     }
 
@@ -89,7 +89,7 @@ pub fn main() !void {
     std.debug.print("Rate limiter: {d}/15 operations allowed\n\n", .{allowed});
 
     // Let workers run
-    std.Thread.sleep(3000 * std.time.ns_per_ms);
+    vigil.compat.sleep(3000 * std.time.ns_per_ms);
 
     std.debug.print("\n=== Initiating Graceful Shutdown ===\n", .{});
 

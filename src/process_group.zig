@@ -5,6 +5,7 @@ const std = @import("std");
 const Message = @import("messages.zig").Message;
 const Inbox = @import("api/inbox.zig").Inbox;
 const telemetry = @import("telemetry.zig");
+const compat = @import("compat.zig");
 
 /// Result of a broadcast operation, reporting delivery outcomes.
 pub const BroadcastResult = struct {
@@ -31,7 +32,7 @@ pub const ProcessGroup = struct {
     name: []const u8,
     members: std.ArrayListUnmanaged(GroupMember),
     round_robin_index: usize,
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     /// Initialize a new process group
     pub fn init(allocator: std.mem.Allocator, name: []const u8) !ProcessGroup {
@@ -41,7 +42,7 @@ pub const ProcessGroup = struct {
         return .{
             .allocator = allocator,
             .name = name_copy,
-            .members = .{},
+            .members = .empty,
             .round_robin_index = 0,
             .mutex = .{},
         };
@@ -116,7 +117,7 @@ pub const ProcessGroup = struct {
                 if (telemetry.getGlobal()) |t| {
                     t.emit(.{
                         .event_type = .message_dropped,
-                        .timestamp_ms = std.time.milliTimestamp(),
+                        .timestamp_ms = compat.milliTimestamp(),
                         .metadata = self.name,
                     });
                 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const vigil = @import("vigil.zig");
 const checkpoint_mod = @import("checkpoint.zig");
+const compat = @import("compat.zig");
 const testing = @import("std").testing;
 
 pub const GenServerState = enum {
@@ -22,7 +23,7 @@ pub fn GenServer(comptime StateType: type) type {
 
         /// Thread-safe map of correlation_id -> reply mailbox for the call/reply pattern.
         reply_mailboxes: std.StringHashMap(*vigil.ProcessMailbox),
-        reply_mutex: std.Thread.Mutex = .{},
+        reply_mutex: compat.Mutex = .{},
 
         /// Optional state checkpointing
         checkpointer: ?checkpoint_mod.Checkpointer = null,
@@ -88,7 +89,7 @@ pub fn GenServer(comptime StateType: type) type {
 
             try self.init_fn(self);
             self.server_state = .running;
-            self.last_checkpoint_ms = std.time.milliTimestamp();
+            self.last_checkpoint_ms = compat.milliTimestamp();
 
             while (self.server_state == .running) {
                 if (self.mailbox.receive()) |msg_const| {
@@ -105,7 +106,7 @@ pub fn GenServer(comptime StateType: type) type {
                     self.maybeCheckpoint();
                 } else |err| switch (err) {
                     error.EmptyMailbox => {
-                        std.Thread.sleep(1 * std.time.ns_per_ms);
+                        compat.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },
                     else => return err,
@@ -127,7 +128,7 @@ pub fn GenServer(comptime StateType: type) type {
         /// The handler must call self.reply(msg, payload) to send a response
         /// back to the caller's dedicated reply mailbox.
         pub fn call(self: *Self, msg: *vigil.Message, timeout_ms: ?u32) !vigil.Message {
-            const correlation_id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{std.time.milliTimestamp()});
+            const correlation_id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{compat.milliTimestamp()});
             errdefer self.allocator.free(correlation_id);
 
             // Create a temporary reply mailbox dedicated to this call
@@ -153,10 +154,10 @@ pub fn GenServer(comptime StateType: type) type {
             try self.cast(msg_copy);
 
             // Wait on the dedicated reply mailbox (not the server's mailbox)
-            const start_time = std.time.milliTimestamp();
+            const start_time = compat.milliTimestamp();
             while (true) {
                 if (timeout_ms) |timeout| {
-                    if (std.time.milliTimestamp() - start_time > timeout) {
+                    if (compat.milliTimestamp() - start_time > timeout) {
                         self.cleanupReplyEntry(correlation_id);
                         return error.Timeout;
                     }
@@ -167,7 +168,7 @@ pub fn GenServer(comptime StateType: type) type {
                     return response;
                 } else |err| switch (err) {
                     error.EmptyMailbox => {
-                        std.Thread.sleep(1 * std.time.ns_per_ms);
+                        compat.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },
                     else => return err,
@@ -251,7 +252,7 @@ pub fn GenServer(comptime StateType: type) type {
 
         fn maybeCheckpoint(self: *Self) void {
             if (self.checkpointer == null or self.checkpoint_fns == null) return;
-            const now = std.time.milliTimestamp();
+            const now = compat.milliTimestamp();
             if (now - self.last_checkpoint_ms < self.checkpoint_interval_ms) return;
             self.last_checkpoint_ms = now;
             self.saveCheckpoint();
@@ -366,7 +367,7 @@ test "GenServer message handling" {
 
     const Context = struct {
         received: bool = false,
-        mutex: std.Thread.Mutex = .{},
+        mutex: compat.Mutex = .{},
     };
     var context = Context{};
 
@@ -463,7 +464,7 @@ test "GenServer synchronous call" {
     }.run, .{server});
 
     // Give server time to start
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
 
     var msg = try vigil.Message.init(allocator, "ping_msg", "tester", "ping", .info, .normal, 5000);
     defer msg.deinit();
@@ -528,7 +529,7 @@ test "GenServer state management" {
 
     const Context = struct {
         count: u32 = 0,
-        mutex: std.Thread.Mutex = .{},
+        mutex: compat.Mutex = .{},
     };
     var context = Context{};
 

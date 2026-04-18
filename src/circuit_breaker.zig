@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const telemetry = @import("telemetry.zig");
+const compat = @import("compat.zig");
 
 /// Circuit breaker state
 pub const CircuitState = enum {
@@ -34,7 +35,7 @@ pub const CircuitBreaker = struct {
     success_count: u32,
     last_failure_time_ms: i64,
     half_open_request_count: u32,
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
     circuit_id: []const u8,
     allocator: std.mem.Allocator,
 
@@ -69,7 +70,7 @@ pub const CircuitBreaker = struct {
 
             // Check if circuit should transition from open to half-open
             if (self.state == .open) {
-                const now_ms = std.time.milliTimestamp();
+                const now_ms = compat.milliTimestamp();
                 const elapsed = now_ms - self.last_failure_time_ms;
                 if (elapsed >= self.config.reset_timeout_ms) {
                     self.state = .half_open;
@@ -124,7 +125,7 @@ pub const CircuitBreaker = struct {
 
             // Check if circuit should transition from open to half-open
             if (self.state == .open) {
-                const now_ms = std.time.milliTimestamp();
+                const now_ms = compat.milliTimestamp();
                 const elapsed = now_ms - self.last_failure_time_ms;
                 if (elapsed >= self.config.reset_timeout_ms) {
                     self.state = .half_open;
@@ -179,7 +180,7 @@ pub const CircuitBreaker = struct {
     /// Record a failure
     fn recordFailure(self: *CircuitBreaker) void {
         self.failure_count += 1;
-        self.last_failure_time_ms = std.time.milliTimestamp();
+        self.last_failure_time_ms = compat.milliTimestamp();
 
         if (self.state == .half_open) {
             // Failure in half-open - go back to open
@@ -208,7 +209,7 @@ pub const CircuitBreaker = struct {
 
         if (self.state != .open) {
             self.state = .open;
-            self.last_failure_time_ms = std.time.milliTimestamp();
+            self.last_failure_time_ms = compat.milliTimestamp();
             self.emitEvent(.circuit_opened);
         }
     }
@@ -341,7 +342,7 @@ test "CircuitBreaker half-open recovery" {
     try std.testing.expect(breaker.getState() == .open);
 
     // Wait for reset timeout
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    compat.sleep(20 * std.time.ns_per_ms);
 
     // First call transitions to half-open
     breaker.callError(successFn) catch {};

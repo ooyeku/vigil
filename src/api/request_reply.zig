@@ -6,6 +6,16 @@ const Message = @import("../messages.zig").Message;
 const MessageError = @import("../messages.zig").MessageError;
 const Inbox = @import("./inbox.zig").Inbox;
 const InboxError = @import("./inbox.zig").InboxError;
+const compat = @import("../compat.zig");
+
+/// Placeholder for the removed `std.Thread.ResetEvent` in Zig 0.16.
+/// The existing flow uses polling on the inbox for correlation matching, so
+/// this entry is tracked in the map purely for the correlation-id lifecycle
+/// and is never actually waited on. Kept as a stub to preserve public layout
+/// without paying the cost of a real synchronization primitive.
+const ResetEvent = struct {
+    pub fn reset(_: *ResetEvent) void {}
+};
 
 /// Request options
 pub const RequestOptions = struct {
@@ -17,19 +27,19 @@ pub const RequestOptions = struct {
 /// intended for other pending requests.
 pub const ReplyMailbox = struct {
     inbox: *Inbox,
-    correlation_map: std.StringHashMap(*std.Thread.ResetEvent),
+    correlation_map: std.StringHashMap(*ResetEvent),
     /// Buffer for messages that didn't match the awaited correlation ID.
     /// These are re-sent to the inbox so other consumers can process them.
     stash: std.ArrayListUnmanaged(Message),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
     allocator: std.mem.Allocator,
 
     /// Initialize a reply mailbox
     pub fn init(allocator: std.mem.Allocator, inbox: *Inbox) ReplyMailbox {
         return .{
             .inbox = inbox,
-            .correlation_map = std.StringHashMap(*std.Thread.ResetEvent).init(allocator),
-            .stash = .{},
+            .correlation_map = std.StringHashMap(*ResetEvent).init(allocator),
+            .stash = .empty,
             .mutex = .{},
             .allocator = allocator,
         };
@@ -83,7 +93,7 @@ pub const ReplyMailbox = struct {
         correlation_id: []const u8,
         timeout_ms: u32,
     ) !Message {
-        const event = try self.allocator.create(std.Thread.ResetEvent);
+        const event = try self.allocator.create(ResetEvent);
         errdefer self.allocator.destroy(event);
         event.* = .{};
 
@@ -98,7 +108,7 @@ pub const ReplyMailbox = struct {
 
         // Helper to cleanup map entry using the copied key
         const cleanup = struct {
-            fn remove(map: *std.StringHashMap(*std.Thread.ResetEvent), mutex: *std.Thread.Mutex, key: []const u8) void {
+            fn remove(map: *std.StringHashMap(*ResetEvent), mutex: *compat.Mutex, key: []const u8) void {
                 mutex.lock();
                 _ = map.remove(key);
                 mutex.unlock();
@@ -106,9 +116,9 @@ pub const ReplyMailbox = struct {
         };
 
         // Wait for reply
-        const start_ms = std.time.milliTimestamp();
+        const start_ms = compat.milliTimestamp();
         while (true) {
-            const elapsed = std.time.milliTimestamp() - start_ms;
+            const elapsed = compat.milliTimestamp() - start_ms;
             if (elapsed > timeout_ms) {
                 cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
                 self.allocator.free(corr_id_copy);
@@ -158,7 +168,7 @@ pub const ReplyMailbox = struct {
                 }
             }
 
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            compat.sleep(10 * std.time.ns_per_ms);
         }
     }
 
@@ -185,7 +195,7 @@ pub fn request(
     const correlation_id = try std.fmt.allocPrint(
         allocator,
         "req_{d}",
-        .{std.time.milliTimestamp()},
+        .{compat.milliTimestamp()},
     );
     defer allocator.free(correlation_id);
 

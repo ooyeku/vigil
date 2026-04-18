@@ -5,6 +5,7 @@ const std = @import("std");
 const Message = @import("messages.zig").Message;
 const MessagePriority = @import("messages.zig").MessagePriority;
 const Signal = @import("messages.zig").Signal;
+const compat = @import("compat.zig");
 
 /// Event types that can be emitted
 pub const EventType = enum {
@@ -109,7 +110,7 @@ pub const EventHandler = *const fn (event: Event) void;
 pub const TelemetryEmitter = struct {
     allocator: std.mem.Allocator,
     handlers: std.ArrayListUnmanaged(HandlerEntry),
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
     enabled: bool = true,
 
     const HandlerEntry = struct {
@@ -121,7 +122,7 @@ pub const TelemetryEmitter = struct {
     pub fn init(allocator: std.mem.Allocator) TelemetryEmitter {
         return .{
             .allocator = allocator,
-            .handlers = .{},
+            .handlers = .empty,
             .mutex = .{},
             .enabled = true,
         };
@@ -191,7 +192,7 @@ pub const TelemetryEmitter = struct {
 
 /// Global telemetry instance
 var global_telemetry: ?TelemetryEmitter = null;
-var telemetry_mutex: std.Thread.Mutex = .{};
+var telemetry_mutex: compat.Mutex = .{};
 
 /// Initialize global telemetry
 pub fn initGlobal(allocator: std.mem.Allocator) !void {
@@ -254,7 +255,7 @@ pub fn createProcessEvent(
     return ProcessEvent{
         .base = .{
             .event_type = event_type,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp_ms = compat.milliTimestamp(),
             .metadata = null,
         },
         .process_id = id_copy,
@@ -275,7 +276,7 @@ pub fn createMessageEvent(
     return MessageEvent{
         .base = .{
             .event_type = event_type,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp_ms = compat.milliTimestamp(),
             .metadata = null,
         },
         .message_id = message.id,
@@ -304,7 +305,7 @@ pub fn createSupervisorEvent(
     return SupervisorEvent{
         .base = .{
             .event_type = event_type,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp_ms = compat.milliTimestamp(),
             .metadata = null,
         },
         .supervisor_id = sup_id_copy,
@@ -328,7 +329,7 @@ pub fn createCircuitEvent(
     return CircuitEvent{
         .base = .{
             .event_type = event_type,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp_ms = compat.milliTimestamp(),
             .metadata = null,
         },
         .circuit_id = id_copy,
@@ -355,7 +356,7 @@ test "TelemetryEmitter basic operations" {
 
     const event = Event{
         .event_type = .process_started,
-        .timestamp_ms = std.time.milliTimestamp(),
+        .timestamp_ms = compat.milliTimestamp(),
         .metadata = null,
     };
 
@@ -384,7 +385,7 @@ test "TelemetryEmitter multiple handlers" {
 
     const event = Event{
         .event_type = .message_sent,
-        .timestamp_ms = std.time.milliTimestamp(),
+        .timestamp_ms = compat.milliTimestamp(),
         .metadata = null,
     };
 
@@ -408,13 +409,13 @@ test "TelemetryEmitter event filtering" {
 
     const event1 = Event{
         .event_type = .process_started,
-        .timestamp_ms = std.time.milliTimestamp(),
+        .timestamp_ms = compat.milliTimestamp(),
         .metadata = null,
     };
 
     const event2 = Event{
         .event_type = .process_stopped,
-        .timestamp_ms = std.time.milliTimestamp(),
+        .timestamp_ms = compat.milliTimestamp(),
         .metadata = null,
     };
 

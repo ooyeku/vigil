@@ -4,6 +4,7 @@
 const std = @import("std");
 const Message = @import("../messages.zig").Message;
 const MessageError = @import("../messages.zig").MessageError;
+const compat = @import("../compat.zig");
 
 /// Backpressure strategy when limits are exceeded
 pub const BackpressureStrategy = enum {
@@ -23,7 +24,7 @@ pub const RateLimiter = struct {
     max_tokens: f64,
     refill_rate: f64, // tokens per millisecond
     last_refill_ms: i64,
-    mutex: std.Thread.Mutex,
+    mutex: compat.Mutex,
 
     /// Initialize a rate limiter
     /// max_per_second: Maximum number of operations per second
@@ -33,7 +34,7 @@ pub const RateLimiter = struct {
             .tokens = @as(f64, @floatFromInt(max_per_second)),
             .max_tokens = @as(f64, @floatFromInt(max_per_second)),
             .refill_rate = tokens_per_ms,
-            .last_refill_ms = std.time.milliTimestamp(),
+            .last_refill_ms = compat.milliTimestamp(),
             .mutex = .{},
         };
     }
@@ -43,7 +44,7 @@ pub const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.milliTimestamp();
         const elapsed_ms = @as(f64, @floatFromInt(now_ms - self.last_refill_ms));
         self.last_refill_ms = now_ms;
 
@@ -62,7 +63,7 @@ pub const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.tokens = self.max_tokens;
-        self.last_refill_ms = std.time.milliTimestamp();
+        self.last_refill_ms = compat.milliTimestamp();
     }
 
     /// Get current available tokens
@@ -140,7 +141,7 @@ pub const FlowControlledInbox = struct {
                             const current_stats = self.inbox.stats();
                             const current = current_stats.messages_received - current_stats.messages_sent;
                             if (current < config.low_watermark) break;
-                            std.Thread.sleep(10 * std.time.ns_per_ms);
+                            compat.sleep(10 * std.time.ns_per_ms);
                         }
                         try self.inbox.send(payload);
                     },
@@ -197,7 +198,7 @@ test "RateLimiter refill over time" {
     while (limiter.allow()) {}
 
     // Wait enough time for significant refill (200ms should give ~200 tokens)
-    std.Thread.sleep(200 * std.time.ns_per_ms);
+    compat.sleep(200 * std.time.ns_per_ms);
 
     // Call allow() to trigger refill calculation, then check
     _ = limiter.allow();

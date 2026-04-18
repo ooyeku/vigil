@@ -44,6 +44,7 @@ pub const checkpoint = @import("checkpoint.zig");
 pub const distributed_registry = @import("distributed_registry.zig");
 pub const shutdown = @import("shutdown.zig");
 pub const errors = @import("errors.zig");
+pub const compat = @import("compat.zig");
 
 // High-level API re-exports
 pub const msg = msg_builder.msg;
@@ -141,7 +142,7 @@ const compat_0_2 = @import("compat_0_2.zig");
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
         .major = 1,
-        .minor = 2,
+        .minor = 3,
         .patch = 0,
     };
 }

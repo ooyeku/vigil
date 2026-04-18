@@ -13,6 +13,7 @@
 //! ```
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const legacy = @import("../legacy.zig");
 const presets = @import("./presets.zig");
 
@@ -40,7 +41,7 @@ pub const AppBuilder = struct {
         app_builder.* = .{
             .allocator = allocator,
             .preset_config = preset_config,
-            .allocated_ids = std.ArrayList([]const u8){},
+            .allocated_ids = .empty,
         };
 
         return app_builder;
@@ -162,7 +163,7 @@ pub fn appWithPreset(allocator: std.mem.Allocator, preset: Preset) !*AppBuilder 
 }
 
 fn testWorker() void {
-    std.Thread.sleep(1 * std.time.ns_per_ms);
+    compat.sleep(1 * std.time.ns_per_ms);
 }
 
 test "AppBuilder basic creation" {
