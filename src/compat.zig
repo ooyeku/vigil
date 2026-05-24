@@ -39,10 +39,29 @@ test "Mutex basic lock/unlock" {
     m.unlock();
 }
 
+// Direct kernel32 externs. Zig 0.16 pared `std.os.windows.kernel32` down
+// to a couple of functions (CreateProcessW etc.), so the time / Sleep
+// surfaces aren't reachable through the stdlib anymore. Declaring them
+// inline keeps the change self-contained and zero-dep.
+const win32 = if (@import("builtin").os.tag == .windows) struct {
+    extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+    extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
+} else struct {};
+
 /// Replacement for the removed `std.Thread.sleep`. Blocks the current thread
-/// for `nanoseconds` nanoseconds using libc `nanosleep` or platform
-/// equivalents.
+/// for `nanoseconds` nanoseconds using libc `nanosleep` (POSIX) or
+/// `kernel32!Sleep` (Windows). Windows resolution is milliseconds; sub-ms
+/// callers get a single ms wait so we never short-sleep.
 pub fn sleep(nanoseconds: u64) void {
+    if (@import("builtin").os.tag == .windows) {
+        const ms_u64 = if (nanoseconds == 0)
+            0
+        else
+            @max(@as(u64, 1), (nanoseconds + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+        const ms: u32 = @intCast(@min(ms_u64, std.math.maxInt(u32)));
+        win32.Sleep(ms);
+        return;
+    }
     const ns_per_s = std.time.ns_per_s;
     var req: std.posix.timespec = .{
         .sec = @intCast(nanoseconds / ns_per_s),
@@ -55,8 +74,22 @@ pub fn sleep(nanoseconds: u64) void {
 }
 
 /// Replacement for the removed `std.time.nanoTimestamp`. Returns nanoseconds
-/// since the Unix epoch using `CLOCK_REALTIME`.
+/// since the Unix epoch. POSIX uses `clock_gettime(CLOCK_REALTIME)`; Windows
+/// reads a FILETIME (100-ns ticks since 1601-01-01) and shifts it onto the
+/// Unix epoch.
 pub fn nanoTimestamp() i128 {
+    if (@import("builtin").os.tag == .windows) {
+        var ft: std.os.windows.FILETIME = undefined;
+        win32.GetSystemTimeAsFileTime(&ft);
+        // Combine into a single 64-bit count of 100-ns intervals since
+        // 1601-01-01, then shift the epoch to 1970-01-01 and scale up
+        // to nanoseconds. 116444736000000000 = ticks between the two
+        // epochs (369 years × 365.2425 days × 86400 × 10_000_000).
+        const epoch_delta_100ns: i128 = 116444736000000000;
+        const ticks_100ns: i128 =
+            (@as(i128, ft.dwHighDateTime) << 32) | @as(i128, ft.dwLowDateTime);
+        return (ticks_100ns - epoch_delta_100ns) * 100;
+    }
     var ts: std.posix.timespec = undefined;
     _ = std.posix.system.clock_gettime(.REALTIME, &ts);
     return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
