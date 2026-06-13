@@ -13,6 +13,7 @@
 const std = @import("std");
 const legacy = @import("../legacy.zig");
 const compat = @import("../compat.zig");
+const flow_control = @import("./flow_control.zig");
 
 pub const Message = legacy.Message;
 pub const ProcessMailbox = legacy.ProcessMailbox;
@@ -40,6 +41,8 @@ pub const Inbox = struct {
     /// Number of in-flight operations (send / recv / recvTimeout).
     /// `close()` waits for this to reach zero before deallocating.
     active_ops: std.atomic.Value(u32),
+    rate_limiter: ?flow_control.RateLimiter,
+    backpressure_config: ?flow_control.BackpressureConfig,
 
     /// Create a new inbox
     pub fn init(allocator: std.mem.Allocator) !*Inbox {
@@ -61,6 +64,8 @@ pub const Inbox = struct {
             .allocator = allocator,
             .closed = std.atomic.Value(bool).init(false),
             .active_ops = std.atomic.Value(u32).init(0),
+            .rate_limiter = null,
+            .backpressure_config = null,
         };
 
         return inbox_ptr;
@@ -104,6 +109,8 @@ pub const Inbox = struct {
         if (self.closed.load(.acquire)) {
             return InboxError.InboxClosed;
         }
+
+        try self.applyFlowControl();
 
         const message = try Message.init(
             self.allocator,
@@ -195,6 +202,41 @@ pub const Inbox = struct {
     pub fn stats(self: *Inbox) legacy.MailboxStats {
         return self.mailbox.getStats();
     }
+
+    fn queuedCount(self: *Inbox) usize {
+        const inbox_stats = self.stats();
+        if (inbox_stats.messages_received < inbox_stats.messages_sent) {
+            return 0;
+        }
+        return inbox_stats.messages_received - inbox_stats.messages_sent;
+    }
+
+    fn applyFlowControl(self: *Inbox) !void {
+        if (self.rate_limiter) |*limiter| {
+            if (!limiter.allow()) {
+                return MessageError.RateLimitExceeded;
+            }
+        }
+
+        const config = self.backpressure_config orelse return;
+        if (self.queuedCount() < config.high_watermark) return;
+
+        switch (config.strategy) {
+            .drop_oldest => {
+                if (self.mailbox.receive()) |old_msg| {
+                    var owned_old_msg = old_msg;
+                    owned_old_msg.deinit();
+                } else |_| {}
+            },
+            .drop_newest => return,
+            .block => {
+                while (self.queuedCount() >= config.low_watermark) {
+                    compat.sleep(10 * std.time.ns_per_ms);
+                }
+            },
+            .return_error => return MessageError.MailboxFull,
+        }
+    }
 };
 
 /// Inbox builder for fluent configuration
@@ -206,8 +248,6 @@ pub const InboxBuilder = struct {
     default_ttl_ms_val: ?u32 = 30_000,
     rate_limit_config: ?flow_control.RateLimitConfig = null,
     backpressure_config: ?flow_control.BackpressureConfig = null,
-
-    const flow_control = @import("./flow_control.zig");
 
     fn init(allocator: std.mem.Allocator) InboxBuilder {
         return .{ .allocator = allocator };
@@ -268,6 +308,8 @@ pub const InboxBuilder = struct {
             .allocator = self.allocator,
             .closed = std.atomic.Value(bool).init(false),
             .active_ops = std.atomic.Value(u32).init(0),
+            .rate_limiter = if (self.rate_limit_config) |config| flow_control.RateLimiter.init(config.max_per_second) else null,
+            .backpressure_config = self.backpressure_config,
         };
 
         return inbox_ptr;
@@ -505,4 +547,37 @@ test "Inbox message ID is consistent" {
     var msg3 = try inbox_ptr.recv();
     defer msg3.deinit();
     try std.testing.expectEqualSlices(u8, "inbox_msg", msg3.id);
+}
+
+test "InboxBuilder applies rate limiting" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var inbox_ptr = try inboxBuilder(allocator)
+        .withRateLimit(.{ .max_per_second = 1 })
+        .build();
+    defer inbox_ptr.close();
+
+    try inbox_ptr.send("first");
+    try std.testing.expectError(MessageError.RateLimitExceeded, inbox_ptr.send("second"));
+}
+
+test "InboxBuilder applies return_error backpressure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var inbox_ptr = try inboxBuilder(allocator)
+        .capacity(1)
+        .withBackpressure(.{
+            .strategy = .return_error,
+            .high_watermark = 1,
+            .low_watermark = 0,
+        })
+        .build();
+    defer inbox_ptr.close();
+
+    try inbox_ptr.send("first");
+    try std.testing.expectError(MessageError.MailboxFull, inbox_ptr.send("second"));
 }
