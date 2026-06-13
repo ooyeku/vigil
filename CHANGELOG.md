@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-06-13
+
+### Added
+- **Owned Runtime facade**: Added `vigil.Runtime`, `vigil.RuntimeOptions`, and `vigil.runtime()` to own registry, telemetry, shutdown hooks, inbox creation, and supervisor creation from one explicit runtime value.
+- **Explicit server sugar lifecycle**: `vigil.server(...)` now exposes `init()` for allocation and `spawn()` for a running server handle with `cast`, `call`, `stop`, `join`, and `deinit`.
+- **Documented timer instance API**: `vigil.Timer` now supports `init`, `deinit`, `setTimeout`, `setInterval`, and `cancel`, while preserving `sendAfter` for delayed mailbox delivery.
+- **Versioned distributed registry protocol**: Distributed registry commands now use `VIGIL/2` frames with parser/formatter coverage in `distributed_protocol.zig`.
+
+### Changed
+- **Inbox builder options are real**: `InboxBuilder.withRateLimit()` and `withBackpressure()` now affect the built inbox instead of only storing unused config.
+- **Supervisor builder hooks are real**: `SupervisorBuilder.onCrash()` and `withTelemetry()` now flow into supervisor options and monitored restart behavior.
+- **GenServer registration is explicit**: `GenServer.register()` now takes a `*vigil.Registry`, removing hidden dependency on root global registry state.
+- **Docs and examples are v2-first**: README and API docs now show runtime-owned services, `vigil.compat.sleep`, the explicit GenServer registry contract, and the `VIGIL/2` distributed protocol.
+
+### Removed
+- **Obsolete 0.2 root helpers**: Removed root exports for `createMailbox`, `createSupervisor`, `createSupervisionTree`, `createResponse`, `addWorkerGroup`, and root `broadcast`.
+- **Root global registry**: Removed `vigil.global_registry`; use `vigil.Runtime` or an explicit `vigil.Registry`.
+- **Compatibility shim source**: Removed `src/compat_0_2.zig`. Historical low-level types remain available through explicit `vigil/legacy` import where appropriate.
+
 ## [1.3.0] - 2026-04-18
 
 ### Changed

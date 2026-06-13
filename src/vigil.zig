@@ -130,8 +130,8 @@ pub const Timer = @import("timer.zig").Timer;
 /// Get library version information
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
-        .major = 1,
-        .minor = 3,
+        .major = 2,
+        .minor = 0,
         .patch = 0,
     };
 }

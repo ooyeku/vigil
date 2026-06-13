@@ -195,4 +195,3 @@ test "MemoryCheckpointer save and load" {
 
     try std.testing.expectEqualSlices(u8, "test_state", loaded.?);
 }
-

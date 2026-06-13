@@ -38,4 +38,3 @@ pub const VigilError = error{
     OperationTimeout,
     InvalidState,
 };
-
