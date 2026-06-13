@@ -26,6 +26,7 @@ const Allocator = std.mem.Allocator;
 const compat = @import("compat.zig");
 const Mutex = compat.Mutex;
 const Process = @import("process.zig");
+const telemetry = @import("telemetry.zig");
 
 /// Defines how the supervisor should handle process restarts.
 /// This determines the strategy used when a child process fails.
@@ -43,6 +44,9 @@ pub const RestartStrategy = enum {
     rest_for_one,
 };
 
+/// Callback invoked when the supervisor observes a child failure.
+pub const CrashHandler = *const fn (child_id: []const u8) void;
+
 /// Configuration options for supervisor behavior.
 /// These options determine how the supervisor manages its child processes.
 /// - strategy: RestartStrategy,
@@ -55,6 +59,10 @@ pub const SupervisorOptions = struct {
     max_restarts: u32,
     /// Time window in seconds for max_restarts
     max_seconds: u32,
+    /// Optional callback invoked before restart handling.
+    crash_handler: ?CrashHandler = null,
+    /// Emit telemetry when child failures are observed.
+    enable_telemetry: bool = false,
 };
 
 /// Statistics about supervisor operations.
@@ -521,6 +529,20 @@ pub const Supervisor = struct {
         return &[_]RestartHistoryEntry{};
     }
 
+    fn notifyChildCrash(self: *Supervisor, child_id: []const u8) void {
+        if (self.options.crash_handler) |handler| {
+            handler(child_id);
+        }
+
+        if (self.options.enable_telemetry) {
+            telemetry.emit(.{
+                .event_type = .process_crashed,
+                .timestamp_ms = compat.milliTimestamp(),
+                .metadata = child_id,
+            });
+        }
+    }
+
     // Internal functions below this point
 
     /// Internal function to handle child process failure according to restart strategy
@@ -530,6 +552,7 @@ pub const Supervisor = struct {
 
         const current_time = compat.milliTimestamp();
         self.stats.last_failure_time = current_time;
+        self.notifyChildCrash(failed_child.spec.id);
 
         // Reset restart count if outside time window
         const time_diff = current_time - self.last_restart_time;
@@ -597,6 +620,7 @@ pub const Supervisor = struct {
                     // Handle failure according to restart strategy
                     const current_time = compat.milliTimestamp();
                     self.stats.last_failure_time = current_time;
+                    self.notifyChildCrash(child.spec.id);
 
                     const time_diff = current_time - self.last_restart_time;
                     if (time_diff > self.options.max_seconds * 1000) {

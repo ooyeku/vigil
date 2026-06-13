@@ -15,6 +15,7 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
 const legacy = @import("../legacy.zig");
+const telemetry = @import("../telemetry.zig");
 
 pub const Supervisor = legacy.Supervisor;
 pub const SupervisorOptions = legacy.SupervisorOptions;
@@ -98,6 +99,8 @@ pub const SupervisorBuilder = struct {
                 .strategy = self.strategy_val,
                 .max_restarts = self.max_restarts_val,
                 .max_seconds = self.max_seconds_val,
+                .crash_handler = self.crash_handler,
+                .enable_telemetry = self.enable_telemetry,
             });
         }
 
@@ -135,25 +138,35 @@ pub const SupervisorBuilder = struct {
     }
 
     pub fn onCrash(self: *SupervisorBuilder, handler: CrashHandler) *SupervisorBuilder {
-        var result = self;
-        result.crash_handler = handler;
-        return result;
+        self.crash_handler = handler;
+        if (self.supervisor) |*sup| {
+            sup.options.crash_handler = handler;
+        }
+        return self;
     }
 
     pub fn withTelemetry(self: *SupervisorBuilder, enabled: bool) SupervisorBuilder {
         var result = self.*;
         result.enable_telemetry = enabled;
+        if (result.supervisor) |*sup| {
+            sup.options.enable_telemetry = enabled;
+        }
         return result;
     }
 
     pub fn build(self: SupervisorBuilder) Supervisor {
         if (self.supervisor) |sup| {
-            return sup;
+            var result = sup;
+            result.options.crash_handler = self.crash_handler;
+            result.options.enable_telemetry = self.enable_telemetry;
+            return result;
         }
         return Supervisor.init(self.allocator, .{
             .strategy = self.strategy_val,
             .max_restarts = self.max_restarts_val,
             .max_seconds = self.max_seconds_val,
+            .crash_handler = self.crash_handler,
+            .enable_telemetry = self.enable_telemetry,
         });
     }
 };
@@ -165,6 +178,25 @@ pub fn supervisor(allocator: std.mem.Allocator) SupervisorBuilder {
 
 fn dummyWorker() void {
     compat.sleep(1 * std.time.ns_per_ms);
+}
+
+fn longRunningWorker() void {
+    while (true) {
+        compat.sleep(50 * std.time.ns_per_ms);
+    }
+}
+
+var builder_crash_count = std.atomic.Value(u32).init(0);
+var builder_crash_event_count = std.atomic.Value(u32).init(0);
+
+fn countCrash(_: []const u8) void {
+    _ = builder_crash_count.fetchAdd(1, .monotonic);
+}
+
+fn countCrashEvent(event: telemetry.Event) void {
+    if (event.event_type == .process_crashed) {
+        _ = builder_crash_event_count.fetchAdd(1, .monotonic);
+    }
 }
 
 test "SupervisorBuilder basic creation" {
@@ -182,6 +214,51 @@ test "SupervisorBuilder basic creation" {
 
     // Verify supervisor was created
     try std.testing.expect(sup.children.items.len == 0);
+}
+
+test "SupervisorBuilder wires crash handler into monitored restart" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    builder_crash_count.store(0, .release);
+    builder_crash_event_count.store(0, .release);
+    telemetry.deinitGlobal();
+    try telemetry.initGlobal(allocator);
+    defer telemetry.deinitGlobal();
+    if (telemetry.getGlobal()) |emitter| {
+        try emitter.on(.process_crashed, countCrashEvent);
+    }
+
+    var builder = supervisor(allocator);
+    builder = builder.withTelemetry(true);
+    _ = builder.onCrash(countCrash);
+    _ = try builder.childWithOptions("crashy", longRunningWorker, .{ .shutdown_timeout_ms = 100 });
+    var sup = builder.build();
+    try std.testing.expect(sup.options.crash_handler != null);
+    try std.testing.expect(sup.options.enable_telemetry);
+    defer {
+        sup.stopMonitoring();
+        compat.sleep(50 * std.time.ns_per_ms);
+        sup.deinit();
+    }
+
+    try sup.start();
+    try sup.startMonitoring();
+
+    {
+        const child = sup.findChild("crashy").?;
+        child.mutex.lock();
+        child.state = .failed;
+        child.mutex.unlock();
+    }
+
+    var waited_ms: u32 = 0;
+    while ((builder_crash_count.load(.acquire) == 0 or builder_crash_event_count.load(.acquire) == 0) and waited_ms < 1000) : (waited_ms += 25) {
+        compat.sleep(25 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(u32, 1), builder_crash_count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), builder_crash_event_count.load(.acquire));
 }
 
 test "SupervisorBuilder add children" {
