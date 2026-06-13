@@ -765,15 +765,39 @@ test "supervisor monitoring" {
     }
 }
 
+var supervisor_crash_count = std.atomic.Value(u32).init(0);
+var supervisor_crash_event_count = std.atomic.Value(u32).init(0);
+
+fn recordSupervisorCrash(_: []const u8) void {
+    _ = supervisor_crash_count.fetchAdd(1, .monotonic);
+}
+
+fn recordSupervisorCrashEvent(event: telemetry.Event) void {
+    if (event.event_type == .process_crashed) {
+        _ = supervisor_crash_event_count.fetchAdd(1, .monotonic);
+    }
+}
+
 test "supervisor restart strategies" {
     const allocator = std.testing.allocator;
 
     // Test one_for_one strategy
     {
+        supervisor_crash_count.store(0, .release);
+        supervisor_crash_event_count.store(0, .release);
+        telemetry.deinitGlobal();
+        try telemetry.initGlobal(allocator);
+        defer telemetry.deinitGlobal();
+        if (telemetry.getGlobal()) |emitter| {
+            try emitter.on(.process_crashed, recordSupervisorCrashEvent);
+        }
+
         var supervisor = Supervisor.init(allocator, .{
             .strategy = .one_for_one,
             .max_restarts = 3,
             .max_seconds = 5,
+            .crash_handler = recordSupervisorCrash,
+            .enable_telemetry = true,
         });
         defer {
             supervisor.stopMonitoring();
@@ -808,13 +832,21 @@ test "supervisor restart strategies" {
             child.mutex.unlock();
         }
 
-        // Wait for restart to complete
-        compat.sleep(500 * std.time.ns_per_ms);
+        // Wait for restart, crash callback, and telemetry to complete.
+        var waited_ms: u32 = 0;
+        while ((supervisor.getStats().total_restarts == 0 or
+            supervisor_crash_count.load(.acquire) == 0 or
+            supervisor_crash_event_count.load(.acquire) == 0) and waited_ms < 3000) : (waited_ms += 25)
+        {
+            compat.sleep(25 * std.time.ns_per_ms);
+        }
 
         // Get stats with mutex protection
         const stats = supervisor.getStats();
         try std.testing.expectEqual(@as(u32, 1), stats.total_restarts);
         try std.testing.expectEqual(@as(u32, 1), stats.active_children);
+        try std.testing.expectEqual(@as(u32, 1), supervisor_crash_count.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 1), supervisor_crash_event_count.load(.acquire));
     }
 }
 
