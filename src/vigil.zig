@@ -122,22 +122,6 @@ pub const ProcessMailbox = legacy.ProcessMailbox;
 pub const Registry = @import("registry.zig").Registry;
 pub const Timer = @import("timer.zig").Timer;
 
-/// Global registry instance (optional)
-pub var global_registry: ?*Registry = null;
-
-// Additional legacy exports for backward compatibility
-pub const SupervisorOptions = legacy.SupervisorOptions;
-pub const SupervisorTree = legacy.SupervisorTree;
-pub const ChildSpec = legacy.ChildSpec;
-pub const createMailbox = compat_0_2.createMailbox;
-pub const createSupervisor = compat_0_2.createSupervisor;
-pub const createSupervisionTree = compat_0_2.createSupervisionTree;
-pub const broadcast = compat_0_2.broadcast;
-pub const createResponse = compat_0_2.createResponse;
-pub const addWorkerGroup = compat_0_2.addWorkerGroup;
-
-const compat_0_2 = @import("compat_0_2.zig");
-
 /// Get library version information
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
@@ -145,6 +129,16 @@ pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
         .minor = 3,
         .patch = 0,
     };
+}
+
+test "v2 root module excludes obsolete 0.2 compatibility helpers" {
+    try std.testing.expect(!@hasDecl(@This(), "createMailbox"));
+    try std.testing.expect(!@hasDecl(@This(), "createSupervisor"));
+    try std.testing.expect(!@hasDecl(@This(), "createSupervisionTree"));
+    try std.testing.expect(!@hasDecl(@This(), "createResponse"));
+    try std.testing.expect(!@hasDecl(@This(), "addWorkerGroup"));
+    try std.testing.expect(!@hasDecl(@This(), "broadcast"));
+    try std.testing.expect(!@hasDecl(@This(), "global_registry"));
 }
 
 test {

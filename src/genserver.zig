@@ -55,13 +55,18 @@ pub fn GenServer(comptime StateType: type) type {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
+            const mailbox = try allocator.create(vigil.ProcessMailbox);
+            errdefer allocator.destroy(mailbox);
+            mailbox.* = vigil.ProcessMailbox.init(allocator, .{
+                .capacity = 100,
+                .priority_queues = true,
+                .enable_deadletter = true,
+                .default_ttl_ms = 5000,
+            });
+
             self.* = .{
                 .allocator = allocator,
-                .mailbox = try vigil.createMailbox(allocator, .{
-                    .capacity = 100,
-                    .priority = .normal,
-                    .default_ttl_ms = 5000,
-                }),
+                .mailbox = mailbox,
                 .state = state,
                 .handler = handler,
                 .init_fn = init_fn,
@@ -268,13 +273,9 @@ pub fn GenServer(comptime StateType: type) type {
             ckpt.save(id, data) catch {};
         }
 
-        /// Register the GenServer with the global registry
-        pub fn register(self: *Self, name: []const u8) !void {
-            if (vigil.global_registry) |reg| {
-                try reg.register(name, self.mailbox);
-            } else {
-                return error.GlobalRegistryNotInitialized;
-            }
+        /// Register the GenServer with an explicit registry.
+        pub fn register(self: *Self, registry: *vigil.Registry, name: []const u8) !void {
+            try registry.register(name, self.mailbox);
         }
 
         /// Schedule a message to be sent to self after a delay
@@ -507,17 +508,14 @@ test "GenServer supervision" {
         State{ .count = 0 },
     );
 
-    const supervisor = try vigil.createSupervisor(allocator, .{
+    var supervisor = vigil.Supervisor.init(allocator, .{
         .strategy = .one_for_one,
         .max_restarts = 3,
         .max_seconds = 5,
     });
-    defer {
-        supervisor.deinit();
-        allocator.destroy(supervisor);
-    }
+    defer supervisor.deinit();
 
-    try server.supervise(supervisor, "test_gen_server");
+    try server.supervise(&supervisor, "test_gen_server");
     try testing.expect(server.supervisor != null);
 
     server.stop();

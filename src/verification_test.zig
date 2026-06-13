@@ -6,11 +6,9 @@ const testing = std.testing;
 test "Verification of v0.5.0 features" {
     const allocator = testing.allocator;
 
-    // 1. Initialize Global Registry
+    // 1. Initialize explicit Registry
     var registry = vigil.Registry.init(allocator);
     defer registry.deinit();
-    vigil.global_registry = &registry;
-    defer vigil.global_registry = null;
 
     // 2. Create Supervisor
     var supervisor = vigil.Supervisor.init(allocator, .{
@@ -21,9 +19,12 @@ test "Verification of v0.5.0 features" {
     defer supervisor.deinit();
 
     // 3. Define GenServer
-    const State = struct { count: u32 };
+    const State = struct {
+        count: u32,
+        registry: *vigil.Registry,
+    };
     const ServerType = vigil.GenServer(State);
-    const state = State{ .count = 0 };
+    const state = State{ .count = 0, .registry = &registry };
 
     const server = try ServerType.init(
         allocator,
@@ -37,7 +38,7 @@ test "Verification of v0.5.0 features" {
         struct {
             fn init(self: *ServerType) !void {
                 // Register self
-                try self.register("my_server");
+                try self.register(self.state.registry, "my_server");
 
                 // Schedule message
                 const msg = try vigil.Message.init(self.allocator, "sched", "self", "scheduled", .info, .normal, null);
@@ -61,7 +62,7 @@ test "Verification of v0.5.0 features" {
     // 5. Verify Registry
     // Wait for async registration
     compat.sleep(10 * std.time.ns_per_ms);
-    try std.testing.expect(vigil.global_registry.?.whereis("my_server") != null);
+    try std.testing.expect(registry.whereis("my_server") != null);
 
     // 6. Verify Timer (wait for message)
     // We wait enough time for timer to fire and server to process it
@@ -84,9 +85,12 @@ test "Verification of v0.5.0 features" {
     // but for this test, we'll just create a new server.
     // The supervisor and registry are still active from the first part of the test.
 
-    const StatePersistent = struct { count: u32 };
+    const StatePersistent = struct {
+        count: u32,
+        registry: *vigil.Registry,
+    };
     const ServerTypePersistent = vigil.GenServer(StatePersistent);
-    const state_persistent = StatePersistent{ .count = 0 };
+    const state_persistent = StatePersistent{ .count = 0, .registry = &registry };
 
     const server_persistent = try ServerTypePersistent.init(
         allocator,
@@ -99,7 +103,7 @@ test "Verification of v0.5.0 features" {
         }.handle,
         struct {
             fn init(self: *ServerTypePersistent) !void {
-                try self.register("my_server_persistent");
+                try self.register(self.state.registry, "my_server_persistent");
                 const msg = try vigil.Message.init(self.allocator, "sched", "self", "scheduled", .info, .normal, null);
                 try self.schedule(msg, 10);
             }
@@ -122,7 +126,7 @@ test "Verification of v0.5.0 features" {
 
     // Wait for async registration
     compat.sleep(10 * std.time.ns_per_ms);
-    try std.testing.expect(vigil.global_registry.?.whereis("my_server_persistent") != null);
+    try std.testing.expect(registry.whereis("my_server_persistent") != null);
 
     compat.sleep(100 * std.time.ns_per_ms);
 
