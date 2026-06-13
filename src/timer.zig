@@ -3,8 +3,104 @@ const Message = @import("messages.zig").Message;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 const compat = @import("compat.zig");
 
+var timer_test_count = std.atomic.Value(u32).init(0);
+
+fn incrementTimerTestCount() void {
+    _ = timer_test_count.fetchAdd(1, .monotonic);
+}
+
+pub const TimerCallback = *const fn () void;
+
 /// Timer utilities for scheduling messages.
 pub const Timer = struct {
+    allocator: std.mem.Allocator,
+    context: ?*TimerContext = null,
+    thread: ?std.Thread = null,
+
+    const TimerContext = struct {
+        cancelled: std.atomic.Value(bool),
+        interval_ms: u32,
+        callback: TimerCallback,
+        repeat: bool,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) Timer {
+        return .{
+            .allocator = allocator,
+            .context = null,
+            .thread = null,
+        };
+    }
+
+    pub fn deinit(self: *Timer) void {
+        self.cancel();
+        self.joinExistingThread();
+    }
+
+    pub fn cancel(self: *Timer) void {
+        if (self.context) |ctx| {
+            ctx.cancelled.store(true, .release);
+        }
+    }
+
+    pub fn setTimeout(self: *Timer, delay_ms: u32, callback: TimerCallback) !void {
+        self.cancel();
+        self.joinExistingThread();
+        self.context = try self.allocator.create(TimerContext);
+        self.context.?.* = .{
+            .cancelled = std.atomic.Value(bool).init(false),
+            .interval_ms = delay_ms,
+            .callback = callback,
+            .repeat = false,
+        };
+        errdefer {
+            self.allocator.destroy(self.context.?);
+            self.context = null;
+        }
+        self.thread = try std.Thread.spawn(.{}, timerLoop, .{self.context.?});
+    }
+
+    pub fn setInterval(self: *Timer, interval_ms: u32, callback: TimerCallback) !void {
+        self.cancel();
+        self.joinExistingThread();
+        self.context = try self.allocator.create(TimerContext);
+        self.context.?.* = .{
+            .cancelled = std.atomic.Value(bool).init(false),
+            .interval_ms = interval_ms,
+            .callback = callback,
+            .repeat = true,
+        };
+        errdefer {
+            self.allocator.destroy(self.context.?);
+            self.context = null;
+        }
+        self.thread = try std.Thread.spawn(.{}, timerLoop, .{self.context.?});
+    }
+
+    fn joinExistingThread(self: *Timer) void {
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
+        if (self.context) |ctx| {
+            self.allocator.destroy(ctx);
+            self.context = null;
+        }
+    }
+
+    fn timerLoop(ctx: *TimerContext) void {
+        while (!ctx.cancelled.load(.acquire)) {
+            compat.sleep(@as(u64, ctx.interval_ms) * std.time.ns_per_ms);
+            if (ctx.cancelled.load(.acquire)) {
+                return;
+            }
+            ctx.callback();
+            if (!ctx.repeat) {
+                return;
+            }
+        }
+    }
+
     /// Schedule a message to be sent after a delay.
     /// Spawns a detached thread to handle the timing.
     /// The message is owned by the timer until sent.
@@ -48,6 +144,34 @@ pub const Timer = struct {
         thread.detach();
     }
 };
+
+test "Timer setTimeout runs callback" {
+    timer_test_count.store(0, .release);
+
+    var timer = Timer.init(std.testing.allocator);
+    defer timer.deinit();
+
+    try timer.setTimeout(10, incrementTimerTestCount);
+    compat.sleep(40 * std.time.ns_per_ms);
+
+    try std.testing.expectEqual(@as(u32, 1), timer_test_count.load(.acquire));
+}
+
+test "Timer cancel stops interval" {
+    timer_test_count.store(0, .release);
+
+    var timer = Timer.init(std.testing.allocator);
+    defer timer.deinit();
+
+    try timer.setInterval(5, incrementTimerTestCount);
+    compat.sleep(20 * std.time.ns_per_ms);
+    timer.cancel();
+
+    const count_after_cancel = timer_test_count.load(.acquire);
+    compat.sleep(20 * std.time.ns_per_ms);
+
+    try std.testing.expectEqual(count_after_cancel, timer_test_count.load(.acquire));
+}
 
 test "Timer sendAfter" {
     const allocator = std.testing.allocator;
