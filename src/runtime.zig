@@ -64,9 +64,8 @@ pub const Runtime = struct {
     }
 
     pub fn supervisor(self: *Runtime) supervisor_builder.SupervisorBuilder {
-        return supervisor_builder
-            .supervisor(self.allocator)
-            .withTelemetry(self.options.telemetry_enabled);
+        var builder = supervisor_builder.supervisor(self.allocator);
+        return builder.withTelemetry(self.options.telemetry_enabled);
     }
 
     pub fn register(self: *Runtime, name: []const u8, mailbox: *ProcessMailbox) !void {
@@ -93,6 +92,12 @@ pub fn runtime(allocator: std.mem.Allocator, options: RuntimeOptions) !Runtime {
     return Runtime.init(allocator, options);
 }
 
+var runtime_shutdown_count = std.atomic.Value(u32).init(0);
+
+fn recordRuntimeShutdown() void {
+    _ = runtime_shutdown_count.fetchAdd(1, .monotonic);
+}
+
 test "Runtime initializes owned services" {
     var rt = try Runtime.init(std.testing.allocator, .{});
     defer rt.deinit();
@@ -112,4 +117,50 @@ test "Runtime creates and closes inboxes" {
     var msg = try ib.recvTimeout(50) orelse return error.ExpectedMessage;
     defer msg.deinit();
     try std.testing.expectEqualStrings("hello", msg.payload.?);
+}
+
+test "Runtime registers and resolves owned mailboxes" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var ib = try rt.inbox(.{ .capacity = 4 });
+    defer ib.close();
+
+    try rt.register("worker.inbox", ib.mailbox);
+    try std.testing.expect(rt.whereis("worker.inbox") == ib.mailbox);
+    try std.testing.expect(rt.whereis("missing") == null);
+}
+
+test "Runtime supervisor builder inherits telemetry option" {
+    var rt_enabled = try Runtime.init(std.testing.allocator, .{ .telemetry_enabled = true });
+    defer rt_enabled.deinit();
+    var enabled_builder = rt_enabled.supervisor();
+    var enabled_sup = enabled_builder.build();
+    defer enabled_sup.deinit();
+    try std.testing.expect(enabled_sup.options.enable_telemetry);
+
+    var rt_disabled = try Runtime.init(std.testing.allocator, .{ .telemetry_enabled = false });
+    defer rt_disabled.deinit();
+    var disabled_builder = rt_disabled.supervisor();
+    var disabled_sup = disabled_builder.build();
+    defer disabled_sup.deinit();
+    try std.testing.expect(!disabled_sup.options.enable_telemetry);
+}
+
+test "Runtime shutdown honors shutdown_enabled option" {
+    runtime_shutdown_count.store(0, .release);
+
+    var enabled = try Runtime.init(std.testing.allocator, .{ .shutdown_enabled = true });
+    defer enabled.deinit();
+    try enabled.onShutdown(recordRuntimeShutdown);
+    enabled.shutdown();
+    try std.testing.expect(!enabled.isRunning());
+    try std.testing.expectEqual(@as(u32, 1), runtime_shutdown_count.load(.acquire));
+
+    var disabled = try Runtime.init(std.testing.allocator, .{ .shutdown_enabled = false });
+    defer disabled.deinit();
+    try disabled.onShutdown(recordRuntimeShutdown);
+    disabled.shutdown();
+    try std.testing.expect(!disabled.isRunning());
+    try std.testing.expectEqual(@as(u32, 1), runtime_shutdown_count.load(.acquire));
 }

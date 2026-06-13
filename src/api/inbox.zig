@@ -581,3 +581,51 @@ test "InboxBuilder applies return_error backpressure" {
     try inbox_ptr.send("first");
     try std.testing.expectError(MessageError.MailboxFull, inbox_ptr.send("second"));
 }
+
+test "InboxBuilder drop_newest backpressure keeps existing message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var inbox_ptr = try inboxBuilder(allocator)
+        .capacity(1)
+        .withBackpressure(.{
+            .strategy = .drop_newest,
+            .high_watermark = 1,
+            .low_watermark = 0,
+        })
+        .build();
+    defer inbox_ptr.close();
+
+    try inbox_ptr.send("first");
+    try inbox_ptr.send("second");
+
+    var msg = try inbox_ptr.recv();
+    defer msg.deinit();
+    try std.testing.expectEqualStrings("first", msg.payload.?);
+    try std.testing.expectEqual(@as(?Message, null), try inbox_ptr.recvTimeout(5));
+}
+
+test "InboxBuilder drop_oldest backpressure replaces existing message" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var inbox_ptr = try inboxBuilder(allocator)
+        .capacity(1)
+        .withBackpressure(.{
+            .strategy = .drop_oldest,
+            .high_watermark = 1,
+            .low_watermark = 0,
+        })
+        .build();
+    defer inbox_ptr.close();
+
+    try inbox_ptr.send("first");
+    try inbox_ptr.send("second");
+
+    var msg = try inbox_ptr.recv();
+    defer msg.deinit();
+    try std.testing.expectEqualStrings("second", msg.payload.?);
+    try std.testing.expectEqual(@as(?Message, null), try inbox_ptr.recvTimeout(5));
+}

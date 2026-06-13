@@ -173,6 +173,19 @@ test "Timer cancel stops interval" {
     try std.testing.expectEqual(count_after_cancel, timer_test_count.load(.acquire));
 }
 
+test "Timer cancel prevents pending timeout callback" {
+    timer_test_count.store(0, .release);
+
+    var timer = Timer.init(std.testing.allocator);
+    defer timer.deinit();
+
+    try timer.setTimeout(40, incrementTimerTestCount);
+    timer.cancel();
+    compat.sleep(70 * std.time.ns_per_ms);
+
+    try std.testing.expectEqual(@as(u32, 0), timer_test_count.load(.acquire));
+}
+
 test "Timer sendAfter" {
     const allocator = std.testing.allocator;
     var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 10 });

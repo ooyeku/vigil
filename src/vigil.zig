@@ -146,6 +146,18 @@ test "v2 root module excludes obsolete 0.2 compatibility helpers" {
     try std.testing.expect(!@hasDecl(@This(), "global_registry"));
 }
 
+test "v2 root module exports runtime and version" {
+    try std.testing.expect(@hasDecl(@This(), "Runtime"));
+    try std.testing.expect(@hasDecl(@This(), "RuntimeOptions"));
+    try std.testing.expect(@hasDecl(@This(), "runtime"));
+    try std.testing.expect(@hasDecl(@This(), "distributed_protocol"));
+
+    const version = getVersion();
+    try std.testing.expectEqual(@as(u32, 2), version.major);
+    try std.testing.expectEqual(@as(u32, 0), version.minor);
+    try std.testing.expectEqual(@as(u32, 0), version.patch);
+}
+
 test {
     std.testing.refAllDecls(@This());
 }

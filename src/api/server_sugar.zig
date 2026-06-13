@@ -148,6 +148,26 @@ const TestHandlers = struct {
     }
 };
 
+const CallState = struct {};
+
+const CallHandlers = struct {
+    pub fn init(self: *GenServer(CallState)) !void {
+        _ = self;
+    }
+
+    pub fn handle(self: *GenServer(CallState), msg: Message) !void {
+        if (msg.payload) |payload| {
+            if (std.mem.eql(u8, payload, "ping")) {
+                try self.reply(msg, "pong");
+            }
+        }
+    }
+
+    pub fn terminate(self: *GenServer(CallState)) void {
+        _ = self;
+    }
+};
+
 test "server sugar basic creation" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -176,6 +196,23 @@ test "server sugar spawn runs message loop and joins cleanly" {
 
     handle.stop();
     handle.join();
+}
+
+test "server sugar call waits for handler reply" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Server = server(CallState, CallHandlers);
+    var handle = try Server.spawn(allocator, .{});
+    defer handle.deinit();
+
+    compat.sleep(10 * std.time.ns_per_ms);
+
+    var response = try handle.call("ping", .{ .timeout = 500 });
+    defer response.deinit();
+
+    try std.testing.expectEqualStrings("pong", response.payload.?);
 }
 
 test "server sugar state management" {
