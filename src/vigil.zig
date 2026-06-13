@@ -43,6 +43,7 @@ pub const process_group = @import("process_group.zig");
 pub const pubsub = @import("pubsub.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const distributed_registry = @import("distributed_registry.zig");
+pub const distributed_protocol = @import("distributed_protocol.zig");
 pub const shutdown = @import("shutdown.zig");
 pub const errors = @import("errors.zig");
 pub const compat = @import("compat.zig");

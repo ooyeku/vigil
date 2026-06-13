@@ -7,6 +7,7 @@ const Registry = @import("registry.zig").Registry;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 const compat = @import("compat.zig");
 const net = compat.net;
+const protocol = @import("distributed_protocol.zig");
 
 /// Cluster node representation
 pub const ClusterNode = struct {
@@ -31,11 +32,11 @@ pub const DistributedRegistryConfig = struct {
     listen_port: u16 = 9100,
 };
 
-/// Text-based protocol opcodes (newline-delimited)
-/// REG <name>    -> OK | ERR <msg>
-/// UNREG <name>  -> OK
-/// WHERE <name>  -> FOUND | NOTFOUND
-/// HEART         -> ALIVE
+/// Text-based v2 protocol opcodes (newline-delimited)
+/// VIGIL/2 REG <name>    -> OK | ERR <msg>
+/// VIGIL/2 UNREG <name>  -> OK
+/// VIGIL/2 WHERE <name>  -> FOUND | NOTFOUND
+/// VIGIL/2 HEART         -> ALIVE
 const Protocol = struct {
     fn sendFrame(stream: net.Stream, data: []const u8) void {
         _ = stream.write(data) catch {};
@@ -225,7 +226,7 @@ pub const DistributedRegistry = struct {
         const stream = net.Stream{ .handle = fd };
 
         var buf: [256]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "WHERE {s}\n", .{name}) catch return false;
+        const cmd = protocol.writeFrame(&buf, "WHERE {s}", .{name}) catch return false;
         _ = stream.write(cmd) catch return false;
 
         var resp_buf: [256]u8 = undefined;
@@ -258,6 +259,17 @@ pub const DistributedRegistry = struct {
         });
     }
 
+    fn uncacheRemoteRegistration(self: *DistributedRegistry, name: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.remote_registrations.fetchRemove(name)) |entry| {
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value.name);
+            self.allocator.free(entry.value.node_address);
+        }
+    }
+
     /// Send heartbeat to a node and update liveness
     fn sendHeartbeat(_: *DistributedRegistry, node: *ClusterNode) void {
         const addr = net.parseIp4(node.address, node.port) catch {
@@ -280,7 +292,12 @@ pub const DistributedRegistry = struct {
         };
         const stream = net.Stream{ .handle = fd };
 
-        _ = stream.write("HEART\n") catch {
+        var frame_buf: [128]u8 = undefined;
+        const frame = protocol.writeFrame(&frame_buf, "HEART", .{}) catch {
+            node.is_alive = false;
+            return;
+        };
+        _ = stream.write(frame) catch {
             node.is_alive = false;
             return;
         };
@@ -310,7 +327,7 @@ pub const DistributedRegistry = struct {
         const stream = net.Stream{ .handle = fd };
 
         var buf: [256]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "REG {s}\n", .{name}) catch return;
+        const cmd = protocol.writeFrame(&buf, "REG {s}", .{name}) catch return;
         _ = stream.write(cmd) catch {};
     }
 
@@ -321,38 +338,50 @@ pub const DistributedRegistry = struct {
         var buffer: [1024]u8 = undefined;
         const line = Protocol.readLine(stream, &buffer) orelse return;
 
-        if (std.mem.startsWith(u8, line, "WHERE ")) {
-            const name = line["WHERE ".len..];
-            if (self.local_registry.whereis(name) != null) {
-                Protocol.sendFrame(stream, "FOUND\n");
-            } else {
-                Protocol.sendFrame(stream, "NOTFOUND\n");
-            }
-        } else if (std.mem.startsWith(u8, line, "REG ")) {
-            const name = line["REG ".len..];
-            const peer_ip_be = std.mem.bigToNative(u32, peer_addr.in.addr);
-            const peer_port = std.mem.bigToNative(u16, peer_addr.in.port);
-            var addr_buf: [64]u8 = undefined;
-            const peer_ip = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
-                (peer_ip_be >> 24) & 0xff,
-                (peer_ip_be >> 16) & 0xff,
-                (peer_ip_be >> 8) & 0xff,
-                peer_ip_be & 0xff,
-            }) catch {
-                Protocol.sendFrame(stream, "OK\n");
-                return;
-            };
+        const command = protocol.parse(line) catch {
+            Protocol.sendFrame(stream, "ERR unsupported protocol\n");
+            return;
+        };
 
-            self.cacheRemoteRegistration(name, .{
-                .name = name,
-                .node_address = peer_ip,
-                .node_port = peer_port,
-            }) catch {};
-            Protocol.sendFrame(stream, "OK\n");
-        } else if (std.mem.eql(u8, line, "HEART")) {
-            Protocol.sendFrame(stream, "ALIVE\n");
-        } else {
-            Protocol.sendFrame(stream, "ERR unknown command\n");
+        switch (command) {
+            .where => |name| {
+                if (self.local_registry.whereis(name) != null) {
+                    Protocol.sendFrame(stream, "FOUND\n");
+                } else {
+                    Protocol.sendFrame(stream, "NOTFOUND\n");
+                }
+            },
+            .reg => |name| {
+                const peer_ip_be = std.mem.bigToNative(u32, peer_addr.in.addr);
+                const peer_port = std.mem.bigToNative(u16, peer_addr.in.port);
+                var addr_buf: [64]u8 = undefined;
+                const peer_ip = std.fmt.bufPrint(&addr_buf, "{d}.{d}.{d}.{d}", .{
+                    (peer_ip_be >> 24) & 0xff,
+                    (peer_ip_be >> 16) & 0xff,
+                    (peer_ip_be >> 8) & 0xff,
+                    peer_ip_be & 0xff,
+                }) catch {
+                    Protocol.sendFrame(stream, "OK\n");
+                    return;
+                };
+
+                self.cacheRemoteRegistration(name, .{
+                    .name = name,
+                    .node_address = peer_ip,
+                    .node_port = peer_port,
+                }) catch {};
+                Protocol.sendFrame(stream, "OK\n");
+            },
+            .unreg => |name| {
+                self.uncacheRemoteRegistration(name);
+                Protocol.sendFrame(stream, "OK\n");
+            },
+            .heart => {
+                Protocol.sendFrame(stream, "ALIVE\n");
+            },
+            .hello => {
+                Protocol.sendFrame(stream, "OK\n");
+            },
         }
     }
 
