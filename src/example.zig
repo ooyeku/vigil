@@ -35,7 +35,7 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    std.debug.print("\n=== Vigil v1.0.0 Example ===\n", .{});
+    std.debug.print("\n=== Vigil v2.0.0 Example ===\n", .{});
     std.debug.print("Demonstrating: Supervision, Messaging, Circuit Breaker, Telemetry\n\n", .{});
 
     // Create circuit breaker for resilience

@@ -1,10 +1,11 @@
-# Vigil API Reference v1.3.0
+# Vigil API Reference v2.0.0
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Runtime](#runtime)
 - [Core API](#core-api)
   - [Message Builder](#message-builder)
   - [Inbox API](#inbox-api)
@@ -63,6 +64,41 @@ fn handlerFunction() void {
     // Your handler logic
 }
 ```
+
+---
+
+## Runtime
+
+`Runtime` owns the common process-system services that were previously reached through scattered global helpers: registry, telemetry, shutdown hooks, inbox construction, and supervisor construction.
+
+```zig
+var rt = try vigil.runtime(allocator, .{});
+defer rt.deinit();
+
+var inbox = try rt.inbox(.{ .capacity = 128 });
+defer inbox.close();
+
+try inbox.send("hello");
+
+if (rt.whereis("worker")) |mailbox| {
+    _ = mailbox;
+}
+```
+
+| Method | Description |
+|--------|-------------|
+| `runtime(allocator, options)` | Create an owned runtime |
+| `deinit()` | Release owned registry, telemetry, and shutdown resources |
+| `inbox(options)` | Create an inbox using runtime allocator |
+| `supervisor()` | Create a supervisor builder using runtime options |
+| `register(name, mailbox)` | Register a mailbox in the runtime registry |
+| `whereis(name)` | Look up a registered mailbox |
+| `onShutdown(hook)` | Register a shutdown hook |
+| `shutdown()` | Mark runtime stopped and run shutdown hooks |
+
+### Migrating from pre-2.0 root helpers
+
+Vigil 2.0 removes the old 0.2 compatibility helpers from `@import("vigil")`. Use `vigil.inboxBuilder`, `vigil.supervisor`, `vigil.Runtime`, or explicit `@import("vigil/legacy")` low-level types.
 
 ---
 
@@ -522,7 +558,7 @@ if (vigil.telemetry.getGlobal()) |emitter| {
 // Emit events (thread-safe)
 vigil.telemetry.emit(.{
     .event_type = .message_sent,
-    .timestamp_ms = std.time.milliTimestamp(),
+    .timestamp_ms = vigil.compat.milliTimestamp(),
     .metadata = null,
 });
 
@@ -732,7 +768,7 @@ try server.setCheckpointer(mem_ckpt.toCheckpointer(), "my_server", 5000, .{
 | `call(msg, timeout_ms)` | Send sync message, wait for reply |
 | `reply(msg, payload)` | Reply to a call() from within the handler |
 | `setCheckpointer(ckpt, id, interval_ms, fns)` | Enable state checkpointing |
-| `register(name)` | Register with the global registry |
+| `register(registry, name)` | Register with an explicit registry |
 | `schedule(msg, delay_ms)` | Send a delayed message to self |
 | `supervise(supervisor, id)` | Register with a supervisor |
 
@@ -778,9 +814,10 @@ registry.stopSync();
 ```
 
 **Cluster Protocol (TCP, newline-delimited):**
-- `HEART` -> `ALIVE` (liveness check)
-- `WHERE <name>` -> `FOUND` / `NOTFOUND` (name lookup)
-- `REG <name>` -> `OK` (registration propagation)
+- `VIGIL/2 HEART` -> `ALIVE` (liveness check)
+- `VIGIL/2 WHERE <name>` -> `FOUND` / `NOTFOUND` (name lookup)
+- `VIGIL/2 REG <name>` -> `OK` (registration propagation)
+- `VIGIL/2 UNREG <name>` -> `OK` (remote cache removal)
 
 | Method | Description |
 |--------|-------------|

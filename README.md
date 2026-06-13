@@ -28,7 +28,7 @@ const vigil = @import("vigil");
 
 fn worker() void {
     std.debug.print("Worker running\n", .{});
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    vigil.compat.sleep(100 * std.time.ns_per_ms);
 }
 
 pub fn main() !void {
@@ -42,6 +42,18 @@ pub fn main() !void {
     try app.start();
     defer app.shutdown();
 }
+```
+
+### Runtime-Owned Services
+
+```zig
+var rt = try vigil.runtime(allocator, .{});
+defer rt.deinit();
+
+var inbox = try rt.inbox(.{ .capacity = 128 });
+defer inbox.close();
+
+try inbox.send("hello from the runtime");
 ```
 
 ### Channel-Like Message Passing
@@ -103,6 +115,7 @@ try group.roundRobin("message"); // Load balance
 
 - **Process Supervision** - Automatic restart strategies (one_for_one, one_for_all, rest_for_one)
 - **Message Passing** - Thread-safe inboxes with priority queues
+- **Owned Runtime** - Registry, telemetry, shutdown, inboxes, and supervisors under one owner
 - **Fluent Builders** - Intuitive API with sensible defaults
 - **Configuration Presets** - Production, development, HA, and testing modes
 
@@ -163,6 +176,10 @@ zig build
 
 See [docs/api.md](docs/api.md) for comprehensive API documentation.
 
+## Migrating to 2.0
+
+Vigil 2.0 removes the old 0.2 compatibility helpers from the root `vigil` module. Code that needs historical low-level types should import `vigil/legacy` explicitly. New code should use `vigil.Runtime`, `vigil.app`, `vigil.supervisor`, `vigil.inbox`, and `vigil.GenServer`.
+
 ## Running Tests
 
 ```bash
@@ -172,7 +189,8 @@ zig build test
 ## Requirements
 
 - Zig 0.16.x
-- POSIX-compliant operating system
+- Core runtime support for Zig's native thread targets
+- Distributed TCP registry and networking examples currently use the bundled POSIX socket compatibility layer
 
 ## License
 
