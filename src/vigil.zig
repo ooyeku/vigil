@@ -34,6 +34,7 @@ pub const presets = @import("api/presets.zig");
 pub const testing = @import("api/testing.zig");
 pub const flow_control = @import("api/flow_control.zig");
 pub const request_reply = @import("api/request_reply.zig");
+pub const runtime_api = @import("runtime.zig");
 
 // New feature modules
 pub const telemetry = @import("telemetry.zig");
@@ -61,6 +62,9 @@ pub const AppBuilder = app_builder.AppBuilder;
 pub const server = server_sugar.server;
 pub const Preset = presets.Preset;
 pub const PresetConfig = presets.PresetConfig;
+pub const Runtime = runtime_api.Runtime;
+pub const RuntimeOptions = runtime_api.RuntimeOptions;
+pub const runtime = runtime_api.runtime;
 
 // Testing utilities
 pub const TestContext = testing.TestContext;
