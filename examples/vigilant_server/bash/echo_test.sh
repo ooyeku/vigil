@@ -1,6 +1,6 @@
 #!/bin/bash
 TEST_STR="TEST_$(date +%s)"
-RESPONSE=$(printf "%s\n" "$TEST_STR" | nc -w 2 localhost 8080)
+RESPONSE=$(printf "%s\n" "$TEST_STR" | nc -w 2 localhost 9090)
 echo "Server response: '$RESPONSE'"
 
 if [ "$RESPONSE" = "$TEST_STR" ]; then

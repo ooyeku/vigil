@@ -1,22 +1,37 @@
-//! High-level configuration presets for Vigil
+//! High-level configuration presets for Vigil.
+//!
 //! Pre-configured settings for different deployment scenarios.
 
+/// Named configuration profile for builder APIs.
 pub const Preset = enum {
+    /// Lenient restart limits and verbose logging for local development.
     development,
+    /// Conservative defaults for deployed services.
     production,
+    /// Larger mailbox and availability-focused timing.
     high_availability,
+    /// Small, fast settings for tests.
     testing,
 };
 
+/// Concrete values selected by a `Preset`.
 pub const PresetConfig = struct {
+    /// Maximum restarts allowed within `max_seconds`.
     max_restarts: u32,
+    /// Time window for restart-limit accounting.
     max_seconds: u32,
+    /// Health check interval for supervised children.
     health_check_interval_ms: u32,
+    /// Shutdown timeout for supervised children.
     shutdown_timeout_ms: u32,
+    /// Suggested mailbox capacity for preset-aware builders.
     mailbox_capacity: usize,
+    /// Whether monitoring should be enabled by default.
     enable_monitoring: bool,
+    /// Whether verbose logging should be enabled by default.
     enable_verbose_logging: bool,
 
+    /// Return the concrete configuration for a preset.
     pub fn get(preset: Preset) PresetConfig {
         return switch (preset) {
             .development => .{

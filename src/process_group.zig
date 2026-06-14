@@ -1,5 +1,9 @@
-//! Process Groups for Vigil
-//! Manage related processes together with routing strategies.
+//! Process groups for Vigil.
+//!
+//! A process group is a named set of inboxes that can receive broadcast,
+//! round-robin, or keyed messages. Groups are useful for worker pools, fanout,
+//! and simple sharding where the caller does not want to look up each mailbox
+//! manually.
 
 const std = @import("std");
 const Message = @import("messages.zig").Message;
@@ -9,32 +13,47 @@ const compat = @import("compat.zig");
 
 /// Result of a broadcast operation, reporting delivery outcomes.
 pub const BroadcastResult = struct {
+    /// Number of group members that accepted the payload.
     delivered: usize = 0,
+    /// Number of group members whose inbox rejected the payload.
     failed: usize = 0,
 };
 
-/// Routing strategy for process groups
+/// Supported routing styles for a process group.
 pub const RoutingStrategy = enum {
-    broadcast, // Send to all members
-    round_robin, // Distribute evenly
-    consistent_hash, // Route by key
+    /// Send to every current member.
+    broadcast,
+    /// Distribute messages across members in insertion order.
+    round_robin,
+    /// Route messages by hashing a caller-provided key.
+    consistent_hash,
 };
 
-/// Process group member
+/// Member entry in a process group.
 pub const GroupMember = struct {
+    /// Stable member id copied by `ProcessGroup.add`.
     id: []const u8,
+    /// Inbox owned by the caller. The group does not close or free it.
     inbox: *Inbox,
 };
 
-/// Process group for managing related processes
+/// Thread-safe collection of named inboxes.
+///
+/// The group owns copied member ids and its own name. It does not own member
+/// inboxes; callers must keep inboxes alive while they are registered.
 pub const ProcessGroup = struct {
+    /// Allocator for copied names and member storage.
     allocator: std.mem.Allocator,
+    /// Group name, used in telemetry metadata.
     name: []const u8,
+    /// Registered members.
     members: std.ArrayListUnmanaged(GroupMember),
+    /// Next member index for round-robin routing.
     round_robin_index: usize,
+    /// Protects membership and round-robin state.
     mutex: compat.Mutex,
 
-    /// Initialize a new process group
+    /// Initialize an empty process group with a copied name.
     pub fn init(allocator: std.mem.Allocator, name: []const u8) !ProcessGroup {
         const name_copy = try allocator.dupe(u8, name);
         errdefer allocator.free(name_copy);
@@ -48,7 +67,9 @@ pub const ProcessGroup = struct {
         };
     }
 
-    /// Cleanup resources
+    /// Release group-owned names and member storage.
+    ///
+    /// Registered inboxes are not closed.
     pub fn deinit(self: *ProcessGroup) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -60,7 +81,10 @@ pub const ProcessGroup = struct {
         self.allocator.free(self.name);
     }
 
-    /// Add a member to the group
+    /// Add an inbox to the group under `id`.
+    ///
+    /// The id is copied. The inbox remains caller-owned and must outlive its
+    /// membership or be removed before closing.
     pub fn add(self: *ProcessGroup, id: []const u8, inbox: *Inbox) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -74,7 +98,9 @@ pub const ProcessGroup = struct {
         });
     }
 
-    /// Remove a member from the group
+    /// Remove a member by id.
+    ///
+    /// Returns true when a member was removed.
     pub fn remove(self: *ProcessGroup, id: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -89,7 +115,7 @@ pub const ProcessGroup = struct {
         return false;
     }
 
-    /// Get member count
+    /// Return the number of registered members.
     pub fn memberCount(self: *ProcessGroup) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -97,8 +123,10 @@ pub const ProcessGroup = struct {
     }
 
     /// Broadcast a message to all members.
+    ///
     /// Returns a `BroadcastResult` with delivery/failure counts.
     /// Emits `message_dropped` telemetry events for each failed delivery.
+    /// Delivery is best-effort: one failed inbox does not stop the broadcast.
     pub fn broadcast(self: *ProcessGroup, payload: []const u8) !BroadcastResult {
         self.mutex.lock();
         const members_copy = self.allocator.alloc(GroupMember, self.members.items.len) catch {
@@ -128,7 +156,9 @@ pub const ProcessGroup = struct {
         return result;
     }
 
-    /// Send message using round-robin distribution
+    /// Send a payload to the next member in round-robin order.
+    ///
+    /// Returns `error.NoMembers` when the group is empty.
     pub fn roundRobin(self: *ProcessGroup, payload: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -141,7 +171,10 @@ pub const ProcessGroup = struct {
         try member.inbox.send(payload);
     }
 
-    /// Route message using consistent hash
+    /// Route a payload by hashing `key`.
+    ///
+    /// The same key routes to the same member while membership order is
+    /// unchanged. Returns `error.NoMembers` when the group is empty.
     pub fn route(self: *ProcessGroup, payload: []const u8, key: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -165,6 +198,7 @@ pub const ProcessGroup = struct {
 };
 
 pub const ProcessGroupError = error{
+    /// Routing was requested on an empty group.
     NoMembers,
 };
 

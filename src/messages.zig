@@ -49,20 +49,34 @@ const Time = std.time.Time;
 /// These errors cover the full range of potential failures in message processing,
 /// from basic mailbox operations to delivery and validation issues.
 pub const MessageError = error{
-    EmptyMailbox, // No messages available for receiving
-    MailboxFull, // Mailbox has reached its capacity
-    InvalidMessage, // Message format or content is invalid
-    InvalidSender, // Sender identification is missing or invalid
-    MessageExpired, // Message TTL has elapsed
-    DeliveryTimeout, // Message could not be delivered within timeout
-    ReceiverUnavailable, // Target receiver is not accepting messages
-    InvalidPriority, // Message priority level is invalid
-    InvalidSignal, // Signal type is not recognized
-    MessageTooLarge, // Message exceeds size limits
-    DuplicateMessage, // Message with same ID already exists
-    OutOfMemory, // Memory allocation failed
-    RateLimitExceeded, // Operation rejected by rate limiter
-    DeliveryFailed, // Message could not be delivered to subscriber
+    /// No messages are available for receiving.
+    EmptyMailbox,
+    /// Mailbox has reached its configured capacity.
+    MailboxFull,
+    /// Message format or content is invalid for the operation.
+    InvalidMessage,
+    /// Sender identification is missing or invalid.
+    InvalidSender,
+    /// Message TTL has elapsed.
+    MessageExpired,
+    /// Message could not be delivered within the requested timeout.
+    DeliveryTimeout,
+    /// Target receiver is not accepting messages.
+    ReceiverUnavailable,
+    /// Message priority level is invalid.
+    InvalidPriority,
+    /// Signal type is not recognized.
+    InvalidSignal,
+    /// Message exceeds the configured size limit.
+    MessageTooLarge,
+    /// Message with the same id already exists.
+    DuplicateMessage,
+    /// Memory allocation failed.
+    OutOfMemory,
+    /// Operation was rejected by a rate limiter.
+    RateLimitExceeded,
+    /// Message could not be delivered to a subscriber.
+    DeliveryFailed,
 };
 
 /// Message priority levels for handling urgent communications.
@@ -89,11 +103,16 @@ pub const MessageError = error{
 /// );
 /// ```
 pub const MessagePriority = enum {
-    critical, // Immediate handling required (e.g., shutdown signals, system failures)
-    high, // Urgent but not critical (e.g., health alerts, resource warnings)
-    normal, // Standard operations (e.g., status updates, routine tasks)
-    low, // Background tasks (e.g., cleanup, optimization)
-    batch, // Bulk operations (e.g., data processing, logging)
+    /// Immediate handling required, such as shutdown or system failure.
+    critical,
+    /// Urgent but not critical, such as health alerts.
+    high,
+    /// Standard application work.
+    normal,
+    /// Background or deferrable work.
+    low,
+    /// Bulk work such as batching, logging, or offline processing.
+    batch,
 
     /// Convert priority to integer for comparison and sorting
     /// Returns: u8 value from 0 (critical) to 4 (batch)
@@ -148,33 +167,46 @@ pub const MessagePriority = enum {
 /// );
 /// ```
 pub const Signal = enum {
-    // Process lifecycle signals
-    restart, // Request process restart
-    shutdown, // Request graceful shutdown
-    terminate, // Request immediate termination
-    exit, // Normal process exit
-    @"suspend", // Pause process execution
-    @"resume", // Resume process execution
-
-    // Health and monitoring signals
-    healthCheck, // Request health status
-    memoryWarning, // Memory usage alert
-    cpuWarning, // CPU usage alert
-    deadlockDetected, // Deadlock condition detected
-
-    // Operational signals
-    messageErr, // Message processing error
-    info, // Informational message
-    warning, // Warning condition
-    debug, // Debug information
-    log, // Log entry
-    alert, // Important alert
-    metric, // Performance metric
-    event, // System event
-    heartbeat, // Process heartbeat
-
-    // Custom signals
-    custom, // User-defined signals (use payload for details)
+    /// Request process restart.
+    restart,
+    /// Request graceful shutdown.
+    shutdown,
+    /// Request immediate termination.
+    terminate,
+    /// Normal process exit.
+    exit,
+    /// Pause process execution.
+    @"suspend",
+    /// Resume process execution.
+    @"resume",
+    /// Request health status.
+    healthCheck,
+    /// Memory usage alert.
+    memoryWarning,
+    /// CPU usage alert.
+    cpuWarning,
+    /// Deadlock condition detected.
+    deadlockDetected,
+    /// Message processing error.
+    messageErr,
+    /// Informational message.
+    info,
+    /// Warning condition.
+    warning,
+    /// Debug information.
+    debug,
+    /// Log entry.
+    log,
+    /// Important alert.
+    alert,
+    /// Performance metric.
+    metric,
+    /// System event.
+    event,
+    /// Process heartbeat.
+    heartbeat,
+    /// User-defined signal. Put domain details in the payload.
+    custom,
 };
 
 /// Message metadata for tracking and debugging.
@@ -189,13 +221,20 @@ pub const Signal = enum {
 /// - trace_id: ?[]const u8, // For distributed tracing
 /// - size_bytes: usize, // Total message size in bytes
 pub const MessageMetadata = struct {
-    timestamp: i64, // Creation timestamp (Unix epoch)
-    ttl_ms: ?u32, // Time-to-live in milliseconds (null = no expiry)
-    correlation_id: ?[]const u8, // For tracking related messages
-    reply_to: ?[]const u8, // Destination for responses
-    attempt_count: u32, // Number of delivery attempts made
-    trace_id: ?[]const u8, // For distributed tracing
-    size_bytes: usize, // Total message size in bytes
+    /// Creation timestamp in Unix seconds.
+    timestamp: i64,
+    /// Time-to-live in milliseconds. Null means no expiry.
+    ttl_ms: ?u32,
+    /// Correlation id for request/reply or tracing related messages.
+    correlation_id: ?[]const u8,
+    /// Logical destination for responses.
+    reply_to: ?[]const u8,
+    /// Number of delivery attempts made.
+    attempt_count: u32,
+    /// Optional distributed tracing id.
+    trace_id: ?[]const u8,
+    /// Total message size in bytes.
+    size_bytes: usize,
 };
 
 /// Message structure with metadata and delivery controls.
@@ -244,17 +283,25 @@ pub const MessageMetadata = struct {
 /// }
 /// ```
 pub const Message = struct {
-    id: []const u8, // Unique message identifier
-    payload: ?[]const u8, // Optional message content
-    signal: ?Signal, // Optional signal type
-    sender: []const u8, // Sender identifier
-    priority: MessagePriority, // Message priority level
-    metadata: MessageMetadata, // Message metadata
-    allocator: Allocator, // Memory allocator
+    /// Unique message identifier owned by this message.
+    id: []const u8,
+    /// Optional payload owned by this message.
+    payload: ?[]const u8,
+    /// Optional process signal.
+    signal: ?Signal,
+    /// Sender identifier owned by this message.
+    sender: []const u8,
+    /// Priority used by priority-aware mailboxes.
+    priority: MessagePriority,
+    /// Lifecycle and routing metadata.
+    metadata: MessageMetadata,
+    /// Allocator used for owned fields.
+    allocator: Allocator,
 
-    /// Initialize a new message with the given parameters.
-    /// Caller owns the returned message and must call deinit().
-    /// Returns: Message or error
+    /// Initialize a new owned message.
+    ///
+    /// `id`, `sender`, and `payload` are copied. The caller owns the returned
+    /// message and must call `deinit()`.
     pub fn init(
         allocator: Allocator,
         id: []const u8,
@@ -314,8 +361,7 @@ pub const Message = struct {
         }
     }
 
-    /// Check if the message has expired based on its TTL.
-    /// Returns: true if message has expired, false otherwise
+    /// Return true if the message has a TTL and that TTL has elapsed.
     pub fn isExpired(self: Message) bool {
         if (self.metadata.ttl_ms) |ttl| {
             const current_time = compat.timestamp();
@@ -325,7 +371,9 @@ pub const Message = struct {
         return false;
     }
 
-    /// Set correlation ID for tracking related messages.
+    /// Set or replace the correlation id for tracking related messages.
+    ///
+    /// The id is copied.
     /// Useful for request-response patterns and message chains.
     pub fn setCorrelationId(self: *Message, correlation_id: []const u8) !void {
         if (self.metadata.correlation_id) |old_id| {
@@ -334,7 +382,9 @@ pub const Message = struct {
         self.metadata.correlation_id = try self.allocator.dupe(u8, correlation_id);
     }
 
-    /// Set reply-to address for responses.
+    /// Set or replace the reply-to address for responses.
+    ///
+    /// The address is copied.
     /// Required for createResponse() to work.
     pub fn setReplyTo(self: *Message, reply_to: []const u8) !void {
         if (self.metadata.reply_to) |old_rt| {
@@ -344,8 +394,9 @@ pub const Message = struct {
     }
 
     /// Create a response message to this message.
+    ///
     /// Requires reply_to to be set on the original message.
-    /// Returns: new Message or error
+    /// The returned response is owned by the caller.
     pub fn createResponse(self: Message, allocator: Allocator, payload: ?[]const u8, signal: ?Signal) !Message {
         if (self.metadata.reply_to == null) return MessageError.InvalidMessage;
 
@@ -374,6 +425,9 @@ pub const Message = struct {
         return response;
     }
 
+    /// Deep-copy this message using the message allocator.
+    ///
+    /// The returned message is independent and must be deinitialized.
     pub fn dupe(self: *const Message) !Message {
         const new_id = try self.allocator.dupe(u8, self.id);
         errdefer self.allocator.free(new_id);
@@ -428,11 +482,16 @@ pub const Message = struct {
 /// - priority_queues: bool, // Enable priority-based queuing
 /// - enable_deadletter: bool, // Enable dead letter queue
 pub const MailboxConfig = struct {
-    capacity: usize, // Maximum number of messages
-    max_message_size: usize = 1024 * 1024, // Maximum message size (1MB default)
-    default_ttl_ms: ?u32 = 60_000, // Default message TTL (1 minute)
-    priority_queues: bool = true, // Enable priority-based queuing
-    enable_deadletter: bool = true, // Enable dead letter queue
+    /// Maximum number of queued messages.
+    capacity: usize,
+    /// Maximum accepted message size. Defaults to 1 MiB.
+    max_message_size: usize = 1024 * 1024,
+    /// Default message TTL. Null disables the default.
+    default_ttl_ms: ?u32 = 60_000,
+    /// Enable priority-based queues.
+    priority_queues: bool = true,
+    /// Enable the dead-letter queue for overflowed priority messages.
+    enable_deadletter: bool = true,
 };
 
 /// Process mailbox with priority queues and monitoring.
@@ -480,24 +539,38 @@ pub const MailboxConfig = struct {
 /// }
 /// ```
 pub const ProcessMailbox = struct {
-    messages: std.ArrayList(Message), // Main message queue
-    priority_queues: ?[5]std.ArrayList(Message), // Priority-based queues
-    deadletter_queue: ?std.ArrayList(Message), // Queue for undeliverable messages
-    mutex: Mutex, // Thread synchronization
-    config: MailboxConfig, // Mailbox configuration
-    stats: MailboxStats, // Usage statistics
-    allocator: Allocator, // Allocator for dynamic memory management
+    /// FIFO queue used when priority queues are disabled.
+    messages: std.ArrayList(Message),
+    /// Priority queues indexed by `MessagePriority.toInt()`.
+    priority_queues: ?[5]std.ArrayList(Message),
+    /// Queue for undeliverable messages when enabled.
+    deadletter_queue: ?std.ArrayList(Message),
+    /// Protects queue state.
+    mutex: Mutex,
+    /// Mailbox behavior settings.
+    config: MailboxConfig,
+    /// Usage statistics.
+    stats: MailboxStats,
+    /// Allocator for queue storage.
+    allocator: Allocator,
 
-    /// Statistics for monitoring mailbox performance and usage
+    /// Statistics for monitoring mailbox performance and usage.
     pub const MailboxStats = struct {
-        messages_received: usize = 0, // Total messages received
-        messages_sent: usize = 0, // Total messages sent
-        messages_expired: usize = 0, // Messages expired before delivery
-        messages_dropped: usize = 0, // Messages dropped due to constraints
-        peak_usage: usize = 0, // Maximum queue size reached
-        total_size_bytes: usize = 0, // Total size of all messages
+        /// Total messages accepted by `send()`.
+        messages_received: usize = 0,
+        /// Total messages returned by `receive()`.
+        messages_sent: usize = 0,
+        /// Messages expired before delivery.
+        messages_expired: usize = 0,
+        /// Messages dropped due to constraints.
+        messages_dropped: usize = 0,
+        /// Maximum queue size reached.
+        peak_usage: usize = 0,
+        /// Total size of queued messages.
+        total_size_bytes: usize = 0,
     };
 
+    /// Initialize an empty mailbox.
     pub fn init(allocator: Allocator, config: MailboxConfig) ProcessMailbox {
         const priority_queues: ?[5]std.ArrayList(Message) = if (config.priority_queues)
             .{ .empty, .empty, .empty, .empty, .empty }
@@ -518,6 +591,7 @@ pub const ProcessMailbox = struct {
         };
     }
 
+    /// Deinitialize all queued messages and queue storage.
     pub fn deinit(self: *ProcessMailbox) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -547,7 +621,10 @@ pub const ProcessMailbox = struct {
         }
     }
 
-    /// Send a message with priority handling and size checks
+    /// Send a message with priority handling and size checks.
+    ///
+    /// This function consumes `msg`; after calling it, do not use or deinit the
+    /// original message value, even when an error is returned.
     pub fn send(self: *ProcessMailbox, msg: Message) MessageError!void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -615,7 +692,9 @@ pub const ProcessMailbox = struct {
         );
     }
 
-    /// Receive message with priority handling
+    /// Receive the next message with priority handling.
+    ///
+    /// The caller owns the returned message and must call `deinit()`.
     pub fn receive(self: *ProcessMailbox) MessageError!Message {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -687,7 +766,10 @@ pub const ProcessMailbox = struct {
         return msg;
     }
 
-    /// Peek at next message without removing it
+    /// Return a copy of the next message value without removing it.
+    ///
+    /// The mailbox still owns the underlying message storage. Do not call
+    /// `deinit()` on the returned value.
     pub fn peek(self: *ProcessMailbox) MessageError!Message {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -718,7 +800,7 @@ pub const ProcessMailbox = struct {
         return msg;
     }
 
-    /// Clear all messages from the mailbox
+    /// Deinitialize and remove all queued messages.
     pub fn clear(self: *ProcessMailbox) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -743,14 +825,14 @@ pub const ProcessMailbox = struct {
         self.stats.total_size_bytes = 0;
     }
 
-    /// Get mailbox statistics
+    /// Return a snapshot of mailbox statistics.
     pub fn getStats(self: *ProcessMailbox) MailboxStats {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.stats;
     }
 
-    /// Check if mailbox has capacity for a message of given size
+    /// Return whether a message of `msg_size` can currently be accepted.
     pub fn hasCapacity(self: *ProcessMailbox, msg_size: usize) bool {
         self.mutex.lock();
         defer self.mutex.unlock();

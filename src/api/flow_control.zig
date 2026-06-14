@@ -1,33 +1,43 @@
-//! Flow control primitives for Vigil
-//! Provides rate limiting and backpressure handling.
+//! Flow control primitives for Vigil.
+//!
+//! Use these APIs when producers can temporarily outpace consumers. A
+//! `RateLimiter` caps operation frequency, while backpressure policies define
+//! what an inbox should do once queued work crosses a high-water mark.
 
 const std = @import("std");
 const Message = @import("../messages.zig").Message;
 const MessageError = @import("../messages.zig").MessageError;
 const compat = @import("../compat.zig");
 
-/// Backpressure strategy when limits are exceeded
+/// Policy applied when queued messages reach a configured high-water mark.
 pub const BackpressureStrategy = enum {
-    /// Drop oldest messages when full
+    /// Remove the oldest queued message and accept the new one.
     drop_oldest,
-    /// Drop newest messages when full
+    /// Drop the new message and report success to the caller.
     drop_newest,
-    /// Block until space available
+    /// Block the sender until queued work falls below the low-water mark.
     block,
-    /// Return error immediately
+    /// Return `MessageError.MailboxFull` immediately.
     return_error,
 };
 
-/// Rate limiter using token bucket algorithm
+/// Token-bucket rate limiter.
+///
+/// `allow()` is thread-safe. The bucket starts full, so a new limiter permits
+/// an initial burst up to `max_per_second`, then refills over time.
 pub const RateLimiter = struct {
+    /// Currently available tokens.
     tokens: f64,
+    /// Maximum tokens the bucket can hold.
     max_tokens: f64,
-    refill_rate: f64, // tokens per millisecond
+    /// Tokens added per millisecond.
+    refill_rate: f64,
+    /// Timestamp of the last refill calculation.
     last_refill_ms: i64,
+    /// Protects token accounting.
     mutex: compat.Mutex,
 
-    /// Initialize a rate limiter
-    /// max_per_second: Maximum number of operations per second
+    /// Initialize a limiter for `max_per_second` successful operations.
     pub fn init(max_per_second: u32) RateLimiter {
         const tokens_per_ms = @as(f64, @floatFromInt(max_per_second)) / 1000.0;
         return .{
@@ -39,7 +49,10 @@ pub const RateLimiter = struct {
         };
     }
 
-    /// Check if an operation is allowed and consume a token
+    /// Try to consume one token.
+    ///
+    /// Returns true when the operation may proceed, false when the caller
+    /// should drop, retry later, or return a rate-limit error.
     pub fn allow(self: *RateLimiter) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -58,7 +71,7 @@ pub const RateLimiter = struct {
         return false;
     }
 
-    /// Reset the rate limiter
+    /// Refill the bucket and reset refill timing.
     pub fn reset(self: *RateLimiter) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -66,7 +79,7 @@ pub const RateLimiter = struct {
         self.last_refill_ms = compat.milliTimestamp();
     }
 
-    /// Get current available tokens
+    /// Return the current token count without forcing a refill calculation.
     pub fn available(self: *RateLimiter) f64 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -74,27 +87,41 @@ pub const RateLimiter = struct {
     }
 };
 
-/// Rate limit configuration
+/// Configuration for send-side rate limiting.
 pub const RateLimitConfig = struct {
+    /// Maximum allowed operations per second.
     max_per_second: u32,
-    burst_size: ?u32 = null, // Optional burst allowance
+    /// Reserved for future burst tuning. Current implementation uses
+    /// `max_per_second` as both sustained rate and initial burst size.
+    burst_size: ?u32 = null,
 };
 
-/// Backpressure configuration
+/// Configuration for send-side backpressure.
 pub const BackpressureConfig = struct {
+    /// Strategy to apply once `high_watermark` is reached.
     strategy: BackpressureStrategy,
-    high_watermark: usize, // Start applying strategy at this count
-    low_watermark: usize, // Resume normal operation below this count
+    /// Queue depth at which backpressure starts.
+    high_watermark: usize,
+    /// Queue depth below which `.block` senders resume.
+    low_watermark: usize,
 };
 
-/// Flow-controlled inbox wrapper
+/// Wrapper that applies flow control before delegating to an `Inbox`.
+///
+/// The wrapper does not own the wrapped inbox. Callers must keep the inbox
+/// alive for the wrapper's lifetime and close the inbox through either the
+/// wrapper or the original inbox pointer, but not both.
 pub const FlowControlledInbox = struct {
+    /// Wrapped inbox.
     inbox: *@import("./inbox.zig").Inbox,
+    /// Optional limiter applied before each send.
     rate_limiter: ?RateLimiter,
+    /// Optional backpressure policy.
     backpressure_config: ?BackpressureConfig,
+    /// Allocator retained for future extensions and ABI consistency.
     allocator: std.mem.Allocator,
 
-    /// Initialize flow-controlled inbox
+    /// Initialize a flow-control wrapper around an existing inbox.
     pub fn init(
         allocator: std.mem.Allocator,
         inbox: *@import("./inbox.zig").Inbox,
@@ -109,7 +136,7 @@ pub const FlowControlledInbox = struct {
         };
     }
 
-    /// Send with flow control
+    /// Send a payload after applying rate-limit and backpressure rules.
     pub fn send(self: *FlowControlledInbox, payload: []const u8) !void {
         // Check rate limit
         if (self.rate_limiter) |*limiter| {
@@ -157,22 +184,24 @@ pub const FlowControlledInbox = struct {
         }
     }
 
-    /// Receive (delegates to inbox)
+    /// Receive from the wrapped inbox.
     pub fn recv(self: *FlowControlledInbox) !Message {
         return self.inbox.recv();
     }
 
-    /// Receive with timeout (delegates to inbox)
+    /// Receive from the wrapped inbox with a timeout in milliseconds.
     pub fn recvTimeout(self: *FlowControlledInbox, timeout_ms: u32) !?Message {
         return self.inbox.recvTimeout(timeout_ms);
     }
 
-    /// Close (delegates to inbox)
+    /// Close the wrapped inbox.
+    ///
+    /// After calling this, do not call `close()` on the original inbox pointer.
     pub fn close(self: *FlowControlledInbox) void {
         self.inbox.close();
     }
 
-    /// Get stats (delegates to inbox)
+    /// Return statistics from the wrapped inbox.
     pub fn stats(self: *FlowControlledInbox) @import("../legacy.zig").MailboxStats {
         return self.inbox.stats();
     }

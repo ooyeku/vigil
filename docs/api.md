@@ -1099,18 +1099,23 @@ zig build
 # Run all tests
 zig build test
 
-# Run example
+# Run the showcase example
+cd examples/vigil_showcase
 zig build run
 
-# Build vigilant server example
+# Run the vigilant server example
 cd examples/vigilant_server
-zig build
-./zig-out/bin/vigilant_server
+zig build run
 ```
 
 ---
 
 ## Examples
+
+See `examples/vigil_showcase` for a resilient order pipeline demonstrating:
+- Runtime-owned registry, telemetry, shutdown hooks, and inboxes
+- Process groups and pub/sub event fanout
+- Inbox backpressure, rate limiting, and circuit breaker behavior
 
 See `examples/vigilant_server` for a complete TCP server demonstrating:
 - Circuit breaker protection

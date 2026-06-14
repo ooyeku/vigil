@@ -1,4 +1,5 @@
-//! High-level supervisor builder API for Vigil
+//! High-level supervisor builder API for Vigil.
+//!
 //! Provides a fluent builder pattern for creating and configuring supervisors.
 //!
 //! Example:
@@ -22,7 +23,7 @@ pub const RestartStrategy = legacy.RestartStrategy;
 pub const ChildSpec = legacy.ChildSpec;
 pub const ProcessPriority = legacy.ProcessPriority;
 
-/// Restart type enum for child processes
+/// Restart policy for a supervised child.
 pub const RestartType = enum {
     /// Always restart the process when it terminates
     permanent,
@@ -32,61 +33,86 @@ pub const RestartType = enum {
     temporary,
 };
 
-/// Child options for supervisor builder
+/// Options for one supervised child.
 pub const ChildOptions = struct {
+    /// Restart behavior after termination.
     restart_type: RestartType = .permanent,
+    /// Time allowed for graceful shutdown.
     shutdown_timeout_ms: u32 = 5000,
+    /// Child scheduling priority.
     priority: ProcessPriority = .normal,
+    /// Optional memory ceiling checked by the lower-level process API.
     max_memory_bytes: ?usize = null,
+    /// Optional health check function.
     health_check_fn: ?*const fn () bool = null,
+    /// Interval between health checks.
     health_check_interval_ms: u32 = 1000,
 };
 
-/// Crash handler function type
+/// Function called when a child crash is observed.
 pub const CrashHandler = *const fn (child_id: []const u8) void;
 
-/// High-level supervisor builder
+/// Fluent builder for a `Supervisor`.
+///
+/// The builder owns no resources by itself, but the supervisor it constructs
+/// owns copied child ids. Call `deinit()` on the built supervisor when finished.
 pub const SupervisorBuilder = struct {
+    /// Allocator used by the built supervisor.
     allocator: std.mem.Allocator,
+    /// Restart strategy for the supervisor.
     strategy_val: RestartStrategy = .one_for_one,
+    /// Max restarts in the restart window.
     max_restarts_val: u32 = 3,
+    /// Restart accounting window in seconds.
     max_seconds_val: u32 = 5,
+    /// Lazily-created supervisor while children are added.
     supervisor: ?Supervisor = null,
+    /// Optional crash callback.
     crash_handler: ?CrashHandler = null,
+    /// Whether built supervisors emit telemetry.
     enable_telemetry: bool = false,
 
+    /// Create a builder with default supervisor options.
     pub fn init(allocator: std.mem.Allocator) SupervisorBuilder {
         return .{
             .allocator = allocator,
         };
     }
 
+    /// No-op retained for symmetry with other builders.
     pub fn deinit(self: *SupervisorBuilder) void {
         _ = self;
     }
 
+    /// Set the restart strategy.
     pub fn strategy(self: SupervisorBuilder, s: RestartStrategy) SupervisorBuilder {
         var result = self;
         result.strategy_val = s;
         return result;
     }
 
+    /// Set the maximum restarts allowed in the restart window.
     pub fn maxRestarts(self: SupervisorBuilder, count: u32) SupervisorBuilder {
         var result = self;
         result.max_restarts_val = count;
         return result;
     }
 
+    /// Set the restart accounting window in seconds.
     pub fn maxSeconds(self: SupervisorBuilder, seconds: u32) SupervisorBuilder {
         var result = self;
         result.max_seconds_val = seconds;
         return result;
     }
 
+    /// Add a permanent child with default child options.
     pub fn child(self: *SupervisorBuilder, id: []const u8, start_fn: *const fn () void) !*SupervisorBuilder {
         return self.childWithOptions(id, start_fn, .{});
     }
 
+    /// Add a child with explicit options.
+    ///
+    /// The child id is copied into supervisor-owned memory.
     pub fn childWithOptions(
         self: *SupervisorBuilder,
         id: []const u8,
@@ -122,6 +148,7 @@ pub const SupervisorBuilder = struct {
         return self;
     }
 
+    /// Add `count` children named `{prefix}_{index}`.
     pub fn childPool(
         self: *SupervisorBuilder,
         prefix: []const u8,
@@ -136,6 +163,7 @@ pub const SupervisorBuilder = struct {
         return self;
     }
 
+    /// Set or replace the crash handler.
     pub fn onCrash(self: *SupervisorBuilder, handler: CrashHandler) *SupervisorBuilder {
         self.crash_handler = handler;
         if (self.supervisor) |*sup| {
@@ -144,6 +172,7 @@ pub const SupervisorBuilder = struct {
         return self;
     }
 
+    /// Enable or disable telemetry on the built supervisor.
     pub fn withTelemetry(self: *SupervisorBuilder, enabled: bool) SupervisorBuilder {
         var result = self.*;
         result.enable_telemetry = enabled;
@@ -153,6 +182,10 @@ pub const SupervisorBuilder = struct {
         return result;
     }
 
+    /// Build the supervisor value.
+    ///
+    /// The returned supervisor is owned by the caller and should be
+    /// deinitialized after use.
     pub fn build(self: SupervisorBuilder) Supervisor {
         if (self.supervisor) |sup| {
             var result = sup;
@@ -170,7 +203,7 @@ pub const SupervisorBuilder = struct {
     }
 };
 
-/// Create a new supervisor builder
+/// Create a new supervisor builder.
 pub fn supervisor(allocator: std.mem.Allocator) SupervisorBuilder {
     return SupervisorBuilder.init(allocator);
 }

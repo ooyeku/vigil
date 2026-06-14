@@ -1,0 +1,16 @@
+.{
+    .name = .vigil_showcase,
+    .version = "0.0.0",
+    .fingerprint = 0x2a894558316e5589,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vigil = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

@@ -1,13 +1,14 @@
-//! High-level GenServer sugar API for Vigil
+//! High-level GenServer sugar API for Vigil.
+//!
 //! Simplified handler pattern for creating GenServers.
 //!
 //! Example:
 //! ```zig
 //! const MyState = struct { counter: u32 };
 //! const MyServer = vigil.server(MyState, struct {
-//!     pub fn init(self: *Self) !void { }
-//!     pub fn handle(self: *Self, msg: vigil.Msg) !void { }
-//!     pub fn terminate(self: *Self) void { }
+//!     pub fn init(_: *vigil.GenServer(MyState)) !void {}
+//!     pub fn handle(_: *vigil.GenServer(MyState), _: vigil.Message) !void {}
+//!     pub fn terminate(_: *vigil.GenServer(MyState)) void {}
 //! });
 //! ```
 
@@ -18,35 +19,52 @@ const compat = @import("../compat.zig");
 pub const Message = legacy.Message;
 pub const GenServer = legacy.GenServer;
 
-/// Simplified cast and call options
+/// Options for synchronous `call` requests.
 pub const CallOptions = struct {
+    /// Optional timeout in milliseconds.
     timeout: ?u32 = 5000,
 };
 
+/// Options for asynchronous `cast` requests.
 pub const CastOptions = struct {};
 
-/// Create a GenServer from a state type and handler struct
+/// Generate a typed GenServer wrapper from state and handlers.
+///
+/// `Handlers` must provide functions compatible with the lower-level
+/// `GenServer(StateType)` callbacks:
+/// - `init(*GenServer(StateType)) !void`
+/// - `handle(*GenServer(StateType), Message) !void`
+/// - `terminate(*GenServer(StateType)) void`
 pub fn server(comptime StateType: type, comptime Handlers: type) type {
     return struct {
         const Wrapper = @This();
         const Self = GenServer(StateType);
 
+        /// Running server handle returned by `spawn`.
+        ///
+        /// Call `deinit()` to stop, join, and release the underlying server.
         pub const Handle = struct {
+            /// Underlying GenServer pointer.
             ptr: *Self,
+            /// Worker thread running `GenServer.start`.
             thread: ?std.Thread,
 
+            /// Send an asynchronous payload message.
             pub fn cast(self: *Handle, payload: []const u8) !void {
                 try Wrapper.castPayload(self.ptr, payload);
             }
 
+            /// Send a synchronous payload request.
             pub fn call(self: *Handle, payload: []const u8, options: CallOptions) !Message {
                 return try Wrapper.callPayload(self.ptr, payload, options);
             }
 
+            /// Request server stop.
             pub fn stop(self: *Handle) void {
                 self.ptr.stop();
             }
 
+            /// Join the server thread if it is still running.
             pub fn join(self: *Handle) void {
                 if (self.thread) |thread| {
                     thread.join();
@@ -54,6 +72,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
                 }
             }
 
+            /// Stop, join, and deinitialize the server.
             pub fn deinit(self: *Handle) void {
                 self.stop();
                 self.join();
@@ -61,6 +80,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
             }
         };
 
+        /// Allocate and initialize the underlying GenServer.
         pub fn init(allocator: std.mem.Allocator, initial_state: StateType) !*Self {
             return try Self.init(
                 allocator,
@@ -71,6 +91,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
             );
         }
 
+        /// Allocate, initialize, and start the GenServer in a new thread.
         pub fn spawn(allocator: std.mem.Allocator, initial_state: StateType) !Handle {
             const ptr = try init(allocator, initial_state);
             errdefer ptr.deinit();
@@ -87,6 +108,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
             };
         }
 
+        /// Send an asynchronous payload to an initialized server.
         pub fn castPayload(self: *Self, payload: []const u8) !void {
             const id = try std.fmt.allocPrint(self.allocator, "cast_{d}", .{compat.milliTimestamp()});
             defer self.allocator.free(id);
@@ -105,6 +127,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
             try self.cast(message);
         }
 
+        /// Send a synchronous payload request to an initialized server.
         pub fn callPayload(self: *Self, payload: []const u8, options: CallOptions) !Message {
             const id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{compat.milliTimestamp()});
             defer self.allocator.free(id);

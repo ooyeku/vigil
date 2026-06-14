@@ -1,4 +1,5 @@
-//! Distributed registry for Vigil
+//! Distributed registry for Vigil.
+//!
 //! Cross-process name resolution with TCP-based cluster communication.
 
 const std = @import("std");
@@ -9,26 +10,37 @@ const compat = @import("compat.zig");
 const net = compat.net;
 const protocol = @import("distributed_protocol.zig");
 
-/// Cluster node representation
+/// Peer node tracked by a distributed registry.
 pub const ClusterNode = struct {
+    /// IPv4 address or host string used for TCP connections.
     address: []const u8,
+    /// Peer listen port.
     port: u16,
+    /// Last heartbeat or successful contact time in milliseconds.
     last_seen_ms: i64,
+    /// Whether the node is currently considered reachable.
     is_alive: bool,
 };
 
-/// Information about a process registered on a remote node
+/// Information about a process registered on a remote node.
 pub const RemoteProcessInfo = struct {
+    /// Registered process name.
     name: []const u8,
+    /// Node address, or `"local"` when resolved locally.
     node_address: []const u8,
+    /// Node listen port.
     node_port: u16,
 };
 
-/// Distributed registry configuration
+/// Configuration for a distributed registry node.
 pub const DistributedRegistryConfig = struct {
-    cluster_nodes: []const []const u8, // "host:port" format
+    /// Peer nodes in `"host:port"` format.
+    cluster_nodes: []const []const u8,
+    /// Interval between background sync/heartbeat attempts.
     sync_interval_ms: u32 = 1000,
+    /// Time after which a peer without heartbeat is considered stale.
     heartbeat_timeout_ms: u32 = 5000,
+    /// Local TCP listen port for registry protocol requests.
     listen_port: u16 = 9100,
 };
 
@@ -49,11 +61,19 @@ const Protocol = struct {
     }
 };
 
-/// Distributed registry extends local registry with TCP-based cluster communication.
+/// Local registry extended with cluster name resolution.
+///
+/// The registry owns copied node addresses, global registration names, and
+/// remote cache entries. Registered local mailboxes remain caller-owned and
+/// must outlive their registrations.
 pub const DistributedRegistry = struct {
+    /// Local name to mailbox registry.
     local_registry: Registry,
+    /// Allocator for registry-owned storage.
     allocator: std.mem.Allocator,
+    /// Static cluster configuration.
     config: DistributedRegistryConfig,
+    /// Known peer nodes.
     nodes: std.ArrayListUnmanaged(ClusterNode),
     /// Names that were registered locally with global scope
     global_names: std.StringArrayHashMapUnmanaged(void),
@@ -66,7 +86,9 @@ pub const DistributedRegistry = struct {
     /// Listening socket fd, stored so stopSync() can close it to unblock accept()
     listener_fd: ?posix.socket_t = null,
 
-    /// Initialize distributed registry
+    /// Initialize a distributed registry from `config`.
+    ///
+    /// Each `cluster_nodes` entry must be in `host:port` format.
     pub fn init(allocator: std.mem.Allocator, config: DistributedRegistryConfig) !DistributedRegistry {
         var nodes: std.ArrayListUnmanaged(ClusterNode) = .empty;
         errdefer nodes.deinit(allocator);
@@ -104,7 +126,7 @@ pub const DistributedRegistry = struct {
         };
     }
 
-    /// Cleanup resources
+    /// Stop background sync and release registry-owned storage.
     pub fn deinit(self: *DistributedRegistry) void {
         self.stopSync();
 
@@ -136,13 +158,18 @@ pub const DistributedRegistry = struct {
         self.local_registry.deinit();
     }
 
-    /// Registration scope
+    /// Scope for a registration.
     pub const RegistrationScope = enum {
-        local, // Only visible on this node
-        global, // Visible across cluster
+        /// Only visible on this node.
+        local,
+        /// Advertised to peers during sync.
+        global,
     };
 
-    /// Register a process with scope
+    /// Register a local mailbox with a visibility scope.
+    ///
+    /// The local name is copied by the underlying registry. Global names are
+    /// also tracked for sync. The mailbox pointer is not owned.
     pub fn register(
         self: *DistributedRegistry,
         name: []const u8,
@@ -163,13 +190,16 @@ pub const DistributedRegistry = struct {
         }
     }
 
-    /// Lookup process locally
+    /// Look up a local mailbox by name.
     pub fn whereis(self: *DistributedRegistry, name: []const u8) ?*ProcessMailbox {
         return self.local_registry.whereis(name);
     }
 
     /// Lookup process across the cluster.
+    ///
     /// Checks local registry first, then the remote registration cache.
+    /// Returned remote info contains borrowed slices owned by the registry or
+    /// by the caller when the result is local.
     pub fn whereisGlobal(self: *DistributedRegistry, name: []const u8) ?RemoteProcessInfo {
         // Check local first
         if (self.local_registry.whereis(name) != null) {
@@ -187,6 +217,7 @@ pub const DistributedRegistry = struct {
     }
 
     /// Actively query all peer nodes for a name.
+    ///
     /// Updates the remote registration cache on success.
     pub fn queryPeers(self: *DistributedRegistry, name: []const u8) ?RemoteProcessInfo {
         self.mutex.lock();
@@ -385,7 +416,11 @@ pub const DistributedRegistry = struct {
         }
     }
 
-    /// Start listener and synchronization threads
+    /// Start the listener and background synchronization threads.
+    ///
+    /// Call `stopSync()` before deinitializing, or rely on `deinit()` which
+    /// calls it for you. Returns `error.AlreadySyncing` if sync is already
+    /// active.
     pub fn startSync(self: *DistributedRegistry) !void {
         if (self.should_sync.load(.acquire)) return error.AlreadySyncing;
 
@@ -398,7 +433,10 @@ pub const DistributedRegistry = struct {
         self.sync_thread = try std.Thread.spawn(.{}, syncLoop, .{self});
     }
 
-    /// Stop synchronization and listener
+    /// Stop synchronization and listener threads.
+    ///
+    /// This closes the listener socket to unblock `accept()` and then joins the
+    /// background threads. It is safe to call when sync is not active.
     pub fn stopSync(self: *DistributedRegistry) void {
         if (!self.should_sync.load(.acquire)) return;
 

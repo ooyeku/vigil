@@ -1,4 +1,5 @@
-//! High-level application builder API for Vigil
+//! High-level application builder API for Vigil.
+//!
 //! Templates for common application patterns.
 //!
 //! Example:
@@ -25,13 +26,22 @@ pub const ProcessPriority = legacy.ProcessPriority;
 pub const Preset = presets.Preset;
 pub const PresetConfig = presets.PresetConfig;
 
-/// Simple application builder
+/// Builder for a simple supervised worker application.
+///
+/// `AppBuilder` is heap-allocated by `app()` and `appWithPreset()`. Call
+/// `shutdown()` when finished; it stops/deinitializes the supervisor, frees
+/// copied worker ids, and destroys the builder itself.
 pub const AppBuilder = struct {
+    /// Allocator used for the builder, worker ids, and supervisor internals.
     allocator: std.mem.Allocator,
+    /// Lazily-created supervisor.
     supervisor: ?Supervisor = null,
+    /// Concrete settings selected from the chosen preset.
     preset_config: PresetConfig,
+    /// Worker ids allocated by the app builder.
     allocated_ids: std.ArrayList([]const u8),
 
+    /// Allocate a new app builder for `preset`.
     pub fn init(allocator: std.mem.Allocator, preset: Preset) !*AppBuilder {
         const app_builder = try allocator.create(AppBuilder);
         errdefer allocator.destroy(app_builder);
@@ -47,10 +57,14 @@ pub const AppBuilder = struct {
         return app_builder;
     }
 
+    /// No-op retained for compatibility. Use `shutdown()` for cleanup.
     pub fn deinit(self: *AppBuilder) void {
         _ = self;
     }
 
+    /// Add one permanent worker child.
+    ///
+    /// The id is copied and later freed by `shutdown()`.
     pub fn worker(self: *AppBuilder, id: []const u8, start_fn: *const fn () void) !*AppBuilder {
         if (self.supervisor == null) {
             self.supervisor = Supervisor.init(self.allocator, .{
@@ -77,6 +91,7 @@ pub const AppBuilder = struct {
         return self;
     }
 
+    /// Add `count` workers named `{name_prefix}_{index}`.
     pub fn workerPool(
         self: *AppBuilder,
         name_prefix: []const u8,
@@ -114,6 +129,7 @@ pub const AppBuilder = struct {
         return self;
     }
 
+    /// Ensure the underlying supervisor has been created.
     pub fn build(self: *AppBuilder) !void {
         if (self.supervisor == null) {
             self.supervisor = Supervisor.init(self.allocator, .{
@@ -124,18 +140,25 @@ pub const AppBuilder = struct {
         }
     }
 
+    /// Start the underlying supervisor if present.
     pub fn start(self: *AppBuilder) !void {
         if (self.supervisor) |*sup| {
             try sup.start();
         }
     }
 
+    /// Deinitialize the underlying supervisor without destroying the builder.
+    ///
+    /// Most applications should call `shutdown()` instead.
     pub fn stop(self: *AppBuilder) void {
         if (self.supervisor) |*sup| {
             sup.deinit();
         }
     }
 
+    /// Shut down the application and destroy the builder.
+    ///
+    /// After this call, the `AppBuilder` pointer is invalid.
     pub fn shutdown(self: *AppBuilder) void {
         if (self.supervisor) |*sup| {
             sup.shutdown(self.preset_config.shutdown_timeout_ms) catch {};
@@ -152,12 +175,12 @@ pub const AppBuilder = struct {
     }
 };
 
-/// Create a new application builder with default preset
+/// Create an application builder using the production preset.
 pub fn app(allocator: std.mem.Allocator) !*AppBuilder {
     return try AppBuilder.init(allocator, .production);
 }
 
-/// Create a new application builder with specific preset
+/// Create an application builder using an explicit preset.
 pub fn appWithPreset(allocator: std.mem.Allocator, preset: Preset) !*AppBuilder {
     return try AppBuilder.init(allocator, preset);
 }

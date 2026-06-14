@@ -3,7 +3,7 @@
 # Function to send a request and measure response time in milliseconds
 send_request() {
     local start=$(date +%s.%N)
-    local response=$(echo "$1" | nc -w 1 127.0.0.1 8080)
+    local response=$(echo "$1" | nc -w 1 127.0.0.1 9090)
     local end=$(date +%s.%N)
     local duration=$(echo "($end - $start) * 1000" | bc)
     # Store response for debugging if needed
@@ -62,8 +62,8 @@ echo "Starting benchmarks..."
 # Test standard commands
 for i in {1..10}; do
     echo -n "Standard commands test $i/10... "
-    duration=$(send_request "HEALTHCHECK")
-    update_stats "HEALTHCHECK" $duration
+    duration=$(send_request "HEALTH")
+    update_stats "HEALTH" $duration
     duration=$(send_request "STATUS")
     update_stats "STATUS" $duration
 done
@@ -109,7 +109,7 @@ done
 echo -e "\n=== BENCHMARK RESULTS ===\n"
 
 # Print all statistics
-print_stats "HEALTHCHECK"
+print_stats "HEALTH"
 print_stats "STATUS"
 print_stats "VARIABLE_LENGTH"
 print_stats "RANDOM_DATA"

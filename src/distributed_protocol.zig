@@ -1,22 +1,43 @@
+//! Text protocol helpers for Vigil distributed registry nodes.
+//!
+//! Frames are ASCII lines prefixed with `VIGIL/2 `. Parsing is allocation-free:
+//! returned slices point into the input line and are only valid while that line
+//! remains alive.
+
 const std = @import("std");
 
+/// Errors returned while parsing distributed protocol frames.
 pub const ProtocolError = error{ InvalidFrame, UnsupportedVersion };
 
+/// Parsed distributed protocol command.
 pub const Command = union(enum) {
+    /// Node handshake carrying identity and listen port.
     hello: NodeIdentity,
+    /// Heartbeat frame.
     heart,
+    /// Lookup a process name.
     where: []const u8,
+    /// Register a process name.
     reg: []const u8,
+    /// Unregister a process name.
     unreg: []const u8,
 };
 
+/// Identity sent by a node during handshake.
 pub const NodeIdentity = struct {
+    /// Stable node id.
     node_id: []const u8,
+    /// Node listen port.
     port: u16,
 };
 
+/// Required frame prefix for the v2 protocol.
 pub const version_prefix = "VIGIL/2 ";
 
+/// Parse a single protocol frame.
+///
+/// The returned command borrows slices from `line`. Keep the input buffer alive
+/// for as long as the command is used.
 pub fn parse(line: []const u8) ProtocolError!Command {
     if (!std.mem.startsWith(u8, line, version_prefix)) return error.UnsupportedVersion;
     const body = line[version_prefix.len..];
@@ -41,6 +62,9 @@ fn parseName(name: []const u8) ProtocolError![]const u8 {
     return name;
 }
 
+/// Write a v2 protocol frame into `buffer`.
+///
+/// The returned slice points into `buffer` and includes the trailing newline.
 pub fn writeFrame(buffer: []u8, comptime fmt: []const u8, args: anytype) ![]const u8 {
     return try std.fmt.bufPrint(buffer, "VIGIL/2 " ++ fmt ++ "\n", args);
 }

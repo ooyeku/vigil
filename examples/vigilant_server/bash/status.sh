@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Send status request and capture response
-response=$(printf "STATUS\n" | nc -w 2 localhost 8080)
+response=$(printf "STATUS\n" | nc -w 2 localhost 9090)
 echo "Server response: '$response'"
 
 if [ -n "$response" ] && echo "$response" | grep -q "OK"; then

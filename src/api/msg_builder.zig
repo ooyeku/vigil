@@ -1,5 +1,9 @@
-//! High-level message builder API for Vigil
-//! Provides a fluent builder pattern for creating messages.
+//! High-level message builder API for Vigil.
+//!
+//! This module is the ergonomic way to create owned `Message` values without
+//! touching the lower-level constructor. The builder stores borrowed option
+//! slices while chaining; `build()` duplicates the data that the returned
+//! `Message` owns.
 //!
 //! Example:
 //! ```zig
@@ -19,52 +23,73 @@ pub const Message = legacy.Message;
 pub const MessagePriority = legacy.MessagePriority;
 pub const Signal = legacy.Signal;
 
-/// Fluent message builder
+/// Fluent builder for an owned `Message`.
+///
+/// `MessageBuilder` itself is cheap to copy. Its fields point at caller-owned
+/// slices until `build()` is called. After `build()`, the returned `Message`
+/// owns duplicated metadata and must be released with `Message.deinit()`.
 pub const MessageBuilder = struct {
+    /// Payload slice to copy into the built message.
     payload: []const u8,
+    /// Optional sender name. Defaults to `"anonymous"`.
     sender: ?[]const u8 = null,
+    /// Priority used by priority-aware mailboxes.
     priority_val: MessagePriority = .normal,
+    /// Optional message time-to-live in milliseconds.
     ttl_ms: ?u32 = null,
+    /// Optional control signal attached to the message.
     signal_val: ?Signal = null,
+    /// Optional correlation id for request/reply workflows.
     correlation_id: ?[]const u8 = null,
+    /// Optional return address for replies.
     reply_to: ?[]const u8 = null,
 
+    /// Set the sender name copied into the message.
     pub fn from(self: MessageBuilder, sender: []const u8) MessageBuilder {
         var result = self;
         result.sender = sender;
         return result;
     }
 
+    /// Set the mailbox priority for the message.
     pub fn priority(self: MessageBuilder, p: MessagePriority) MessageBuilder {
         var result = self;
         result.priority_val = p;
         return result;
     }
 
+    /// Set the message time-to-live in milliseconds.
     pub fn ttl(self: MessageBuilder, ms: u32) MessageBuilder {
         var result = self;
         result.ttl_ms = ms;
         return result;
     }
 
+    /// Attach a process control signal to the message.
     pub fn signal(self: MessageBuilder, sig: Signal) MessageBuilder {
         var result = self;
         result.signal_val = sig;
         return result;
     }
 
+    /// Set a correlation id used to match replies to requests.
     pub fn withCorrelation(self: MessageBuilder, id: []const u8) MessageBuilder {
         var result = self;
         result.correlation_id = id;
         return result;
     }
 
+    /// Set the logical reply address for the message.
     pub fn replyTo(self: MessageBuilder, addr: []const u8) MessageBuilder {
         var result = self;
         result.reply_to = addr;
         return result;
     }
 
+    /// Allocate and return an owned message.
+    ///
+    /// The caller owns the returned `Message` and must call `deinit()`.
+    /// The allocator must stay valid until that deinit call.
     pub fn build(self: MessageBuilder, allocator: std.mem.Allocator) !Message {
         var message = try Message.init(
             allocator,
@@ -88,7 +113,9 @@ pub const MessageBuilder = struct {
     }
 };
 
-/// Create a new message builder with the given payload
+/// Start building a message with the given payload.
+///
+/// The payload slice is borrowed by the builder and copied by `build()`.
 pub fn msg(payload: []const u8) MessageBuilder {
     return .{ .payload = payload };
 }

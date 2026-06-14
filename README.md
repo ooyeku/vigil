@@ -160,6 +160,19 @@ var app = try vigil.appWithPreset(allocator, .testing);
 
 ## Examples
 
+The root package is library-only: use `zig build test` at the repository root, and run examples from their own directories.
+
+See [examples/vigil_showcase](examples/vigil_showcase) for a self-contained resilient order pipeline that demonstrates:
+- Runtime-owned registry, telemetry, shutdown hooks, and inboxes
+- Process groups for worker routing and operations broadcast
+- Pub/Sub event fanout for audit and alert streams
+- Inbox backpressure, rate limiting, and circuit breaker behavior
+
+```bash
+cd examples/vigil_showcase
+zig build run
+```
+
 See [examples/vigilant_server](examples/vigilant_server) for a complete TCP server with:
 - Circuit breaker protection
 - Rate limiting
@@ -168,8 +181,7 @@ See [examples/vigilant_server](examples/vigilant_server) for a complete TCP serv
 
 ```bash
 cd examples/vigilant_server
-zig build
-./zig-out/bin/vigilant_server
+zig build run
 ```
 
 ## Documentation

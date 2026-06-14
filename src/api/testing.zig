@@ -1,4 +1,5 @@
-//! Testing utilities for Vigil
+//! Testing utilities for Vigil.
+//!
 //! Provides mocking, assertions, and time control for testing Vigil applications.
 
 const std = @import("std");
@@ -9,14 +10,21 @@ const Inbox = @import("./inbox.zig").Inbox;
 const Supervisor = @import("../supervisor.zig").Supervisor;
 const compat = @import("../compat.zig");
 
-/// Test context manages test lifecycle, time control, and mocks
+/// Test context that owns mock inboxes, mock supervisors, and simulated time.
+///
+/// Call `deinit()` at the end of the test to release all mocks created through
+/// this context.
 pub const TestContext = struct {
+    /// Allocator used for mocks and captured data.
     allocator: std.mem.Allocator,
+    /// Simulated time in milliseconds.
     current_time_ms: i64,
+    /// Mock inboxes owned by this context.
     mock_inboxes: std.ArrayListUnmanaged(*MockInbox),
+    /// Mock supervisors owned by this context.
     mock_supervisors: std.ArrayListUnmanaged(*MockSupervisor),
 
-    /// Initialize a new test context
+    /// Initialize an empty test context.
     pub fn init(allocator: std.mem.Allocator) TestContext {
         return .{
             .allocator = allocator,
@@ -26,7 +34,7 @@ pub const TestContext = struct {
         };
     }
 
-    /// Cleanup all resources
+    /// Release every mock created through this context.
     pub fn deinit(self: *TestContext) void {
         for (self.mock_inboxes.items) |mock| {
             mock.deinit();
@@ -41,17 +49,20 @@ pub const TestContext = struct {
         self.mock_supervisors.deinit(self.allocator);
     }
 
-    /// Advance simulated time by milliseconds
+    /// Advance simulated time by `ms` milliseconds.
     pub fn advanceTime(self: *TestContext, ms: i64) void {
         self.current_time_ms += ms;
     }
 
-    /// Get current simulated time in milliseconds
+    /// Return current simulated time in milliseconds.
     pub fn now(self: *TestContext) i64 {
         return self.current_time_ms;
     }
 
-    /// Create a mock inbox that captures messages
+    /// Create a mock inbox that captures messages.
+    ///
+    /// The returned pointer is owned by the context and is destroyed by
+    /// `TestContext.deinit()`.
     pub fn mockInbox(self: *TestContext) !*MockInbox {
         const mock = try self.allocator.create(MockInbox);
         errdefer self.allocator.destroy(mock);
@@ -61,7 +72,7 @@ pub const TestContext = struct {
         return mock;
     }
 
-    /// Create a mock supervisor
+    /// Create a mock supervisor owned by the context.
     pub fn mockSupervisor(self: *TestContext) !*MockSupervisor {
         const mock = try self.allocator.create(MockSupervisor);
         errdefer self.allocator.destroy(mock);
@@ -72,10 +83,16 @@ pub const TestContext = struct {
     }
 };
 
-/// Mock inbox that captures messages for testing
+/// Mock inbox that captures owned copies of messages.
+///
+/// `send()` duplicates the input message. `recv()` transfers ownership of a
+/// captured message to the caller, who must call `deinit()`.
 pub const MockInbox = struct {
+    /// Allocator for captured messages.
     allocator: std.mem.Allocator,
+    /// Captured message queue.
     messages: std.ArrayListUnmanaged(Message),
+    /// Protects captured message storage.
     mutex: compat.Mutex,
 
     fn init(allocator: std.mem.Allocator) MockInbox {
@@ -96,7 +113,7 @@ pub const MockInbox = struct {
         self.messages.deinit(self.allocator);
     }
 
-    /// Send a message (captures it)
+    /// Capture a duplicate of `msg`.
     pub fn send(self: *MockInbox, msg: Message) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -105,7 +122,9 @@ pub const MockInbox = struct {
         try self.messages.append(self.allocator, msg_copy);
     }
 
-    /// Receive a message (removes from captured list)
+    /// Remove and return the oldest captured message.
+    ///
+    /// The caller owns the returned message and must call `deinit()`.
     pub fn recv(self: *MockInbox) ?Message {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -114,14 +133,17 @@ pub const MockInbox = struct {
         return self.messages.orderedRemove(0);
     }
 
-    /// Get count of captured messages
+    /// Return the number of captured messages.
     pub fn count(self: *MockInbox) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.messages.items.len;
     }
 
-    /// Peek at messages without removing
+    /// Return a borrowed copy of the captured message value at `index`.
+    ///
+    /// The message remains owned by the mock inbox; do not deinitialize the
+    /// value returned from `peek()`.
     pub fn peek(self: *MockInbox, index: usize) ?Message {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -130,7 +152,7 @@ pub const MockInbox = struct {
         return self.messages.items[index];
     }
 
-    /// Clear all captured messages
+    /// Deinitialize and remove all captured messages.
     pub fn clear(self: *MockInbox) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -142,12 +164,17 @@ pub const MockInbox = struct {
     }
 };
 
-/// Mock supervisor for testing without threads
+/// Mock supervisor for deterministic tests without spawning worker threads.
 pub const MockSupervisor = struct {
+    /// Allocator for copied child ids.
     allocator: std.mem.Allocator,
+    /// Tracked child records.
     children: std.ArrayListUnmanaged(ChildInfo),
+    /// Protects child state.
     mutex: compat.Mutex,
+    /// Total simulated restart count.
     restart_count: u32,
+    /// Supervisor state.
     state: SupervisorState,
 
     const SupervisorState = enum {
@@ -190,7 +217,7 @@ pub const MockSupervisor = struct {
         self.children.deinit(self.allocator);
     }
 
-    /// Add a child process
+    /// Add a child record without starting a real thread.
     pub fn addChild(self: *MockSupervisor, id: []const u8, start_fn: *const fn () void) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -206,7 +233,7 @@ pub const MockSupervisor = struct {
         });
     }
 
-    /// Start all children
+    /// Mark all children as running.
     pub fn start(self: *MockSupervisor) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -219,7 +246,7 @@ pub const MockSupervisor = struct {
         self.state = .running;
     }
 
-    /// Stop all children
+    /// Mark all children as stopped.
     pub fn stop(self: *MockSupervisor) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -230,7 +257,7 @@ pub const MockSupervisor = struct {
         self.state = .stopped;
     }
 
-    /// Simulate a child failure
+    /// Simulate a child failure and increment restart counters.
     pub fn failChild(self: *MockSupervisor, id: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -246,14 +273,14 @@ pub const MockSupervisor = struct {
         return error.ChildNotFound;
     }
 
-    /// Get child count
+    /// Return the number of mock children.
     pub fn childCount(self: *MockSupervisor) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.children.items.len;
     }
 
-    /// Get restart count
+    /// Return the total simulated restart count.
     pub fn getRestartCount(self: *MockSupervisor) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -261,16 +288,23 @@ pub const MockSupervisor = struct {
     }
 };
 
-/// Assertion helper for messages
+/// Expected message fields used by `expectMessage`.
+///
+/// Null fields are ignored.
 pub const MessageAssertion = struct {
+    /// Expected payload, if any.
     payload: ?[]const u8 = null,
+    /// Expected sender, if any.
     sender: ?[]const u8 = null,
+    /// Expected priority, if any.
     priority: ?MessagePriority = null,
+    /// Expected signal, if any.
     signal: ?Signal = null,
+    /// Expected correlation id, if any.
     correlation_id: ?[]const u8 = null,
 };
 
-/// Expect a message matching the assertion
+/// Consume the next mock message and assert selected fields.
 pub fn expectMessage(
     _: anytype,
     mock_inbox: *MockInbox,
@@ -314,7 +348,7 @@ pub fn expectMessage(
     }
 }
 
-/// Expect a specific signal
+/// Consume the next mock message and assert its signal.
 pub fn expectSignal(
     _: anytype,
     mock_inbox: *MockInbox,

@@ -1,5 +1,9 @@
-//! High-level inbox API for Vigil
-//! Provides a channel-like interface for message passing.
+//! High-level inbox API for Vigil.
+//!
+//! An `Inbox` is a channel-like wrapper around the lower-level
+//! `ProcessMailbox`. It is the recommended API for application code because it
+//! hides message construction for simple payload sends and provides a safe
+//! close path for concurrent send/receive operations.
 //!
 //! Example:
 //! ```zig
@@ -34,17 +38,28 @@ pub const InboxError = error{
 /// flag and then spins until all in-flight operations have finished
 /// before deallocating.
 pub const Inbox = struct {
+    /// Underlying mailbox. Exposed for interop with registries and legacy APIs.
+    /// The `Inbox` owns this pointer; do not deinitialize it directly.
     mailbox: *ProcessMailbox,
+    /// Allocator used for the inbox object, mailbox, and messages sent through
+    /// `send()`.
     allocator: std.mem.Allocator,
     /// Atomic flag indicating the inbox has been closed.
     closed: std.atomic.Value(bool),
     /// Number of in-flight operations (send / recv / recvTimeout).
     /// `close()` waits for this to reach zero before deallocating.
     active_ops: std.atomic.Value(u32),
+    /// Optional token-bucket limiter applied before sending.
     rate_limiter: ?flow_control.RateLimiter,
+    /// Optional backpressure policy applied when queued messages cross the
+    /// configured high-water mark.
     backpressure_config: ?flow_control.BackpressureConfig,
 
-    /// Create a new inbox
+    /// Allocate a new inbox with default mailbox settings.
+    ///
+    /// The caller owns the returned pointer and must call `close()` exactly
+    /// once. For custom capacity, TTL, rate limiting, or backpressure, use
+    /// `inboxBuilder(allocator)` instead.
     pub fn init(allocator: std.mem.Allocator) !*Inbox {
         const inbox_ptr = try allocator.create(Inbox);
         errdefer allocator.destroy(inbox_ptr);
@@ -71,9 +86,12 @@ pub const Inbox = struct {
         return inbox_ptr;
     }
 
-    /// Close and cleanup the inbox.
+    /// Close and destroy the inbox.
+    ///
     /// Sets the closed flag to signal waiting threads, then waits for
     /// all in-flight operations to finish before deallocating resources.
+    /// After this returns, any pointer to this inbox or its raw mailbox is
+    /// invalid.
     pub fn close(self: *Inbox) void {
         // Set closed flag first to signal waiting threads
         self.closed.store(true, .release);
@@ -91,12 +109,16 @@ pub const Inbox = struct {
         self.allocator.destroy(self);
     }
 
-    /// Check if the inbox has been closed
+    /// Return whether `close()` has been requested.
     pub fn isClosed(self: *Inbox) bool {
         return self.closed.load(.acquire);
     }
 
-    /// Send a message payload
+    /// Send a payload as a new normal-priority message.
+    ///
+    /// `send()` copies the payload into an owned `Message`. It may fail when
+    /// the inbox is closed, the mailbox is full, a rate limit is exceeded, or
+    /// allocation fails.
     pub fn send(self: *Inbox, payload: []const u8) !void {
         if (self.closed.load(.acquire)) {
             return InboxError.InboxClosed;
@@ -124,8 +146,10 @@ pub const Inbox = struct {
         try self.mailbox.send(message);
     }
 
-    /// Receive a message (blocks until available or inbox is closed)
-    /// Returns error.InboxClosed if the inbox is closed while waiting
+    /// Receive the next available message, blocking until one arrives.
+    ///
+    /// The returned `Message` is owned by the caller and must be deinitialized.
+    /// Returns `InboxError.InboxClosed` if the inbox closes while waiting.
     pub fn recv(self: *Inbox) !Message {
         while (true) {
             // Check if inbox has been closed
@@ -160,8 +184,11 @@ pub const Inbox = struct {
         }
     }
 
-    /// Receive with timeout.
-    /// Returns null on timeout, error.InboxClosed if closed while waiting.
+    /// Receive the next message, waiting at most `timeout_ms`.
+    ///
+    /// Returns null on timeout. A zero timeout performs a non-blocking poll.
+    /// The returned `Message`, when present, is owned by the caller and must be
+    /// deinitialized.
     pub fn recvTimeout(self: *Inbox, timeout_ms: u32) !?Message {
         const start = compat.milliTimestamp();
         while (true) {
@@ -198,7 +225,7 @@ pub const Inbox = struct {
         }
     }
 
-    /// Get statistics
+    /// Return a snapshot of the underlying mailbox statistics.
     pub fn stats(self: *Inbox) legacy.MailboxStats {
         return self.mailbox.getStats();
     }
@@ -239,56 +266,87 @@ pub const Inbox = struct {
     }
 };
 
-/// Inbox builder for fluent configuration
+/// Fluent builder for configuring an inbox before allocation.
+///
+/// Builder methods return a modified copy, so chains are cheap and immutable
+/// from the caller's perspective:
+/// ```zig
+/// var inbox = try vigil.inboxBuilder(allocator)
+///     .capacity(256)
+///     .defaultTTL(5_000)
+///     .withBackpressure(.{
+///         .strategy = .drop_oldest,
+///         .high_watermark = 200,
+///         .low_watermark = 100,
+///     })
+///     .build();
+/// defer inbox.close();
+/// ```
 pub const InboxBuilder = struct {
+    /// Allocator used by `build()`.
     allocator: std.mem.Allocator,
+    /// Mailbox capacity.
     capacity_val: usize = 100,
+    /// Whether priority queues are enabled.
     priority_queues_val: bool = true,
+    /// Whether dead-letter support is enabled.
     dead_letter_val: bool = true,
+    /// Default TTL for messages. Null disables the default.
     default_ttl_ms_val: ?u32 = 30_000,
+    /// Optional send rate limit.
     rate_limit_config: ?flow_control.RateLimitConfig = null,
+    /// Optional backpressure policy.
     backpressure_config: ?flow_control.BackpressureConfig = null,
 
     fn init(allocator: std.mem.Allocator) InboxBuilder {
         return .{ .allocator = allocator };
     }
 
+    /// Set mailbox capacity.
     pub fn capacity(self: InboxBuilder, n: usize) InboxBuilder {
         var result = self;
         result.capacity_val = n;
         return result;
     }
 
+    /// Enable or disable priority queues.
     pub fn priorityQueues(self: InboxBuilder, enabled: bool) InboxBuilder {
         var result = self;
         result.priority_queues_val = enabled;
         return result;
     }
 
+    /// Enable or disable dead-letter support.
     pub fn deadLetter(self: InboxBuilder, enabled: bool) InboxBuilder {
         var result = self;
         result.dead_letter_val = enabled;
         return result;
     }
 
+    /// Set the default message TTL in milliseconds.
     pub fn defaultTTL(self: InboxBuilder, ms: u32) InboxBuilder {
         var result = self;
         result.default_ttl_ms_val = ms;
         return result;
     }
 
+    /// Apply a token-bucket rate limit to sends.
     pub fn withRateLimit(self: InboxBuilder, config: flow_control.RateLimitConfig) InboxBuilder {
         var result = self;
         result.rate_limit_config = config;
         return result;
     }
 
+    /// Apply a backpressure policy to sends.
     pub fn withBackpressure(self: InboxBuilder, config: flow_control.BackpressureConfig) InboxBuilder {
         var result = self;
         result.backpressure_config = config;
         return result;
     }
 
+    /// Allocate and return the configured inbox.
+    ///
+    /// The caller owns the returned pointer and must call `close()`.
     pub fn build(self: InboxBuilder) !*Inbox {
         const inbox_ptr = try self.allocator.create(Inbox);
         errdefer self.allocator.destroy(inbox_ptr);
@@ -316,12 +374,14 @@ pub const InboxBuilder = struct {
     }
 };
 
-/// Create a new inbox builder
+/// Create a new inbox builder using `allocator`.
 pub fn inboxBuilder(allocator: std.mem.Allocator) InboxBuilder {
     return InboxBuilder.init(allocator);
 }
 
-/// Create a new inbox (simple version)
+/// Allocate a default inbox.
+///
+/// Equivalent to `inboxBuilder(allocator).build()`.
 pub fn inbox(allocator: std.mem.Allocator) !*Inbox {
     return try Inbox.init(allocator);
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const vigil = @import("vigil");
 const net = vigil.compat.net;
+const sockets = vigil.compat.sockets;
 const posix = std.posix;
 
 // Configuration
@@ -10,6 +11,51 @@ const SERVER_ADDRESS = "127.0.0.1";
 
 // Global shutdown signal
 var sig_received = std.atomic.Value(bool).init(false);
+
+fn handleInterrupt(_: std.c.SIG) callconv(.c) void {
+    sig_received.store(true, .release);
+    std.debug.print("\nReceived shutdown signal...\n", .{});
+}
+
+fn installSignalHandlers() void {
+    const empty_set = std.posix.sigemptyset();
+
+    std.posix.sigaction(std.posix.SIG.INT, &std.posix.Sigaction{
+        .handler = .{ .handler = handleInterrupt },
+        .mask = empty_set,
+        .flags = 0,
+    }, null);
+
+    std.posix.sigaction(std.posix.SIG.PIPE, &std.posix.Sigaction{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = empty_set,
+        .flags = 0,
+    }, null);
+}
+
+fn nowSeconds() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
+fn sleepFor(nanoseconds: u64) void {
+    const ns_per_s = std.time.ns_per_s;
+    var req: std.posix.timespec = .{
+        .sec = @intCast(nanoseconds / ns_per_s),
+        .nsec = @intCast(nanoseconds % ns_per_s),
+    };
+    var rem: std.posix.timespec = undefined;
+    while (std.c.nanosleep(&req, &rem) != 0) {
+        req = rem;
+    }
+}
+
+fn isControlCommand(cmd: []const u8) bool {
+    return std.mem.eql(u8, cmd, "STATUS") or
+        std.mem.eql(u8, cmd, "HEALTH") or
+        std.mem.eql(u8, cmd, "METRICS");
+}
 
 // Server metrics using Vigil's telemetry
 const ServerMetrics = struct {
@@ -23,7 +69,7 @@ const ServerMetrics = struct {
             .total_connections = std.atomic.Value(usize).init(0),
             .active_connections = std.atomic.Value(usize).init(0),
             .requests_handled = std.atomic.Value(usize).init(0),
-            .start_time = vigil.compat.timestamp(),
+            .start_time = nowSeconds(),
         };
     }
 
@@ -41,21 +87,23 @@ const ServerMetrics = struct {
     }
 
     pub fn getUptime(self: *ServerMetrics) i64 {
-        return vigil.compat.timestamp() - self.start_time;
+        return nowSeconds() - self.start_time;
     }
 };
 
 // Server state
 const ServerState = struct {
     allocator: std.mem.Allocator,
+    runtime: *vigil.Runtime,
     metrics: ServerMetrics,
     rate_limiter: vigil.RateLimiter,
     circuit_breaker: vigil.CircuitBreaker,
     is_shutting_down: std.atomic.Value(bool),
 
-    pub fn init(allocator: std.mem.Allocator) !ServerState {
+    pub fn init(allocator: std.mem.Allocator, runtime: *vigil.Runtime) !ServerState {
         return .{
             .allocator = allocator,
+            .runtime = runtime,
             .metrics = ServerMetrics.init(),
             .rate_limiter = vigil.RateLimiter.init(1000), // 1000 requests/sec
             .circuit_breaker = try vigil.CircuitBreaker.init(allocator, "server", .{
@@ -78,29 +126,30 @@ fn handleConnection(stream: net.Stream, state: *ServerState) void {
         state.metrics.connectionClosed();
     }
 
-    state.metrics.connectionOpened();
     var buffer: [1024]u8 = undefined;
 
     while (!state.is_shutting_down.load(.acquire)) {
-        // Check rate limit
-        if (!state.rate_limiter.allow()) {
-            const response = "ERROR: Rate limited\n";
-            _ = stream.write(response) catch break;
-            continue;
-        }
-
-        // Check circuit breaker
-        if (state.circuit_breaker.getState() == .open) {
-            const response = "ERROR: Service temporarily unavailable\n";
-            _ = stream.write(response) catch break;
-            vigil.compat.sleep(100 * std.time.ns_per_ms);
-            continue;
-        }
-
         const bytes_read = stream.read(&buffer) catch break;
         if (bytes_read == 0) break;
 
         const cmd = std.mem.trim(u8, buffer[0..bytes_read], "\r\n");
+
+        if (!isControlCommand(cmd)) {
+            if (!state.rate_limiter.allow()) {
+                const response = "ERROR: Rate limited\n";
+                _ = stream.write(response) catch break;
+                state.metrics.requestHandled();
+                continue;
+            }
+
+            if (state.circuit_breaker.getState() == .open) {
+                const response = "ERROR: Service temporarily unavailable\n";
+                _ = stream.write(response) catch break;
+                state.metrics.requestHandled();
+                sleepFor(100 * std.time.ns_per_ms);
+                continue;
+            }
+        }
 
         // Handle commands
         if (std.mem.eql(u8, cmd, "STATUS")) {
@@ -145,23 +194,28 @@ fn handleConnection(stream: net.Stream, state: *ServerState) void {
     }
 }
 
+fn spawnConnectionHandler(stream: net.Stream, state: *ServerState) !void {
+    state.metrics.connectionOpened();
+    errdefer state.metrics.connectionClosed();
+
+    const handler_thread = try std.Thread.spawn(.{}, handleConnection, .{ stream, state });
+    handler_thread.detach();
+}
+
 fn runServer(allocator: std.mem.Allocator) !void {
-    var state = try ServerState.init(allocator);
+    var runtime = try vigil.runtime(allocator, .{});
+    defer runtime.deinit();
+
+    var state = try ServerState.init(allocator, &runtime);
     defer state.deinit();
 
-    // Initialize Vigil telemetry
-    try vigil.telemetry.initGlobal(allocator);
-    if (vigil.telemetry.getGlobal()) |emitter| {
-        try emitter.on(.process_started, struct {
-            fn handler(event: vigil.telemetry.Event) void {
-                std.debug.print("[Telemetry] {s}\n", .{@tagName(event.event_type)});
-            }
-        }.handler);
-    }
+    try state.runtime.telemetry_emitter.on(.process_started, struct {
+        fn handler(event: vigil.telemetry.Event) void {
+            std.debug.print("[Telemetry] {s}\n", .{@tagName(event.event_type)});
+        }
+    }.handler);
 
-    // Initialize shutdown manager
-    try vigil.shutdown.initGlobal(allocator);
-    try vigil.onShutdown(struct {
+    try state.runtime.onShutdown(struct {
         fn cleanup() void {
             std.debug.print("[Shutdown] Server cleanup complete\n", .{});
         }
@@ -171,13 +225,13 @@ fn runServer(allocator: std.mem.Allocator) !void {
     const address = try net.parseIp4(SERVER_ADDRESS, SERVER_PORT);
     std.debug.print("Starting Vigilant Server on {s}:{d}\n", .{ SERVER_ADDRESS, SERVER_PORT });
 
-    const sock_flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-    const fd = try vigil.compat.sockets.socket(posix.AF.INET, sock_flags, posix.IPPROTO.TCP);
-    errdefer vigil.compat.sockets.close(fd);
+    const sock_flags = posix.SOCK.STREAM;
+    const fd = try sockets.socket(posix.AF.INET, sock_flags, posix.IPPROTO.TCP);
+    errdefer sockets.close(fd);
 
     try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try vigil.compat.sockets.bind(fd, &address.any, address.getOsSockLen());
-    try vigil.compat.sockets.listen(fd, 128);
+    try sockets.bind(fd, &address.any, address.getOsSockLen());
+    try sockets.listen(fd, 128);
 
     var server = net.Server{
         .stream = .{ .handle = fd },
@@ -204,7 +258,7 @@ fn runServer(allocator: std.mem.Allocator) !void {
             continue;
         }
 
-        _ = std.Thread.spawn(.{}, handleConnection, .{ conn.stream, &state }) catch |err| {
+        spawnConnectionHandler(conn.stream, &state) catch |err| {
             std.debug.print("Failed to spawn handler: {}\n", .{err});
             conn.stream.close();
             continue;
@@ -214,18 +268,17 @@ fn runServer(allocator: std.mem.Allocator) !void {
     // Graceful shutdown
     std.debug.print("\nInitiating graceful shutdown...\n", .{});
     state.is_shutting_down.store(true, .release);
-    vigil.compat.sockets.close(fd);
+    sockets.close(fd);
 
     // Wait for active connections
     while (state.metrics.active_connections.load(.monotonic) > 0) {
         std.debug.print("Waiting for {d} connections...\n", .{
             state.metrics.active_connections.load(.monotonic),
         });
-        vigil.compat.sleep(100 * std.time.ns_per_ms);
+        sleepFor(100 * std.time.ns_per_ms);
     }
 
-    // Run shutdown hooks
-    vigil.shutdownAll(.{});
+    state.runtime.shutdown();
 
     std.debug.print("Server shutdown complete\n", .{});
 }
@@ -235,22 +288,60 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Setup signal handler
-    const handler = struct {
-        fn handle(_: std.c.SIG) callconv(.c) void {
-            sig_received.store(true, .release);
-            std.debug.print("\nReceived shutdown signal...\n", .{});
-        }
-    }.handle;
-
-    var empty_set: std.posix.sigset_t = undefined;
-    @memset(@as([*]u8, @ptrCast(&empty_set))[0..@sizeOf(std.posix.sigset_t)], 0);
-
-    std.posix.sigaction(std.posix.SIG.INT, &std.posix.Sigaction{
-        .handler = .{ .handler = handler },
-        .mask = empty_set,
-        .flags = 0,
-    }, null);
-
+    installSignalHandlers();
     try runServer(allocator);
+}
+
+test "vigilant server state is wired to a v2 runtime" {
+    const fields = std.meta.fields(ServerState);
+    comptime {
+        var found_runtime = false;
+        for (fields) |field| {
+            if (std.mem.eql(u8, field.name, "runtime")) {
+                found_runtime = field.type == *vigil.Runtime;
+            }
+        }
+        if (!found_runtime) {
+            @compileError("ServerState must carry an owned v2 vigil.Runtime");
+        }
+    }
+}
+
+test "vigilant server example excludes removed root compatibility helpers" {
+    comptime {
+        const removed_root_helpers = .{
+            "global_" ++ "registry",
+            "create" ++ "Mailbox",
+            "create" ++ "Supervisor",
+            "create" ++ "SupervisionTree",
+            "create" ++ "Response",
+            "add" ++ "WorkerGroup",
+            "broad" ++ "cast",
+        };
+
+        for (removed_root_helpers) |decl| {
+            if (@hasDecl(vigil, decl)) {
+                @compileError("example depends on a removed v2 root helper");
+            }
+        }
+    }
+}
+
+test "vigilant server ignores SIGPIPE from disconnected clients" {
+    var previous: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.PIPE, null, &previous);
+    defer std.posix.sigaction(std.posix.SIG.PIPE, &previous, null);
+
+    installSignalHandlers();
+
+    var current: std.posix.Sigaction = undefined;
+    std.posix.sigaction(std.posix.SIG.PIPE, null, &current);
+    try std.testing.expect(current.handler.handler == std.posix.SIG.IGN);
+}
+
+test "vigilant server treats observability commands as control traffic" {
+    try std.testing.expect(isControlCommand("STATUS"));
+    try std.testing.expect(isControlCommand("HEALTH"));
+    try std.testing.expect(isControlCommand("METRICS"));
+    try std.testing.expect(!isControlCommand("hello"));
 }

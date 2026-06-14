@@ -9,12 +9,16 @@ fn incrementTimerTestCount() void {
     _ = timer_test_count.fetchAdd(1, .monotonic);
 }
 
+/// Function called by `Timer` after a timeout or interval tick.
 pub const TimerCallback = *const fn () void;
 
 /// Timer utilities for scheduling messages.
 pub const Timer = struct {
+    /// Allocator for timer contexts.
     allocator: std.mem.Allocator,
+    /// Active timeout/interval context, if any.
     context: ?*TimerContext = null,
+    /// Worker thread for the active timeout/interval.
     thread: ?std.Thread = null,
 
     const TimerContext = struct {
@@ -24,6 +28,7 @@ pub const Timer = struct {
         repeat: bool,
     };
 
+    /// Initialize an idle timer.
     pub fn init(allocator: std.mem.Allocator) Timer {
         return .{
             .allocator = allocator,
@@ -32,17 +37,22 @@ pub const Timer = struct {
         };
     }
 
+    /// Cancel active work and join the timer thread.
     pub fn deinit(self: *Timer) void {
         self.cancel();
         self.joinExistingThread();
     }
 
+    /// Request cancellation of the active timeout or interval.
     pub fn cancel(self: *Timer) void {
         if (self.context) |ctx| {
             ctx.cancelled.store(true, .release);
         }
     }
 
+    /// Run `callback` once after `delay_ms`.
+    ///
+    /// Replaces any existing timeout or interval on this timer.
     pub fn setTimeout(self: *Timer, delay_ms: u32, callback: TimerCallback) !void {
         self.cancel();
         self.joinExistingThread();
@@ -60,6 +70,9 @@ pub const Timer = struct {
         self.thread = try std.Thread.spawn(.{}, timerLoop, .{self.context.?});
     }
 
+    /// Run `callback` every `interval_ms` until cancelled.
+    ///
+    /// Replaces any existing timeout or interval on this timer.
     pub fn setInterval(self: *Timer, interval_ms: u32, callback: TimerCallback) !void {
         self.cancel();
         self.joinExistingThread();
@@ -102,8 +115,10 @@ pub const Timer = struct {
     }
 
     /// Schedule a message to be sent after a delay.
+    ///
     /// Spawns a detached thread to handle the timing.
-    /// The message is owned by the timer until sent.
+    /// This function takes ownership of `msg` once it succeeds. If thread
+    /// creation fails, the message is deinitialized before returning the error.
     pub fn sendAfter(
         allocator: std.mem.Allocator,
         delay_ms: u32,
@@ -118,12 +133,14 @@ pub const Timer = struct {
         };
 
         const context = try allocator.create(Context);
+        errdefer allocator.destroy(context);
         context.* = .{
             .delay = delay_ms,
             .mailbox = mailbox,
             .msg = msg,
             .allocator = allocator,
         };
+        errdefer context.msg.deinit();
 
         const thread_fn = struct {
             fn run(ctx: *Context) void {
@@ -131,12 +148,9 @@ pub const Timer = struct {
 
                 compat.sleep(@as(u64, ctx.delay) * std.time.ns_per_ms);
 
-                // Send the message (this copies it into the mailbox)
-                // If successful, ownership is transferred to the mailbox.
-                // If failed, we must deinit it.
-                ctx.mailbox.send(ctx.msg) catch {
-                    ctx.msg.deinit();
-                };
+                // ProcessMailbox.send consumes the message on success and on
+                // failure, so there is no cleanup left in this thread.
+                ctx.mailbox.send(ctx.msg) catch {};
             }
         }.run;
 
@@ -207,4 +221,28 @@ test "Timer sendAfter" {
     defer received.deinit(); // We own the received message
 
     try std.testing.expectEqualStrings("timer_msg", received.id);
+}
+
+test "Timer sendAfter handles failed delivery without double free" {
+    const allocator = std.testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 1,
+        .max_message_size = 1,
+    });
+    defer mailbox.deinit();
+
+    const msg = try Message.init(
+        allocator,
+        "too-large",
+        "timer",
+        "oversized",
+        null,
+        .normal,
+        null,
+    );
+
+    try Timer.sendAfter(allocator, 1, &mailbox, msg);
+    compat.sleep(40 * std.time.ns_per_ms);
+
+    try std.testing.expectError(error.EmptyMailbox, mailbox.receive());
 }

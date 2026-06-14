@@ -33,7 +33,10 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "bash",
         "src",
+        "tests",
+        "test_server.py",
         // For example...
         //"LICENSE",
         //"README.md",

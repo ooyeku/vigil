@@ -1,5 +1,9 @@
-//! Request/Reply pattern for Vigil
-//! Synchronous messaging with automatic correlation.
+//! Request/reply pattern for Vigil.
+//!
+//! These helpers layer synchronous waiting on top of normal inbox messaging by
+//! assigning and matching message correlation ids. They are useful for local
+//! service calls where the caller needs one response and wants timeout
+//! handling.
 
 const std = @import("std");
 const Message = @import("../messages.zig").Message;
@@ -17,24 +21,33 @@ const ResetEvent = struct {
     pub fn reset(_: *ResetEvent) void {}
 };
 
-/// Request options
+/// Options for a request/reply exchange.
 pub const RequestOptions = struct {
+    /// Maximum time to wait for a correlated reply.
     timeout_ms: u32 = 5000,
 };
 
 /// Reply mailbox for handling responses.
+///
 /// Non-matching messages are re-queued to avoid dropping messages
 /// intended for other pending requests.
 pub const ReplyMailbox = struct {
+    /// Inbox used to receive candidate replies.
     inbox: *Inbox,
+    /// Tracks active correlation ids.
     correlation_map: std.StringHashMap(*ResetEvent),
     /// Buffer for messages that didn't match the awaited correlation ID.
     /// These are re-sent to the inbox so other consumers can process them.
     stash: std.ArrayListUnmanaged(Message),
+    /// Protects correlation map updates.
     mutex: compat.Mutex,
+    /// Allocator for copied correlation ids, event stubs, and stash storage.
     allocator: std.mem.Allocator,
 
-    /// Initialize a reply mailbox
+    /// Initialize a reply mailbox over an existing inbox.
+    ///
+    /// The reply mailbox does not own the inbox. Call `deinit()` before
+    /// closing the inbox.
     pub fn init(allocator: std.mem.Allocator, inbox: *Inbox) ReplyMailbox {
         return .{
             .inbox = inbox,
@@ -45,7 +58,7 @@ pub const ReplyMailbox = struct {
         };
     }
 
-    /// Cleanup resources
+    /// Release correlation tracking and any stashed messages.
     pub fn deinit(self: *ReplyMailbox) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -85,9 +98,12 @@ pub const ReplyMailbox = struct {
         }
     }
 
-    /// Wait for a reply with the given correlation ID.
+    /// Wait for a reply with the given correlation id.
+    ///
     /// Non-matching messages are stashed and re-queued to the inbox
     /// when the wait completes (on match, timeout, or error).
+    ///
+    /// The returned `Message` is owned by the caller and must be deinitialized.
     pub fn waitForReply(
         self: *ReplyMailbox,
         correlation_id: []const u8,
@@ -183,7 +199,11 @@ pub const ReplyMailbox = struct {
     }
 };
 
-/// Send a request and wait for reply
+/// Send a request and wait for a correlated reply.
+///
+/// The helper assigns a fresh correlation id before sending. It returns an
+/// owned reply message, or `MessageError.DeliveryTimeout` when no matching
+/// reply arrives before `options.timeout_ms`.
 pub fn request(
     inbox: *Inbox,
     request_msg: Message,
@@ -214,7 +234,11 @@ pub fn request(
     return reply_mailbox.waitForReply(correlation_id, options.timeout_ms);
 }
 
-/// Reply to a request message
+/// Build a reply message for a request.
+///
+/// The request must contain a correlation id. The returned `Message` copies
+/// that id so callers can send it through an inbox and the requester can match
+/// it. The caller owns the returned message and must call `deinit()`.
 pub fn reply(request_msg: Message, response_payload: []const u8, allocator: std.mem.Allocator) !Message {
     if (request_msg.metadata.correlation_id == null) {
         return MessageError.InvalidMessage;

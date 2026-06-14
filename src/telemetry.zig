@@ -1,5 +1,10 @@
-//! Telemetry and event hooks for Vigil
-//! Provides observable events for monitoring and debugging.
+//! Telemetry and event hooks for Vigil.
+//!
+//! Telemetry is intentionally lightweight: handlers are plain function
+//! pointers, event dispatch is synchronous, and events carry optional metadata
+//! as borrowed slices. New v2 applications should prefer
+//! `Runtime.telemetry_emitter`; the global helpers remain available for modules
+//! that still publish through process-wide telemetry.
 
 const std = @import("std");
 const Message = @import("messages.zig").Message;
@@ -7,7 +12,7 @@ const MessagePriority = @import("messages.zig").MessagePriority;
 const Signal = @import("messages.zig").Signal;
 const compat = @import("compat.zig");
 
-/// Event types that can be emitted
+/// Event types emitted by Vigil components.
 pub const EventType = enum {
     // Process lifecycle events
     process_started,
@@ -40,19 +45,28 @@ pub const EventType = enum {
     genserver_state_changed,
 };
 
-/// Base event structure
+/// Base event delivered to telemetry handlers.
+///
+/// `metadata`, when present, is borrowed for the duration of the `emit()` call.
 pub const Event = struct {
+    /// Kind of event.
     event_type: EventType,
+    /// Event timestamp in milliseconds.
     timestamp_ms: i64,
+    /// Optional human-readable metadata.
     metadata: ?[]const u8 = null,
 };
 
-/// Process lifecycle event
+/// Detailed process lifecycle event.
 pub const ProcessEvent = struct {
+    /// Base event fields.
     base: Event,
+    /// Process id. Created helper events allocate a copied id.
     process_id: []const u8,
+    /// Lifecycle state.
     state: ProcessState,
 
+    /// Process lifecycle states used in process telemetry.
     pub const ProcessState = enum {
         started,
         stopped,
@@ -62,33 +76,50 @@ pub const ProcessEvent = struct {
     };
 };
 
-/// Message event
+/// Detailed message event.
 pub const MessageEvent = struct {
+    /// Base event fields.
     base: Event,
+    /// Message id.
     message_id: []const u8,
+    /// Message sender.
     sender: []const u8,
+    /// Optional logical receiver. Created helper events copy this field.
     receiver: ?[]const u8,
+    /// Message priority.
     priority: MessagePriority,
+    /// Payload size reported by the message metadata.
     size_bytes: usize,
+    /// Optional topic for pub/sub style events.
     topic: ?[]const u8 = null,
 };
 
-/// Supervisor event
+/// Detailed supervisor event.
 pub const SupervisorEvent = struct {
+    /// Base event fields.
     base: Event,
+    /// Supervisor id, if known. Created helper events copy this field.
     supervisor_id: ?[]const u8,
+    /// Child id, if known. Created helper events copy this field.
     child_id: ?[]const u8,
+    /// Restart count at the time of the event.
     restart_count: u32,
+    /// Optional strategy label.
     strategy: ?[]const u8 = null,
 };
 
-/// Circuit breaker event
+/// Detailed circuit breaker event.
 pub const CircuitEvent = struct {
+    /// Base event fields.
     base: Event,
+    /// Circuit id. Created helper events allocate a copied id.
     circuit_id: []const u8,
+    /// Circuit state after the event.
     state: CircuitState,
+    /// Failure count after the event.
     failure_count: u32,
 
+    /// Circuit states used in telemetry payloads.
     pub const CircuitState = enum {
         opened,
         closed,
@@ -96,21 +127,35 @@ pub const CircuitEvent = struct {
     };
 };
 
-/// GenServer event
+/// Detailed GenServer event.
 pub const GenServerEvent = struct {
+    /// Base event fields.
     base: Event,
+    /// Server id.
     server_id: []const u8,
+    /// Optional serialized state snapshot.
     state_snapshot: ?[]const u8 = null,
 };
 
-/// Event handler function type
+/// Event handler function type.
+///
+/// Handlers run synchronously on the thread that calls `emit()`. Keep handlers
+/// small and non-blocking.
 pub const EventHandler = *const fn (event: Event) void;
 
-/// Telemetry emitter - central event dispatcher
+/// Thread-safe event dispatcher.
+///
+/// Handlers are grouped by exact `EventType`; there is no wildcard matching.
+/// The emitter copies its handler list before dispatch so handlers may register
+/// or remove handlers without invalidating iteration.
 pub const TelemetryEmitter = struct {
+    /// Allocator for handler storage and dispatch snapshots.
     allocator: std.mem.Allocator,
+    /// Registered handlers.
     handlers: std.ArrayListUnmanaged(HandlerEntry),
+    /// Protects handler registration and enabled state.
     mutex: compat.Mutex,
+    /// Whether `emit()` dispatches events.
     enabled: bool = true,
 
     const HandlerEntry = struct {
@@ -118,7 +163,7 @@ pub const TelemetryEmitter = struct {
         handler: EventHandler,
     };
 
-    /// Initialize a new telemetry emitter
+    /// Initialize an enabled telemetry emitter.
     pub fn init(allocator: std.mem.Allocator) TelemetryEmitter {
         return .{
             .allocator = allocator,
@@ -128,14 +173,17 @@ pub const TelemetryEmitter = struct {
         };
     }
 
-    /// Cleanup resources
+    /// Release handler storage.
     pub fn deinit(self: *TelemetryEmitter) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.handlers.deinit(self.allocator);
     }
 
-    /// Register a handler for a specific event type
+    /// Register a handler for an exact event type.
+    ///
+    /// Handler function pointers are not owned by the emitter and must remain
+    /// valid for as long as they are registered.
     pub fn on(self: *TelemetryEmitter, event_type: EventType, handler: EventHandler) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -146,7 +194,10 @@ pub const TelemetryEmitter = struct {
         });
     }
 
-    /// Emit an event to all registered handlers
+    /// Dispatch an event to matching handlers.
+    ///
+    /// Dispatch is synchronous and best-effort. If a temporary handler snapshot
+    /// cannot be allocated, the event is dropped.
     pub fn emit(self: *TelemetryEmitter, event: Event) void {
         if (!self.enabled) return;
 
@@ -167,14 +218,14 @@ pub const TelemetryEmitter = struct {
         }
     }
 
-    /// Enable or disable event emission
+    /// Enable or disable event emission.
     pub fn setEnabled(self: *TelemetryEmitter, enabled: bool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.enabled = enabled;
     }
 
-    /// Remove all handlers for an event type
+    /// Remove all handlers for an event type.
     pub fn removeHandlers(self: *TelemetryEmitter, event_type: EventType) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -190,11 +241,14 @@ pub const TelemetryEmitter = struct {
     }
 };
 
-/// Global telemetry instance
+/// Optional process-wide telemetry emitter.
+///
+/// Prefer `Runtime.telemetry_emitter` in new v2 code unless a process-wide
+/// integration point is explicitly desired.
 var global_telemetry: ?TelemetryEmitter = null;
 var telemetry_mutex: compat.Mutex = .{};
 
-/// Initialize global telemetry
+/// Initialize the optional global telemetry emitter if needed.
 pub fn initGlobal(allocator: std.mem.Allocator) !void {
     telemetry_mutex.lock();
     defer telemetry_mutex.unlock();
@@ -228,21 +282,28 @@ pub fn getGlobal() ?*TelemetryEmitter {
     return if (global_telemetry) |*t| t else null;
 }
 
-/// Register a handler for global telemetry
+/// Register a handler on the optional global telemetry emitter.
+///
+/// Does nothing when global telemetry has not been initialized.
 pub fn on(event_type: EventType, handler: EventHandler) !void {
     if (getGlobal()) |telemetry| {
         try telemetry.on(event_type, handler);
     }
 }
 
-/// Emit an event to global telemetry
+/// Emit an event through the optional global telemetry emitter.
+///
+/// Does nothing when global telemetry has not been initialized.
 pub fn emit(event: Event) void {
     if (getGlobal()) |telemetry| {
         telemetry.emit(event);
     }
 }
 
-/// Helper to create a process event
+/// Allocate a detailed process event.
+///
+/// The returned `process_id` is allocated with `allocator` and must be freed by
+/// the caller when the event is no longer needed.
 pub fn createProcessEvent(
     allocator: std.mem.Allocator,
     event_type: EventType,
@@ -263,7 +324,10 @@ pub fn createProcessEvent(
     };
 }
 
-/// Helper to create a message event
+/// Create a detailed message event.
+///
+/// The returned `receiver`, when present, is allocated with `allocator` and
+/// must be freed by the caller.
 pub fn createMessageEvent(
     allocator: std.mem.Allocator,
     event_type: EventType,
@@ -288,7 +352,10 @@ pub fn createMessageEvent(
     };
 }
 
-/// Helper to create a supervisor event
+/// Allocate a detailed supervisor event.
+///
+/// Returned `supervisor_id` and `child_id` fields, when present, are allocated
+/// with `allocator` and must be freed by the caller.
 pub fn createSupervisorEvent(
     allocator: std.mem.Allocator,
     event_type: EventType,
@@ -315,7 +382,10 @@ pub fn createSupervisorEvent(
     };
 }
 
-/// Helper to create a circuit breaker event
+/// Allocate a detailed circuit breaker event.
+///
+/// The returned `circuit_id` is allocated with `allocator` and must be freed by
+/// the caller.
 pub fn createCircuitEvent(
     allocator: std.mem.Allocator,
     event_type: EventType,

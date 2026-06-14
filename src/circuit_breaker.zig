@@ -1,45 +1,62 @@
-//! Circuit breaker pattern for Vigil
-//! Protects services from cascading failures.
+//! Circuit breaker pattern for Vigil.
+//!
+//! Circuit breakers protect a caller from repeatedly invoking a dependency
+//! that is already failing. After enough failures the breaker opens and future
+//! calls fail fast with `error.CircuitOpen` until the reset timeout allows a
+//! limited half-open probe.
 
 const std = @import("std");
 const telemetry = @import("telemetry.zig");
 const compat = @import("compat.zig");
 
-/// Circuit breaker state
+/// Public state of a circuit breaker.
 pub const CircuitState = enum {
-    /// Circuit is closed - normal operation
+    /// Normal operation. Calls are allowed and failures are counted.
     closed,
-    /// Circuit is open - failing fast
+    /// Failing fast. Calls return `error.CircuitOpen` until reset timeout.
     open,
-    /// Circuit is half-open - testing if service recovered
+    /// Limited probe mode after reset timeout.
     half_open,
 };
 
-/// Circuit breaker configuration
+/// Configuration for circuit breaker thresholds and recovery behavior.
 pub const CircuitBreakerConfig = struct {
-    /// Number of failures before opening circuit
+    /// Consecutive failures needed to open the circuit.
     failure_threshold: u32 = 5,
-    /// Timeout in milliseconds before attempting half-open
+    /// Time to wait before allowing half-open probes.
     reset_timeout_ms: u32 = 30_000,
-    /// Number of requests to allow in half-open state
+    /// Maximum calls allowed while half-open.
     half_open_requests: u32 = 3,
-    /// Success threshold in half-open to close circuit
+    /// Successful half-open calls needed to close the circuit.
     half_open_success_threshold: u32 = 2,
 };
 
-/// Circuit breaker implementation
+/// Thread-safe circuit breaker.
+///
+/// The breaker owns a copied `circuit_id` for telemetry metadata. Call
+/// `deinit()` when finished. `callError()` is the best fit for fallible
+/// `!void` operations; `call()` is for infallible functions returning a value.
 pub const CircuitBreaker = struct {
+    /// Thresholds and timing rules.
     config: CircuitBreakerConfig,
+    /// Current state.
     state: CircuitState,
+    /// Consecutive failure count while closed.
     failure_count: u32,
+    /// Successful probe count while half-open.
     success_count: u32,
+    /// Last failure timestamp in milliseconds.
     last_failure_time_ms: i64,
+    /// Calls already admitted while half-open.
     half_open_request_count: u32,
+    /// Protects breaker state.
     mutex: compat.Mutex,
+    /// Stable id used in telemetry events.
     circuit_id: []const u8,
+    /// Allocator for copied id and telemetry helpers.
     allocator: std.mem.Allocator,
 
-    /// Initialize a new circuit breaker
+    /// Initialize a new closed circuit breaker.
     pub fn init(allocator: std.mem.Allocator, circuit_id: []const u8, config: CircuitBreakerConfig) !CircuitBreaker {
         const id_copy = try allocator.dupe(u8, circuit_id);
         errdefer allocator.free(id_copy);
@@ -57,12 +74,16 @@ pub const CircuitBreaker = struct {
         };
     }
 
-    /// Cleanup resources
+    /// Release the copied circuit id.
     pub fn deinit(self: *CircuitBreaker) void {
         self.allocator.free(self.circuit_id);
     }
 
-    /// Execute a function with circuit breaker protection
+    /// Execute an infallible function with circuit breaker protection.
+    ///
+    /// Returns `error.CircuitOpen` if the breaker is open or half-open capacity
+    /// has been exhausted. Successful calls close the breaker once the
+    /// half-open success threshold is reached.
     pub fn call(self: *CircuitBreaker, comptime T: type, func: *const fn () T) !T {
         {
             self.mutex.lock();
@@ -117,7 +138,11 @@ pub const CircuitBreaker = struct {
         return result;
     }
 
-    /// Execute a function that can fail with circuit breaker protection
+    /// Execute a fallible operation with circuit breaker protection.
+    ///
+    /// Failures returned by `func` are counted and then returned to the caller.
+    /// Once the failure threshold is reached the breaker opens and subsequent
+    /// calls return `error.CircuitOpen` until the reset timeout has elapsed.
     pub fn callError(self: *CircuitBreaker, func: *const fn () anyerror!void) !void {
         {
             self.mutex.lock();
@@ -195,14 +220,14 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// Get current state
+    /// Return the current breaker state.
     pub fn getState(self: *CircuitBreaker) CircuitState {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.state;
     }
 
-    /// Force circuit open
+    /// Force the breaker open and emit telemetry if this is a transition.
     pub fn forceOpen(self: *CircuitBreaker) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -214,7 +239,7 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// Force circuit closed
+    /// Force the breaker closed and reset counters.
     pub fn forceClose(self: *CircuitBreaker) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -228,7 +253,7 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// Get failure count
+    /// Return the current consecutive failure count.
     pub fn getFailureCount(self: *CircuitBreaker) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -258,8 +283,9 @@ pub const CircuitBreaker = struct {
     }
 };
 
-/// Error returned when circuit is open
+/// Error returned when a protected call is rejected by an open circuit.
 pub const CircuitBreakerError = error{
+    /// The dependency is currently considered unavailable.
     CircuitOpen,
 };
 

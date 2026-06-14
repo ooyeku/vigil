@@ -3,14 +3,19 @@ const compat = @import("compat.zig");
 const Mutex = compat.Mutex;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 
-/// Global process registry for mapping names to process mailboxes.
+/// Local process registry for mapping names to process mailboxes.
+///
 /// Thread-safe implementation using a mutex-protected hash map.
+/// `Registry` owns copied names, but it does not own mailbox pointers.
 pub const Registry = struct {
+    /// Protects the registry map.
     mutex: Mutex,
+    /// Name to mailbox pointer mapping.
     map: std.StringHashMap(*ProcessMailbox),
+    /// Allocator for copied names and map storage.
     allocator: std.mem.Allocator,
 
-    /// Initialize a new registry
+    /// Initialize an empty registry.
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{
             .mutex = Mutex{},
@@ -19,7 +24,9 @@ pub const Registry = struct {
         };
     }
 
-    /// Deinitialize the registry and free all stored keys
+    /// Deinitialize the registry and free stored names.
+    ///
+    /// Registered mailboxes are caller-owned and are not deinitialized.
     pub fn deinit(self: *Registry) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -31,8 +38,10 @@ pub const Registry = struct {
         self.map.deinit();
     }
 
-    /// Register a mailbox with a name
-    /// Returns error.AlreadyRegistered if the name is already in use
+    /// Register a mailbox under a name.
+    ///
+    /// The name is copied. Returns `error.AlreadyRegistered` if the name is
+    /// already in use. The mailbox must outlive any users that retrieve it.
     pub fn register(self: *Registry, name: []const u8, mailbox: *ProcessMailbox) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -45,7 +54,7 @@ pub const Registry = struct {
         try self.map.put(name_copy, mailbox);
     }
 
-    /// Unregister a name
+    /// Remove a name if present.
     pub fn unregister(self: *Registry, name: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -55,7 +64,7 @@ pub const Registry = struct {
         }
     }
 
-    /// Look up a mailbox by name
+    /// Look up a mailbox by name.
     pub fn whereis(self: *Registry, name: []const u8) ?*ProcessMailbox {
         self.mutex.lock();
         defer self.mutex.unlock();

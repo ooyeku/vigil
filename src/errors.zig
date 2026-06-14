@@ -1,40 +1,58 @@
-//! Unified error types for Vigil
+//! Unified error types for Vigil.
 
-/// Common Vigil errors
+/// Common errors used across high-level Vigil APIs.
 pub const VigilError = error{
-    // Process errors
+    /// A process id or name could not be found.
     ProcessNotFound,
+    /// A process was started while already running.
     ProcessAlreadyRunning,
+    /// A child process failed to start.
     ProcessStartFailed,
+    /// A process failed to stop cleanly.
     ProcessStopFailed,
 
-    // Supervisor errors
+    /// A supervisor id or name could not be found.
     SupervisorNotFound,
+    /// A supervisor child id could not be found.
     ChildNotFound,
+    /// Restart intensity exceeded supervisor limits.
     TooManyRestarts,
+    /// Graceful shutdown exceeded its timeout.
     ShutdownTimeout,
+    /// Monitoring was started while already active.
     AlreadyMonitoring,
 
-    // Message errors
+    /// A mailbox had no available messages.
     EmptyMailbox,
+    /// A mailbox or inbox reached capacity.
     MailboxFull,
+    /// A message exceeded its TTL.
     MessageExpired,
+    /// A message exceeded the configured size limit.
     MessageTooLarge,
+    /// A message was malformed for the requested operation.
     InvalidMessage,
+    /// Delivery or request/reply waiting exceeded its timeout.
     DeliveryTimeout,
+    /// A rate limiter rejected the operation.
     RateLimitExceeded,
+    /// A message could not be delivered.
     DeliveryFailed,
 
-    // Registry errors
+    /// A registry name is already in use.
     AlreadyRegistered,
+    /// A registry name is not present.
     NotRegistered,
 
-    // Circuit breaker errors
+    /// A circuit breaker is open and rejected the call.
     CircuitOpen,
 
-    // General errors
+    /// Allocation failed.
     OutOfMemory,
+    /// Configuration values were invalid.
     InvalidConfiguration,
+    /// A generic operation timeout occurred.
     OperationTimeout,
+    /// The object is in the wrong state for the requested operation.
     InvalidState,
 };

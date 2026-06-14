@@ -4,7 +4,7 @@
 for i in {1..100}; do 
   (
     start=$(date +%s.%N)
-    response=$(printf "STATUS\n" | nc -w 2 localhost 8080)
+    response=$(printf "STATUS\n" | nc -w 2 localhost 9090)
     end=$(date +%s.%N)
     duration=$(echo "$end - $start" | bc)
     echo "Request $i: $response (${duration}s)"
