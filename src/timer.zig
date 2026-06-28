@@ -297,3 +297,26 @@ test "Timer snapshot reports active and cancelled state" {
     try std.testing.expect(cancelled.active);
     try std.testing.expect(cancelled.cancelled);
 }
+
+test "Timer sendAfter stress queues delayed messages" {
+    const allocator = std.testing.allocator;
+    const iterations = 8;
+
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = iterations });
+    defer mailbox.deinit();
+
+    for (0..iterations) |i| {
+        var id_buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "timer-{d}", .{i});
+        const msg = try Message.init(allocator, id, "timer", "payload", null, .normal, null);
+        try Timer.sendAfter(allocator, 1, &mailbox, msg);
+    }
+
+    compat.sleep(80 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(usize, iterations), mailbox.queuedCount());
+
+    for (0..iterations) |_| {
+        var received = try mailbox.receive();
+        received.deinit();
+    }
+}

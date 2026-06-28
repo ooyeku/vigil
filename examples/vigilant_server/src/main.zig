@@ -98,26 +98,85 @@ const ServerState = struct {
     metrics: ServerMetrics,
     rate_limiter: vigil.RateLimiter,
     circuit_breaker: vigil.CircuitBreaker,
+    control_inbox: *vigil.Inbox,
     is_shutting_down: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, runtime: *vigil.Runtime) !ServerState {
+        var circuit_breaker = try vigil.CircuitBreaker.init(allocator, "server", .{
+            .failure_threshold = 10,
+            .reset_timeout_ms = 5000,
+        });
+        errdefer circuit_breaker.deinit();
+
+        const control_inbox = try runtime.inbox(.{ .capacity = MAX_CONNECTIONS });
+        errdefer control_inbox.close();
+        try runtime.register("vigilant.server.control", control_inbox.mailbox);
+
         return .{
             .allocator = allocator,
             .runtime = runtime,
             .metrics = ServerMetrics.init(),
             .rate_limiter = vigil.RateLimiter.init(1000), // 1000 requests/sec
-            .circuit_breaker = try vigil.CircuitBreaker.init(allocator, "server", .{
-                .failure_threshold = 10,
-                .reset_timeout_ms = 5000,
-            }),
+            .circuit_breaker = circuit_breaker,
+            .control_inbox = control_inbox,
             .is_shutting_down = std.atomic.Value(bool).init(false),
         };
     }
 
     pub fn deinit(self: *ServerState) void {
+        self.control_inbox.close();
         self.circuit_breaker.deinit();
     }
 };
+
+fn formatStatusResponse(buffer: []u8, state: *ServerState) ![]const u8 {
+    const health = try state.runtime.healthWithCircuitBreakers(
+        state.allocator,
+        &[_]*vigil.CircuitBreaker{&state.circuit_breaker},
+    );
+
+    return std.fmt.bufPrint(buffer,
+        \\OK active={d} total={d} runtime_status={s} runtime_ready={} registered={d} overloaded={d} unhealthy_circuits={d}
+        \\
+    , .{
+        state.metrics.active_connections.load(.monotonic),
+        state.metrics.total_connections.load(.monotonic),
+        @tagName(health.status),
+        health.ready,
+        health.registered_count,
+        health.overloaded_inboxes,
+        health.unhealthy_circuit_breakers,
+    });
+}
+
+fn formatHealthResponse(buffer: []u8, state: *ServerState) ![]const u8 {
+    const health = try state.runtime.healthWithCircuitBreakers(
+        state.allocator,
+        &[_]*vigil.CircuitBreaker{&state.circuit_breaker},
+    );
+
+    return std.fmt.bufPrint(buffer,
+        \\OK
+        \\runtime_status={s}
+        \\runtime_ready={}
+        \\registered={d}
+        \\overloaded_inboxes={d}
+        \\unhealthy_circuits={d}
+        \\uptime={d}
+        \\requests={d}
+        \\circuit={s}
+        \\
+    , .{
+        @tagName(health.status),
+        health.ready,
+        health.registered_count,
+        health.overloaded_inboxes,
+        health.unhealthy_circuit_breakers,
+        state.metrics.getUptime(),
+        state.metrics.requests_handled.load(.monotonic),
+        @tagName(state.circuit_breaker.getState()),
+    });
+}
 
 // Connection handler using Vigil's messaging
 fn handleConnection(stream: net.Stream, state: *ServerState) void {
@@ -153,23 +212,10 @@ fn handleConnection(stream: net.Stream, state: *ServerState) void {
 
         // Handle commands
         if (std.mem.eql(u8, cmd, "STATUS")) {
-            const response = std.fmt.bufPrint(&buffer, "OK active={d} total={d}\n", .{
-                state.metrics.active_connections.load(.monotonic),
-                state.metrics.total_connections.load(.monotonic),
-            }) catch break;
+            const response = formatStatusResponse(&buffer, state) catch break;
             _ = stream.write(response) catch break;
         } else if (std.mem.eql(u8, cmd, "HEALTH")) {
-            const response = std.fmt.bufPrint(&buffer,
-                \\OK
-                \\uptime={d}
-                \\requests={d}
-                \\circuit={s}
-                \\
-            , .{
-                state.metrics.getUptime(),
-                state.metrics.requests_handled.load(.monotonic),
-                @tagName(state.circuit_breaker.getState()),
-            }) catch break;
+            const response = formatHealthResponse(&buffer, state) catch break;
             _ = stream.write(response) catch break;
         } else if (std.mem.eql(u8, cmd, "METRICS")) {
             const response = std.fmt.bufPrint(&buffer,
@@ -344,4 +390,42 @@ test "vigilant server treats observability commands as control traffic" {
     try std.testing.expect(isControlCommand("HEALTH"));
     try std.testing.expect(isControlCommand("METRICS"));
     try std.testing.expect(!isControlCommand("hello"));
+}
+
+test "vigilant server health response uses runtime readiness" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try vigil.runtime(allocator, .{});
+    defer runtime.deinit();
+
+    var state = try ServerState.init(allocator, &runtime);
+    defer state.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    const healthy = try formatHealthResponse(&buffer, &state);
+    try std.testing.expect(std.mem.indexOf(u8, healthy, "runtime_status=healthy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, healthy, "runtime_ready=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, healthy, "registered=1") != null);
+
+    state.circuit_breaker.forceOpen();
+    const degraded = try formatHealthResponse(&buffer, &state);
+    try std.testing.expect(std.mem.indexOf(u8, degraded, "runtime_status=degraded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, degraded, "runtime_ready=false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, degraded, "unhealthy_circuits=1") != null);
+}
+
+test "vigilant server status response includes runtime snapshot state" {
+    const allocator = std.testing.allocator;
+
+    var runtime = try vigil.runtime(allocator, .{});
+    defer runtime.deinit();
+
+    var state = try ServerState.init(allocator, &runtime);
+    defer state.deinit();
+
+    var buffer: [512]u8 = undefined;
+    const status = try formatStatusResponse(&buffer, &state);
+
+    try std.testing.expect(std.mem.indexOf(u8, status, "runtime_status=healthy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "registered=1") != null);
 }

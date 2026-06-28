@@ -200,3 +200,31 @@ test "Registry concurrent access" {
     // One should have succeeded, one failed (caught), but final state should be registered
     try std.testing.expect(registry.whereis("concurrent_proc") != null);
 }
+
+test "Registry churn registers snapshots and unregisters many names" {
+    const allocator = std.testing.allocator;
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 32 });
+    defer mailbox.deinit();
+
+    const iterations = 128;
+    for (0..iterations) |i| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "churn.proc.{d}", .{i});
+        try registry.register(name, &mailbox);
+    }
+
+    var snapshot = try registry.snapshot(allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, iterations), snapshot.entries.len);
+
+    for (0..iterations) |i| {
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "churn.proc.{d}", .{i});
+        registry.unregister(name);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), registry.count());
+}

@@ -360,3 +360,33 @@ test "ProcessGroup snapshot reports members and queue depth" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.members[0].queue_depth);
     try std.testing.expect(!snapshot.members[0].closed);
 }
+
+test "ProcessGroup broadcast stress delivers to all members" {
+    const allocator = std.testing.allocator;
+    const member_count = 4;
+    const iterations = 32;
+
+    var group = try ProcessGroup.init(allocator, "stress-workers");
+    defer group.deinit();
+
+    var inboxes: [member_count]*Inbox = undefined;
+    for (&inboxes, 0..) |*slot, i| {
+        slot.* = try Inbox.init(allocator);
+        const id = try std.fmt.allocPrint(allocator, "worker-{d}", .{i});
+        defer allocator.free(id);
+        try group.add(id, slot.*);
+    }
+    defer for (inboxes) |inbox| {
+        inbox.close();
+    };
+
+    for (0..iterations) |_| {
+        const result = try group.broadcast("payload");
+        try std.testing.expectEqual(@as(usize, member_count), result.delivered);
+        try std.testing.expectEqual(@as(usize, 0), result.failed);
+    }
+
+    for (inboxes) |inbox| {
+        try std.testing.expectEqual(iterations, inbox.mailbox.queuedCount());
+    }
+}

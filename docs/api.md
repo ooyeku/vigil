@@ -103,6 +103,7 @@ if (rt.whereis("worker")) |mailbox| {
 | `whereis(name)` | Look up a registered mailbox |
 | `snapshot(allocator)` | Capture registered mailbox stats, queue depth, handler count, and hook count |
 | `health(allocator)` | Return compact health/readiness status |
+| `healthWithCircuitBreakers(allocator, breakers)` | Return readiness with caller-owned circuit breakers folded in |
 | `onShutdown(hook)` | Register a shutdown hook |
 | `shutdown()` | Mark runtime stopped and run shutdown hooks |
 
@@ -116,6 +117,9 @@ shutdown hook count. Call `deinit()` on the snapshot when finished.
 `Runtime.health()` returns a compact readiness summary. A running runtime is
 `healthy` when registered inboxes are below capacity, `degraded` when one or
 more registered inboxes are full, and `stopped` after shutdown.
+Use `Runtime.healthWithCircuitBreakers()` when an app wants readiness to also
+account for caller-owned dependency circuit breakers; open breakers degrade the
+report and set `ready` to false.
 
 Standalone runtime primitives expose focused snapshots too:
 

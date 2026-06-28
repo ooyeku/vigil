@@ -689,3 +689,52 @@ test "InboxBuilder drop_oldest backpressure replaces existing message" {
     try std.testing.expectEqualStrings("second", msg.payload.?);
     try std.testing.expectEqual(@as(?Message, null), try inbox_ptr.recvTimeout(5));
 }
+
+test "Inbox supports concurrent producer and consumer churn" {
+    const allocator = std.heap.smp_allocator;
+    const iterations = 128;
+
+    var inbox_ptr = try inboxBuilder(allocator)
+        .capacity(iterations + 4)
+        .build();
+    defer inbox_ptr.close();
+
+    const ProducerContext = struct {
+        target: *Inbox,
+        count: usize,
+    };
+    const ConsumerContext = struct {
+        target: *Inbox,
+        count: usize,
+    };
+
+    const producer = struct {
+        fn run(ctx: ProducerContext) void {
+            for (0..ctx.count) |_| {
+                ctx.target.send("payload") catch return;
+            }
+        }
+    }.run;
+    const consumer = struct {
+        fn run(ctx: ConsumerContext) void {
+            for (0..ctx.count) |_| {
+                var msg = ctx.target.recv() catch return;
+                msg.deinit();
+            }
+        }
+    }.run;
+
+    const producer_thread = try std.Thread.spawn(.{}, producer, .{ProducerContext{
+        .target = inbox_ptr,
+        .count = iterations,
+    }});
+    const consumer_thread = try std.Thread.spawn(.{}, consumer, .{ConsumerContext{
+        .target = inbox_ptr,
+        .count = iterations,
+    }});
+
+    producer_thread.join();
+    consumer_thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), inbox_ptr.mailbox.queuedCount());
+}

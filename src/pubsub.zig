@@ -455,3 +455,40 @@ test "PubSubBroker snapshot reports subscribers and pattern counts" {
     try std.testing.expectEqual(@as(usize, 0), snapshot.subscribers[0].queue_depth);
     try std.testing.expect(!snapshot.subscribers[0].closed);
 }
+
+test "PubSubBroker fanout stress reports all deliveries" {
+    const allocator = std.testing.allocator;
+    const subscriber_count = 3;
+    const iterations = 32;
+
+    var broker = PubSubBroker.init(allocator);
+    defer broker.deinit();
+
+    var inboxes: [subscriber_count]*Inbox = undefined;
+    var subscribers: [subscriber_count]Subscriber = undefined;
+
+    for (&inboxes, &subscribers) |*inbox_slot, *subscriber_slot| {
+        inbox_slot.* = try Inbox.init(allocator);
+        subscriber_slot.* = Subscriber.init(allocator, inbox_slot.*);
+        try subscriber_slot.subscribe(&[_][]const u8{"stress.#"});
+        try broker.subscribe(subscriber_slot);
+    }
+    defer for (&subscribers) |*subscriber| {
+        subscriber.deinit();
+    };
+    defer for (inboxes) |inbox| {
+        inbox.close();
+    };
+
+    var delivered: usize = 0;
+    for (0..iterations) |_| {
+        const result = try broker.publish("stress.event", "payload");
+        delivered += result.delivered;
+        try std.testing.expectEqual(@as(usize, 0), result.failed);
+    }
+
+    try std.testing.expectEqual(@as(usize, subscriber_count * iterations), delivered);
+    for (inboxes) |inbox| {
+        try std.testing.expectEqual(iterations, inbox.mailbox.queuedCount());
+    }
+}

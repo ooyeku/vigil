@@ -5,6 +5,7 @@ const shutdown_mod = @import("shutdown.zig");
 const inbox_api = @import("api/inbox.zig");
 const supervisor_builder = @import("api/supervisor_builder.zig");
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
+const circuit_breaker = @import("circuit_breaker.zig");
 
 /// Feature flags for an owned Vigil runtime.
 ///
@@ -78,6 +79,8 @@ pub const RuntimeHealth = struct {
     registered_count: usize,
     /// Number of registered inboxes at or above capacity.
     overloaded_inboxes: usize,
+    /// Number of supplied circuit breakers that are currently open.
+    unhealthy_circuit_breakers: usize,
     /// Number of telemetry handlers registered on this runtime.
     telemetry_handler_count: usize,
     /// Number of shutdown hooks registered on this runtime.
@@ -229,9 +232,38 @@ pub const Runtime = struct {
             .ready = status == .healthy,
             .registered_count = state.registered_count,
             .overloaded_inboxes = overloaded_inboxes,
+            .unhealthy_circuit_breakers = 0,
             .telemetry_handler_count = state.telemetry_handler_count,
             .shutdown_hook_count = state.shutdown_hook_count,
         };
+    }
+
+    /// Return health/readiness while folding in caller-owned circuit breakers.
+    ///
+    /// Vigil does not own application circuit breakers, but services often need
+    /// readiness to account for dependency state. Open breakers mark the report
+    /// degraded and not ready.
+    pub fn healthWithCircuitBreakers(
+        self: *Runtime,
+        allocator: std.mem.Allocator,
+        breakers: []const *circuit_breaker.CircuitBreaker,
+    ) !RuntimeHealth {
+        var report = try self.health(allocator);
+
+        var unhealthy_circuit_breakers: usize = 0;
+        for (breakers) |breaker| {
+            if (breaker.getState() == .open) {
+                unhealthy_circuit_breakers += 1;
+            }
+        }
+
+        report.unhealthy_circuit_breakers = unhealthy_circuit_breakers;
+        if (unhealthy_circuit_breakers > 0 and report.status == .healthy) {
+            report.status = .degraded;
+            report.ready = false;
+        }
+
+        return report;
     }
 
     /// Register a function to run during `shutdown()`.
@@ -377,4 +409,22 @@ test "Runtime health reports degraded queues and stopped runtime" {
     const stopped = try rt.health(std.testing.allocator);
     try std.testing.expectEqual(RuntimeHealthStatus.stopped, stopped.status);
     try std.testing.expect(!stopped.ready);
+}
+
+test "Runtime health can include unhealthy circuit breakers" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var breaker = try @import("circuit_breaker.zig").CircuitBreaker.init(std.testing.allocator, "dependency", .{});
+    defer breaker.deinit();
+    breaker.forceOpen();
+
+    const health_report = try rt.healthWithCircuitBreakers(
+        std.testing.allocator,
+        &[_]*@import("circuit_breaker.zig").CircuitBreaker{&breaker},
+    );
+
+    try std.testing.expectEqual(RuntimeHealthStatus.degraded, health_report.status);
+    try std.testing.expect(!health_report.ready);
+    try std.testing.expectEqual(@as(usize, 1), health_report.unhealthy_circuit_breakers);
 }

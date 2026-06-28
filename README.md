@@ -202,7 +202,7 @@ cd benchmarks/vigil_bench
 zig build run -Doptimize=ReleaseSafe -- --iterations 10000
 ```
 
-The v2.1 benchmark harness currently measures inbox send/receive, registry lookup, telemetry emission, timer scheduling, process group routing, and pub/sub fanout.
+The v2.1 benchmark harness reports throughput, average latency, and observed allocator calls per operation for inbox send/receive, registry lookup/register, telemetry emission, timer scheduling, process-group routing/broadcast, pub/sub fanout, request/reply correlation, and concurrent inbox contention. See [benchmarks/vigil_bench](benchmarks/vigil_bench) for the current baseline.
 
 ## Documentation
 
