@@ -62,6 +62,13 @@ pub const ShutdownManager = struct {
         try self.hooks.append(self.allocator, hook);
     }
 
+    /// Return the number of registered shutdown hooks.
+    pub fn hookCount(self: *ShutdownManager) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.hooks.items.len;
+    }
+
     /// Execute registered hooks according to `options`.
     ///
     /// Hook execution is synchronous. If the timeout is exceeded, remaining

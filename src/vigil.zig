@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const legacy = @import("legacy.zig");
+const build_options = @import("vigil_build_options");
 
 /// Fluent message construction API. Most callers use the root `msg`
 /// shortcut rather than importing this module directly.
@@ -112,6 +113,12 @@ pub const PresetConfig = presets.PresetConfig;
 pub const Runtime = runtime_api.Runtime;
 /// Runtime feature flags.
 pub const RuntimeOptions = runtime_api.RuntimeOptions;
+/// Owned runtime-state snapshot for debugging and health reporting.
+pub const RuntimeSnapshot = runtime_api.RuntimeSnapshot;
+/// Compact runtime health/readiness summary.
+pub const RuntimeHealth = runtime_api.RuntimeHealth;
+/// Coarse runtime health state.
+pub const RuntimeHealthStatus = runtime_api.RuntimeHealthStatus;
 /// Create an owned runtime instance.
 pub const runtime = runtime_api.runtime;
 
@@ -137,25 +144,45 @@ pub const FlowControlledInbox = flow_control.FlowControlledInbox;
 pub const request = request_reply.request;
 /// Build a reply message that preserves the request correlation id.
 pub const reply = request_reply.reply;
+/// Options for a request/reply exchange.
+pub const RequestOptions = request_reply.RequestOptions;
+/// Reply mailbox for awaiting correlated responses.
+pub const ReplyMailbox = request_reply.ReplyMailbox;
+/// Value snapshot of reply-mailbox state.
+pub const ReplyMailboxSnapshot = request_reply.ReplyMailboxSnapshot;
 
 /// Fail-fast guard around unreliable dependencies.
 pub const CircuitBreaker = circuit_breaker.CircuitBreaker;
+/// Configuration for circuit breaker thresholds and recovery behavior.
+pub const CircuitBreakerConfig = circuit_breaker.CircuitBreakerConfig;
 /// Public state of a circuit breaker.
 pub const CircuitState = circuit_breaker.CircuitState;
+/// Value snapshot of circuit-breaker state.
+pub const CircuitBreakerSnapshot = circuit_breaker.CircuitBreakerSnapshot;
 
 /// Group of inboxes that can receive broadcast or routed messages.
 pub const ProcessGroup = process_group.ProcessGroup;
 /// Delivery counts from `ProcessGroup.broadcast`.
 pub const BroadcastResult = process_group.BroadcastResult;
+/// Owned snapshot of process-group membership.
+pub const ProcessGroupSnapshot = process_group.ProcessGroupSnapshot;
+/// Snapshot of one process-group member.
+pub const ProcessGroupMemberSnapshot = process_group.ProcessGroupMemberSnapshot;
 
 /// Publish through the optional global pub/sub broker.
 pub const publish = pubsub.publish;
 /// Create and optionally register a global pub/sub subscriber.
 pub const subscribe = pubsub.subscribe;
+/// Topic-based pub/sub broker.
+pub const PubSubBroker = pubsub.PubSubBroker;
 /// Inbox-backed topic subscriber.
 pub const Subscriber = pubsub.Subscriber;
 /// Delivery counts from a pub/sub publish operation.
 pub const PublishResult = pubsub.PublishResult;
+/// Owned snapshot of broker subscribers.
+pub const PubSubBrokerSnapshot = pubsub.PubSubBrokerSnapshot;
+/// Snapshot of one pub/sub subscriber.
+pub const SubscriberSnapshot = pubsub.SubscriberSnapshot;
 
 /// Type-erased checkpoint persistence interface.
 pub const Checkpointer = checkpoint.Checkpointer;
@@ -200,13 +227,15 @@ pub const ProcessMailbox = legacy.ProcessMailbox;
 pub const Registry = @import("registry.zig").Registry;
 /// Timer helper for delayed and periodic callbacks.
 pub const Timer = @import("timer.zig").Timer;
+/// Value snapshot of timer state.
+pub const TimerSnapshot = @import("timer.zig").TimerSnapshot;
 
 /// Return the semantic version of the public root API.
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {
     return .{
-        .major = 2,
-        .minor = 0,
-        .patch = 0,
+        .major = @intCast(build_options.version.major),
+        .minor = @intCast(build_options.version.minor),
+        .patch = @intCast(build_options.version.patch),
     };
 }
 
@@ -224,12 +253,20 @@ test "v2 root module exports runtime and version" {
     try std.testing.expect(@hasDecl(@This(), "Runtime"));
     try std.testing.expect(@hasDecl(@This(), "RuntimeOptions"));
     try std.testing.expect(@hasDecl(@This(), "runtime"));
+    try std.testing.expect(@hasDecl(@This(), "RuntimeSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "RuntimeHealth"));
+    try std.testing.expect(@hasDecl(@This(), "RuntimeHealthStatus"));
+    try std.testing.expect(@hasDecl(@This(), "ProcessGroupSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "PubSubBrokerSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "CircuitBreakerSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "TimerSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "ReplyMailboxSnapshot"));
     try std.testing.expect(@hasDecl(@This(), "distributed_protocol"));
 
     const version = getVersion();
-    try std.testing.expectEqual(@as(u32, 2), version.major);
-    try std.testing.expectEqual(@as(u32, 0), version.minor);
-    try std.testing.expectEqual(@as(u32, 0), version.patch);
+    try std.testing.expectEqual(@as(u32, @intCast(build_options.version.major)), version.major);
+    try std.testing.expectEqual(@as(u32, @intCast(build_options.version.minor)), version.minor);
+    try std.testing.expectEqual(@as(u32, @intCast(build_options.version.patch)), version.patch);
 }
 
 test "library root has no runnable entrypoint" {

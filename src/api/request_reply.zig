@@ -27,6 +27,14 @@ pub const RequestOptions = struct {
     timeout_ms: u32 = 5000,
 };
 
+/// Value snapshot of reply-mailbox state.
+pub const ReplyMailboxSnapshot = struct {
+    /// Number of active correlation ids being waited on.
+    pending_count: usize,
+    /// Number of non-matching messages temporarily stashed.
+    stashed_count: usize,
+};
+
 /// Reply mailbox for handling responses.
 ///
 /// Non-matching messages are re-queued to avoid dropping messages
@@ -77,6 +85,17 @@ pub const ReplyMailbox = struct {
         self.stash.deinit(self.allocator);
     }
 
+    /// Return a value snapshot of pending replies and stashed messages.
+    pub fn snapshot(self: *ReplyMailbox) ReplyMailboxSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return .{
+            .pending_count = self.correlation_map.count(),
+            .stashed_count = self.stash.items.len,
+        };
+    }
+
     /// Flush stashed (non-matching) messages back to the inbox so they
     /// are available for other consumers or future waitForReply calls.
     fn flushStash(self: *ReplyMailbox) void {
@@ -109,18 +128,30 @@ pub const ReplyMailbox = struct {
         correlation_id: []const u8,
         timeout_ms: u32,
     ) !Message {
-        const event = try self.allocator.create(ResetEvent);
-        errdefer self.allocator.destroy(event);
-        event.* = .{};
+        const pending = blk: {
+            const PendingReply = struct {
+                event: *ResetEvent,
+                correlation_id: []const u8,
+            };
 
-        const corr_id_copy = try self.allocator.dupe(u8, correlation_id);
-        errdefer self.allocator.free(corr_id_copy);
+            const event = try self.allocator.create(ResetEvent);
+            errdefer self.allocator.destroy(event);
+            event.* = .{};
 
-        {
+            const corr_id_copy = try self.allocator.dupe(u8, correlation_id);
+            errdefer self.allocator.free(corr_id_copy);
+
             self.mutex.lock();
             defer self.mutex.unlock();
             try self.correlation_map.put(corr_id_copy, event);
-        }
+
+            break :blk PendingReply{
+                .event = event,
+                .correlation_id = corr_id_copy,
+            };
+        };
+        const event = pending.event;
+        const corr_id_copy = pending.correlation_id;
 
         // Helper to cleanup map entry using the copied key
         const cleanup = struct {
@@ -219,10 +250,6 @@ pub fn request(
     );
     defer allocator.free(correlation_id);
 
-    // Set correlation ID on request
-    var mutable_msg = request_msg;
-    try mutable_msg.setCorrelationId(correlation_id);
-
     // Create reply mailbox
     var reply_mailbox = ReplyMailbox.init(allocator, inbox);
     defer reply_mailbox.deinit();
@@ -244,10 +271,13 @@ pub fn reply(request_msg: Message, response_payload: []const u8, allocator: std.
         return MessageError.InvalidMessage;
     }
 
+    const response_id = try std.fmt.allocPrint(allocator, "resp_{s}", .{request_msg.id});
+    defer allocator.free(response_id);
+
     // Create response message with same correlation ID
     var response = try Message.init(
         allocator,
-        try std.fmt.allocPrint(allocator, "resp_{s}", .{request_msg.id}),
+        response_id,
         request_msg.sender,
         response_payload,
         null,
@@ -287,4 +317,48 @@ test "Request/Reply basic flow" {
     try std.testing.expect(response.metadata.correlation_id != null);
     try std.testing.expectEqualSlices(u8, "corr123", response.metadata.correlation_id.?);
     try std.testing.expectEqualSlices(u8, "response_data", response.payload.?);
+}
+
+test "ReplyMailbox snapshot reports pending and stashed counts" {
+    const allocator = std.testing.allocator;
+
+    var inbox = try Inbox.init(allocator);
+    defer inbox.close();
+
+    var reply_mailbox = ReplyMailbox.init(allocator, inbox);
+    defer reply_mailbox.deinit();
+
+    const snapshot = reply_mailbox.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), snapshot.pending_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.stashed_count);
+}
+
+test "reply does not leak temporary response id" {
+    const allocator = std.testing.allocator;
+
+    var request_msg = try Message.init(allocator, "req2", "client", "request", null, .normal, null);
+    defer request_msg.deinit();
+    try request_msg.setCorrelationId("corr456");
+
+    var response = try reply(request_msg, "response_data", allocator);
+    defer response.deinit();
+
+    try std.testing.expectEqualSlices(u8, "corr456", response.metadata.correlation_id.?);
+}
+
+test "request timeout preserves caller-owned correlation id" {
+    const allocator = std.testing.allocator;
+
+    var inbox = try Inbox.init(allocator);
+    defer inbox.close();
+
+    var request_msg = try Message.init(allocator, "req3", "client", "request", null, .normal, null);
+    defer request_msg.deinit();
+    try request_msg.setCorrelationId("caller-owned");
+
+    try std.testing.expectError(
+        MessageError.DeliveryTimeout,
+        request(inbox, request_msg, .{ .timeout_ms = 1 }),
+    );
+    try std.testing.expectEqualSlices(u8, "caller-owned", request_msg.metadata.correlation_id.?);
 }

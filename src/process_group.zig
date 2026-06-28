@@ -37,6 +37,38 @@ pub const GroupMember = struct {
     inbox: *Inbox,
 };
 
+/// Snapshot of one process-group member.
+pub const ProcessGroupMemberSnapshot = struct {
+    /// Stable member id.
+    id: []const u8,
+    /// Current queued message count for the member inbox.
+    queue_depth: usize,
+    /// Whether the member inbox has been closed.
+    closed: bool,
+};
+
+/// Owned snapshot of process-group membership.
+pub const ProcessGroupSnapshot = struct {
+    allocator: std.mem.Allocator,
+    /// Copied process-group name.
+    name: []const u8,
+    /// Number of registered members.
+    member_count: usize,
+    /// Next member index used for round-robin routing.
+    round_robin_index: usize,
+    /// Per-member snapshots.
+    members: []ProcessGroupMemberSnapshot,
+
+    /// Release copied member ids, group name, and snapshot storage.
+    pub fn deinit(self: *ProcessGroupSnapshot) void {
+        for (self.members) |member| {
+            self.allocator.free(member.id);
+        }
+        self.allocator.free(self.members);
+        self.allocator.free(self.name);
+    }
+};
+
 /// Thread-safe collection of named inboxes.
 ///
 /// The group owns copied member ids and its own name. It does not own member
@@ -120,6 +152,46 @@ pub const ProcessGroup = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.members.items.len;
+    }
+
+    /// Capture an owned snapshot of process-group membership.
+    ///
+    /// Registered inboxes must remain alive while this function runs. The
+    /// caller owns the returned snapshot and must call `deinit()`.
+    pub fn snapshot(self: *ProcessGroup, allocator: std.mem.Allocator) !ProcessGroupSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const name_copy = try allocator.dupe(u8, self.name);
+        errdefer allocator.free(name_copy);
+
+        const members = try allocator.alloc(ProcessGroupMemberSnapshot, self.members.items.len);
+        errdefer allocator.free(members);
+
+        var written: usize = 0;
+        errdefer {
+            for (members[0..written]) |member| {
+                allocator.free(member.id);
+            }
+        }
+
+        for (self.members.items) |member| {
+            const id_copy = try allocator.dupe(u8, member.id);
+            members[written] = .{
+                .id = id_copy,
+                .queue_depth = member.inbox.mailbox.queuedCount(),
+                .closed = member.inbox.isClosed(),
+            };
+            written += 1;
+        }
+
+        return .{
+            .allocator = allocator,
+            .name = name_copy,
+            .member_count = members.len,
+            .round_robin_index = self.round_robin_index,
+            .members = members,
+        };
     }
 
     /// Broadcast a message to all members.
@@ -260,4 +332,31 @@ test "ProcessGroup round robin" {
     if (msg2) |m| {
         m.deinit();
     }
+}
+
+test "ProcessGroup snapshot reports members and queue depth" {
+    const allocator = std.testing.allocator;
+
+    var group = try ProcessGroup.init(allocator, "workers");
+    defer group.deinit();
+
+    var inbox1 = try Inbox.init(allocator);
+    defer inbox1.close();
+
+    var inbox2 = try Inbox.init(allocator);
+    defer inbox2.close();
+
+    try inbox1.send("queued");
+    try group.add("worker1", inbox1);
+    try group.add("worker2", inbox2);
+
+    var snapshot = try group.snapshot(allocator);
+    defer snapshot.deinit();
+
+    try std.testing.expectEqualStrings("workers", snapshot.name);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.member_count);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.members.len);
+    try std.testing.expectEqualStrings("worker1", snapshot.members[0].id);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.members[0].queue_depth);
+    try std.testing.expect(!snapshot.members[0].closed);
 }

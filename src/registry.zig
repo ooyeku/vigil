@@ -15,6 +15,32 @@ pub const Registry = struct {
     /// Allocator for copied names and map storage.
     allocator: std.mem.Allocator,
 
+    /// Snapshot of one registered mailbox.
+    pub const RegisteredMailboxSnapshot = struct {
+        /// Registered process name.
+        name: []const u8,
+        /// Current queued message count.
+        queue_depth: usize,
+        /// Configured mailbox capacity.
+        capacity: usize,
+        /// Mailbox usage statistics.
+        stats: ProcessMailbox.MailboxStats,
+    };
+
+    /// Owned snapshot of registry entries.
+    pub const Snapshot = struct {
+        allocator: std.mem.Allocator,
+        entries: []RegisteredMailboxSnapshot,
+
+        /// Release copied names and snapshot storage.
+        pub fn deinit(self: *Snapshot) void {
+            for (self.entries) |entry| {
+                self.allocator.free(entry.name);
+            }
+            self.allocator.free(self.entries);
+        }
+    };
+
     /// Initialize an empty registry.
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{
@@ -69,6 +95,49 @@ pub const Registry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.map.get(name);
+    }
+
+    /// Return the number of registered names.
+    pub fn count(self: *Registry) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.map.count();
+    }
+
+    /// Capture an owned snapshot of registered names and mailbox stats.
+    ///
+    /// Registered mailboxes must remain alive while this function runs.
+    pub fn snapshot(self: *Registry, allocator: std.mem.Allocator) !Snapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const entries = try allocator.alloc(RegisteredMailboxSnapshot, self.map.count());
+        errdefer allocator.free(entries);
+
+        var written: usize = 0;
+        errdefer {
+            for (entries[0..written]) |entry| {
+                allocator.free(entry.name);
+            }
+        }
+
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            const name_copy = try allocator.dupe(u8, entry.key_ptr.*);
+            const mailbox = entry.value_ptr.*;
+            entries[written] = .{
+                .name = name_copy,
+                .queue_depth = mailbox.queuedCount(),
+                .capacity = mailbox.config.capacity,
+                .stats = mailbox.getStats(),
+            };
+            written += 1;
+        }
+
+        return .{
+            .allocator = allocator,
+            .entries = entries,
+        };
     }
 };
 

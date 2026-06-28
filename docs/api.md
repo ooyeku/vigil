@@ -80,6 +80,14 @@ defer inbox.close();
 
 try inbox.send("hello");
 
+var snapshot = try rt.snapshot(allocator);
+defer snapshot.deinit();
+
+const health = try rt.health(allocator);
+if (!health.ready) {
+    // Surface degraded runtime state in your status endpoint.
+}
+
 if (rt.whereis("worker")) |mailbox| {
     _ = mailbox;
 }
@@ -93,8 +101,29 @@ if (rt.whereis("worker")) |mailbox| {
 | `supervisor()` | Create a supervisor builder using runtime options |
 | `register(name, mailbox)` | Register a mailbox in the runtime registry |
 | `whereis(name)` | Look up a registered mailbox |
+| `snapshot(allocator)` | Capture registered mailbox stats, queue depth, handler count, and hook count |
+| `health(allocator)` | Return compact health/readiness status |
 | `onShutdown(hook)` | Register a shutdown hook |
 | `shutdown()` | Mark runtime stopped and run shutdown hooks |
+
+### Runtime Introspection
+
+`Runtime.snapshot()` returns an owned snapshot for debugging and health endpoints.
+It includes whether the runtime is running, registered process names, mailbox
+queue depth, mailbox capacity, mailbox stats, telemetry handler count, and
+shutdown hook count. Call `deinit()` on the snapshot when finished.
+
+`Runtime.health()` returns a compact readiness summary. A running runtime is
+`healthy` when registered inboxes are below capacity, `degraded` when one or
+more registered inboxes are full, and `stopped` after shutdown.
+
+Standalone runtime primitives expose focused snapshots too:
+
+- `ProcessGroup.snapshot(allocator)` reports group name, members, queue depth, and closed inbox state.
+- `PubSubBroker.snapshot(allocator)` reports subscriber count, total pattern count, queue depth, and closed inbox state.
+- `CircuitBreaker.snapshot()` reports breaker state, counters, timestamps, and thresholds.
+- `Timer.snapshot()` reports active, cancelled, repeat, and interval state.
+- `ReplyMailbox.snapshot()` reports pending correlation ids and stashed messages.
 
 ### Migrating from pre-2.0 root helpers
 
@@ -1106,6 +1135,10 @@ zig build run
 # Run the vigilant server example
 cd examples/vigilant_server
 zig build run
+
+# Run the benchmark harness
+cd benchmarks/vigil_bench
+zig build run -Doptimize=ReleaseSafe -- --iterations 10000
 ```
 
 ---

@@ -31,6 +31,24 @@ pub const CircuitBreakerConfig = struct {
     half_open_success_threshold: u32 = 2,
 };
 
+/// Value snapshot of circuit-breaker state.
+pub const CircuitBreakerSnapshot = struct {
+    /// Borrowed circuit id. Valid while the breaker remains alive.
+    circuit_id: []const u8,
+    /// Current circuit state.
+    state: CircuitState,
+    /// Consecutive failure count while closed.
+    failure_count: u32,
+    /// Successful probe count while half-open.
+    success_count: u32,
+    /// Last failure timestamp in milliseconds.
+    last_failure_time_ms: i64,
+    /// Calls already admitted while half-open.
+    half_open_request_count: u32,
+    /// Breaker thresholds and timing rules.
+    config: CircuitBreakerConfig,
+};
+
 /// Thread-safe circuit breaker.
 ///
 /// The breaker owns a copied `circuit_id` for telemetry metadata. Call
@@ -260,6 +278,22 @@ pub const CircuitBreaker = struct {
         return self.failure_count;
     }
 
+    /// Return a value snapshot of breaker state and counters.
+    pub fn snapshot(self: *CircuitBreaker) CircuitBreakerSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return .{
+            .circuit_id = self.circuit_id,
+            .state = self.state,
+            .failure_count = self.failure_count,
+            .success_count = self.success_count,
+            .last_failure_time_ms = self.last_failure_time_ms,
+            .half_open_request_count = self.half_open_request_count,
+            .config = self.config,
+        };
+    }
+
     /// Emit telemetry event
     fn emitEvent(self: *CircuitBreaker, event_type: telemetry.EventType) void {
         if (telemetry.getGlobal()) |t| {
@@ -378,4 +412,29 @@ test "CircuitBreaker half-open recovery" {
     breaker.callError(successFn) catch {};
     breaker.callError(successFn) catch {};
     try std.testing.expect(breaker.getState() == .closed);
+}
+
+test "CircuitBreaker snapshot reports state and counters" {
+    const allocator = std.testing.allocator;
+
+    var breaker = try CircuitBreaker.init(allocator, "payments", .{
+        .failure_threshold = 2,
+        .reset_timeout_ms = 100,
+    });
+    defer breaker.deinit();
+
+    const failFn = struct {
+        fn call() anyerror!void {
+            return error.TestError;
+        }
+    }.call;
+
+    breaker.callError(failFn) catch {};
+    const snapshot = breaker.snapshot();
+
+    try std.testing.expectEqualStrings("payments", snapshot.circuit_id);
+    try std.testing.expectEqual(CircuitState.closed, snapshot.state);
+    try std.testing.expectEqual(@as(u32, 1), snapshot.failure_count);
+    try std.testing.expectEqual(@as(u32, 0), snapshot.success_count);
+    try std.testing.expectEqual(@as(u32, 2), snapshot.config.failure_threshold);
 }

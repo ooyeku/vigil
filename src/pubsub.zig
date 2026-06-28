@@ -19,6 +19,32 @@ pub const PublishResult = struct {
     failed: usize = 0,
 };
 
+/// Snapshot of one subscriber.
+pub const SubscriberSnapshot = struct {
+    /// Number of topic patterns registered on the subscriber.
+    pattern_count: usize,
+    /// Current queued message count for the subscriber inbox.
+    queue_depth: usize,
+    /// Whether the subscriber inbox has been closed.
+    closed: bool,
+};
+
+/// Owned snapshot of broker subscribers.
+pub const PubSubBrokerSnapshot = struct {
+    allocator: std.mem.Allocator,
+    /// Number of subscriber pointers registered with the broker.
+    subscriber_count: usize,
+    /// Total topic patterns across all subscribers.
+    total_pattern_count: usize,
+    /// Per-subscriber snapshots.
+    subscribers: []SubscriberSnapshot,
+
+    /// Release snapshot storage.
+    pub fn deinit(self: *PubSubBrokerSnapshot) void {
+        self.allocator.free(self.subscribers);
+    }
+};
+
 /// Topic pattern used by a subscriber.
 ///
 /// Pattern memory is owned by `Subscriber` when registered through
@@ -125,6 +151,25 @@ pub const Subscriber = struct {
         }
         return false;
     }
+
+    /// Return the number of patterns registered on this subscriber.
+    pub fn patternCount(self: *Subscriber) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.patterns.items.len;
+    }
+
+    /// Return a value snapshot of subscriber state.
+    pub fn snapshot(self: *Subscriber) SubscriberSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return .{
+            .pattern_count = self.patterns.items.len,
+            .queue_depth = self.inbox.mailbox.queuedCount(),
+            .closed = self.inbox.isClosed(),
+        };
+    }
 };
 
 /// Thread-safe broker for topic-based fanout.
@@ -163,6 +208,13 @@ pub const PubSubBroker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.subscribers.append(self.allocator, subscriber);
+    }
+
+    /// Return the number of subscribers registered with this broker.
+    pub fn subscriberCount(self: *PubSubBroker) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.subscribers.items.len;
     }
 
     /// Unregister a subscriber pointer if present.
@@ -213,6 +265,38 @@ pub const PubSubBroker = struct {
             }
         }
         return result;
+    }
+
+    /// Capture an owned snapshot of broker subscribers.
+    ///
+    /// Subscribers and their inboxes must remain alive while this function
+    /// runs. The caller owns the returned snapshot and must call `deinit()`.
+    pub fn snapshot(self: *PubSubBroker, allocator: std.mem.Allocator) !PubSubBrokerSnapshot {
+        self.mutex.lock();
+        const subscribers_copy = allocator.alloc(*Subscriber, self.subscribers.items.len) catch {
+            self.mutex.unlock();
+            return error.OutOfMemory;
+        };
+        @memcpy(subscribers_copy, self.subscribers.items);
+        self.mutex.unlock();
+        defer allocator.free(subscribers_copy);
+
+        const subscribers = try allocator.alloc(SubscriberSnapshot, subscribers_copy.len);
+        errdefer allocator.free(subscribers);
+
+        var total_pattern_count: usize = 0;
+        for (subscribers_copy, 0..) |subscriber, i| {
+            const subscriber_snapshot = subscriber.snapshot();
+            subscribers[i] = subscriber_snapshot;
+            total_pattern_count += subscriber_snapshot.pattern_count;
+        }
+
+        return .{
+            .allocator = allocator,
+            .subscriber_count = subscribers.len,
+            .total_pattern_count = total_pattern_count,
+            .subscribers = subscribers,
+        };
     }
 };
 
@@ -344,4 +428,30 @@ test "PubSubBroker publish/subscribe" {
         defer msg.deinit();
         try std.testing.expectEqualSlices(u8, "alert1", msg.payload.?);
     }
+}
+
+test "PubSubBroker snapshot reports subscribers and pattern counts" {
+    const allocator = std.testing.allocator;
+
+    var broker = PubSubBroker.init(allocator);
+    defer broker.deinit();
+
+    var inbox = try Inbox.init(allocator);
+    defer inbox.close();
+
+    var subscriber = Subscriber.init(allocator, inbox);
+    defer subscriber.deinit();
+    try subscriber.subscribe(&[_][]const u8{ "orders.*", "system.#" });
+
+    try broker.subscribe(&subscriber);
+
+    var snapshot = try broker.snapshot(allocator);
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.subscriber_count);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.total_pattern_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.subscribers.len);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.subscribers[0].pattern_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.subscribers[0].queue_depth);
+    try std.testing.expect(!snapshot.subscribers[0].closed);
 }

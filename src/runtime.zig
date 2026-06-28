@@ -32,6 +32,58 @@ pub const InboxOptions = struct {
     default_ttl_ms: ?u32 = 30_000,
 };
 
+/// Per-process information captured by a runtime snapshot.
+pub const RuntimeProcessSnapshot = Registry.RegisteredMailboxSnapshot;
+
+/// Owned runtime snapshot for debugging and health reporting.
+pub const RuntimeSnapshot = struct {
+    allocator: std.mem.Allocator,
+    /// Whether the runtime is currently running.
+    running: bool,
+    /// Number of registered process names.
+    registered_count: usize,
+    /// Number of telemetry handlers registered on this runtime.
+    telemetry_handler_count: usize,
+    /// Number of shutdown hooks registered on this runtime.
+    shutdown_hook_count: usize,
+    /// Registered mailbox snapshots.
+    processes: []RuntimeProcessSnapshot,
+
+    /// Release copied process names and snapshot storage.
+    pub fn deinit(self: *RuntimeSnapshot) void {
+        for (self.processes) |process| {
+            self.allocator.free(process.name);
+        }
+        self.allocator.free(self.processes);
+    }
+};
+
+/// Coarse runtime health state.
+pub const RuntimeHealthStatus = enum {
+    /// Runtime is running and no registered queues are full.
+    healthy,
+    /// Runtime is running but one or more registered queues need attention.
+    degraded,
+    /// Runtime has been shut down or deinitialized.
+    stopped,
+};
+
+/// Health/readiness summary for a runtime.
+pub const RuntimeHealth = struct {
+    /// Health state.
+    status: RuntimeHealthStatus,
+    /// Whether the runtime should be considered ready for new work.
+    ready: bool,
+    /// Number of registered process names.
+    registered_count: usize,
+    /// Number of registered inboxes at or above capacity.
+    overloaded_inboxes: usize,
+    /// Number of telemetry handlers registered on this runtime.
+    telemetry_handler_count: usize,
+    /// Number of shutdown hooks registered on this runtime.
+    shutdown_hook_count: usize,
+};
+
 /// Owned v2 application runtime.
 ///
 /// `Runtime` is the preferred entry point for new Vigil applications. It owns
@@ -135,6 +187,53 @@ pub const Runtime = struct {
         return self.registry.whereis(name);
     }
 
+    /// Capture an owned snapshot of the runtime's inspectable state.
+    ///
+    /// Registered mailboxes must remain alive while this function runs. The
+    /// caller owns the returned snapshot and must call `deinit()`.
+    pub fn snapshot(self: *Runtime, allocator: std.mem.Allocator) !RuntimeSnapshot {
+        const registry_snapshot = try self.registry.snapshot(allocator);
+        const processes = registry_snapshot.entries;
+
+        return .{
+            .allocator = allocator,
+            .running = self.isRunning(),
+            .registered_count = processes.len,
+            .telemetry_handler_count = self.telemetry_emitter.handlerCount(),
+            .shutdown_hook_count = self.shutdown_manager.hookCount(),
+            .processes = processes,
+        };
+    }
+
+    /// Return a compact health/readiness summary.
+    pub fn health(self: *Runtime, allocator: std.mem.Allocator) !RuntimeHealth {
+        var state = try self.snapshot(allocator);
+        defer state.deinit();
+
+        var overloaded_inboxes: usize = 0;
+        for (state.processes) |process| {
+            if (process.capacity > 0 and process.queue_depth >= process.capacity) {
+                overloaded_inboxes += 1;
+            }
+        }
+
+        const status: RuntimeHealthStatus = if (!state.running)
+            .stopped
+        else if (overloaded_inboxes > 0)
+            .degraded
+        else
+            .healthy;
+
+        return .{
+            .status = status,
+            .ready = status == .healthy,
+            .registered_count = state.registered_count,
+            .overloaded_inboxes = overloaded_inboxes,
+            .telemetry_handler_count = state.telemetry_handler_count,
+            .shutdown_hook_count = state.shutdown_hook_count,
+        };
+    }
+
     /// Register a function to run during `shutdown()`.
     ///
     /// Hooks must not capture stack references; they are plain function
@@ -165,6 +264,8 @@ var runtime_shutdown_count = std.atomic.Value(u32).init(0);
 fn recordRuntimeShutdown() void {
     _ = runtime_shutdown_count.fetchAdd(1, .monotonic);
 }
+
+fn runtimeSnapshotTelemetry(_: telemetry.Event) void {}
 
 test "Runtime initializes owned services" {
     var rt = try Runtime.init(std.testing.allocator, .{});
@@ -231,4 +332,49 @@ test "Runtime shutdown honors shutdown_enabled option" {
     disabled.shutdown();
     try std.testing.expect(!disabled.isRunning());
     try std.testing.expectEqual(@as(u32, 1), runtime_shutdown_count.load(.acquire));
+}
+
+test "Runtime snapshot exposes registered mailbox and runtime service state" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var ib = try rt.inbox(.{ .capacity = 2 });
+    defer ib.close();
+
+    try ib.send("queued");
+    try rt.register("orders.inbox", ib.mailbox);
+    try rt.telemetry_emitter.on(.message_sent, runtimeSnapshotTelemetry);
+    try rt.onShutdown(recordRuntimeShutdown);
+
+    var snapshot = try rt.snapshot(std.testing.allocator);
+    defer snapshot.deinit();
+
+    try std.testing.expect(snapshot.running);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.registered_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.telemetry_handler_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.shutdown_hook_count);
+    try std.testing.expectEqualStrings("orders.inbox", snapshot.processes[0].name);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].queue_depth);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.processes[0].capacity);
+}
+
+test "Runtime health reports degraded queues and stopped runtime" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var ib = try rt.inbox(.{ .capacity = 1 });
+    defer ib.close();
+
+    try ib.send("full");
+    try rt.register("full.inbox", ib.mailbox);
+
+    const degraded = try rt.health(std.testing.allocator);
+    try std.testing.expectEqual(RuntimeHealthStatus.degraded, degraded.status);
+    try std.testing.expect(!degraded.ready);
+    try std.testing.expectEqual(@as(usize, 1), degraded.overloaded_inboxes);
+
+    rt.shutdown();
+    const stopped = try rt.health(std.testing.allocator);
+    try std.testing.expectEqual(RuntimeHealthStatus.stopped, stopped.status);
+    try std.testing.expect(!stopped.ready);
 }

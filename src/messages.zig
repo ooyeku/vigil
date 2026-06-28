@@ -832,6 +832,22 @@ pub const ProcessMailbox = struct {
         return self.stats;
     }
 
+    /// Return the current number of queued messages.
+    pub fn queuedCount(self: *ProcessMailbox) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.priority_queues) |queues| {
+            var total: usize = 0;
+            for (queues) |queue| {
+                total += queue.items.len;
+            }
+            return total;
+        }
+
+        return self.messages.items.len;
+    }
+
     /// Return whether a message of `msg_size` can currently be accepted.
     pub fn hasCapacity(self: *ProcessMailbox, msg_size: usize) bool {
         self.mutex.lock();
@@ -1006,4 +1022,21 @@ test "Mailbox capacity and message size limits" {
         null,
     );
     try testing.expectError(MessageError.MessageTooLarge, mailbox.send(msg));
+}
+
+test "ProcessMailbox queuedCount reports actual queued messages" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 4,
+        .priority_queues = true,
+    });
+    defer mailbox.deinit();
+
+    try mailbox.send(try Message.init(allocator, "a", "sender", "one", null, .normal, null));
+    try mailbox.send(try Message.init(allocator, "b", "sender", "two", null, .high, null));
+    try testing.expectEqual(@as(usize, 2), mailbox.queuedCount());
+
+    var received = try mailbox.receive();
+    defer received.deinit();
+    try testing.expectEqual(@as(usize, 1), mailbox.queuedCount());
 }

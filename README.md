@@ -54,6 +54,14 @@ var inbox = try rt.inbox(.{ .capacity = 128 });
 defer inbox.close();
 
 try inbox.send("hello from the runtime");
+
+var snapshot = try rt.snapshot(allocator);
+defer snapshot.deinit();
+
+const health = try rt.health(allocator);
+if (!health.ready) {
+    // Surface degraded runtime state in your service health endpoint.
+}
 ```
 
 ### Channel-Like Message Passing
@@ -134,6 +142,7 @@ try group.roundRobin("message"); // Load balance
 ### Observability
 
 - **Telemetry** - Event hooks for monitoring (process, message, supervisor, circuit events)
+- **Runtime Introspection** - Snapshot registered mailboxes, queue depth, handlers, hooks, process groups, pub/sub brokers, timers, circuit breakers, and readiness
 - **Testing Utilities** - Mock inboxes, mock supervisors, time control
 
 ### Advanced
@@ -183,6 +192,17 @@ See [examples/vigilant_server](examples/vigilant_server) for a complete TCP serv
 cd examples/vigilant_server
 zig build run
 ```
+
+## Benchmarks
+
+The root package stays library-only. Run the standalone benchmark harness from its own package:
+
+```bash
+cd benchmarks/vigil_bench
+zig build run -Doptimize=ReleaseSafe -- --iterations 10000
+```
+
+The v2.1 benchmark harness currently measures inbox send/receive, registry lookup, telemetry emission, timer scheduling, process group routing, and pub/sub fanout.
 
 ## Documentation
 

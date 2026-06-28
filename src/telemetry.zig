@@ -239,6 +239,13 @@ pub const TelemetryEmitter = struct {
             }
         }
     }
+
+    /// Return the number of registered handlers.
+    pub fn handlerCount(self: *TelemetryEmitter) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.handlers.items.len;
+    }
 };
 
 /// Optional process-wide telemetry emitter.

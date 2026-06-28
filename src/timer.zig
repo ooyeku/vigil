@@ -12,6 +12,18 @@ fn incrementTimerTestCount() void {
 /// Function called by `Timer` after a timeout or interval tick.
 pub const TimerCallback = *const fn () void;
 
+/// Value snapshot of a timer.
+pub const TimerSnapshot = struct {
+    /// Whether a timeout or interval context exists.
+    active: bool,
+    /// Whether cancellation has been requested.
+    cancelled: bool,
+    /// Whether the active context is an interval.
+    repeat: bool,
+    /// Configured delay or interval, when active.
+    interval_ms: ?u32,
+};
+
 /// Timer utilities for scheduling messages.
 pub const Timer = struct {
     /// Allocator for timer contexts.
@@ -48,6 +60,25 @@ pub const Timer = struct {
         if (self.context) |ctx| {
             ctx.cancelled.store(true, .release);
         }
+    }
+
+    /// Return a value snapshot of the timer state.
+    pub fn snapshot(self: *Timer) TimerSnapshot {
+        if (self.context) |ctx| {
+            return .{
+                .active = true,
+                .cancelled = ctx.cancelled.load(.acquire),
+                .repeat = ctx.repeat,
+                .interval_ms = ctx.interval_ms,
+            };
+        }
+
+        return .{
+            .active = false,
+            .cancelled = false,
+            .repeat = false,
+            .interval_ms = null,
+        };
     }
 
     /// Run `callback` once after `delay_ms`.
@@ -245,4 +276,24 @@ test "Timer sendAfter handles failed delivery without double free" {
     compat.sleep(40 * std.time.ns_per_ms);
 
     try std.testing.expectError(error.EmptyMailbox, mailbox.receive());
+}
+
+test "Timer snapshot reports active and cancelled state" {
+    var timer = Timer.init(std.testing.allocator);
+    defer timer.deinit();
+
+    const idle = timer.snapshot();
+    try std.testing.expect(!idle.active);
+    try std.testing.expect(!idle.cancelled);
+
+    try timer.setInterval(50, incrementTimerTestCount);
+    const active = timer.snapshot();
+    try std.testing.expect(active.active);
+    try std.testing.expect(active.repeat);
+    try std.testing.expectEqual(@as(?u32, 50), active.interval_ms);
+
+    timer.cancel();
+    const cancelled = timer.snapshot();
+    try std.testing.expect(cancelled.active);
+    try std.testing.expect(cancelled.cancelled);
 }
