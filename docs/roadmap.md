@@ -16,6 +16,12 @@ This roadmap stages that work across v2.1.0, v2.2.0, v2.3.0, and v3.0.0.
 Each minor release should be serviceable on its own while clearly moving toward
 the v3.0.0 production-runtime moment.
 
+Current status:
+
+- v2.1.0 shipped the measurement and first runtime-introspection foundation.
+- v2.2.0 has started with first-class reliability policies for retry, backoff,
+  timeout classification, fallback, and circuit-breaker composition.
+
 ## Product Direction
 
 By v3.0.0, Vigil should be easy to describe:
@@ -61,6 +67,8 @@ production runtime foundation?"
   feature pile.
 
 ## v2.1.0: Measure And Inspect
+
+Status: shipped.
 
 v2.1.0 should create the measurement and introspection foundation needed for all
 later work. It should be useful even before the hot paths are rewritten.
@@ -118,6 +126,8 @@ later work. It should be useful even before the hot paths are rewritten.
 - The examples expose meaningful health/readiness information.
 
 ## v2.2.0: Operate And Recover
+
+Status: in progress.
 
 v2.2.0 should make Vigil safer to operate when things go wrong. This is the
 release where reliability patterns become first-class rather than hand-rolled in

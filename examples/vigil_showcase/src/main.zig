@@ -8,6 +8,11 @@ const OrderStatus = enum {
     dependency_unavailable,
 };
 
+const PaymentDecision = enum {
+    authorized,
+    unavailable,
+};
+
 const Order = struct {
     id: []const u8,
     customer: []const u8,
@@ -33,6 +38,24 @@ const Summary = struct {
     }
 };
 
+const PaymentAttempt = struct {
+    gateway_available: bool,
+
+    fn authorize(self: *PaymentAttempt) anyerror!PaymentDecision {
+        if (!self.gateway_available) return error.PaymentGatewayUnavailable;
+        return .authorized;
+    }
+
+    fn fallback(_: *PaymentAttempt, _: vigil.PolicyFailure) anyerror!PaymentDecision {
+        return .unavailable;
+    }
+};
+
+const PaymentPolicyResult = struct {
+    decision: PaymentDecision,
+    report: vigil.PolicyReport,
+};
+
 fn riskBand(order: Order) []const u8 {
     if (!order.payment_ok) return "payment-risk";
     if (!order.inventory_ok) return "inventory-risk";
@@ -51,12 +74,6 @@ fn eventTopic(status: OrderStatus) []const u8 {
 
 fn shouldEmitCircuitOpened(previous: vigil.CircuitState, current: vigil.CircuitState) bool {
     return previous != .open and current == .open;
-}
-
-fn paymentOk() anyerror!void {}
-
-fn paymentFailure() anyerror!void {
-    return error.PaymentGatewayUnavailable;
 }
 
 fn telemetryPrinter(event: vigil.telemetry.Event) void {
@@ -102,6 +119,31 @@ fn drainInbox(name: []const u8, inbox: *vigil.Inbox) !usize {
     return drained;
 }
 
+fn paymentPolicyReport(result: vigil.PolicyResult(PaymentDecision)) PaymentPolicyResult {
+    return switch (result) {
+        .success => |success| .{
+            .decision = success.value,
+            .report = success.report,
+        },
+        .fallback => |fallback| .{
+            .decision = fallback.value,
+            .report = fallback.report,
+        },
+        .timeout => |failure| .{
+            .decision = .unavailable,
+            .report = failure.report(),
+        },
+        .circuit_open => |failure| .{
+            .decision = .unavailable,
+            .report = failure.report(),
+        },
+        .permanent_failure => |failure| .{
+            .decision = .unavailable,
+            .report = failure.report(),
+        },
+    };
+}
+
 fn processOrder(
     rt: *vigil.Runtime,
     broker: *vigil.pubsub.PubSubBroker,
@@ -144,27 +186,43 @@ fn processOrder(
 
     summary.accepted += 1;
 
-    if (payment_breaker.getState() == .open) {
-        summary.dependency_unavailable += 1;
-        try publish(broker, summary, eventTopic(.dependency_unavailable), "payment circuit open");
-        std.debug.print("  decision: failed fast because payment circuit is open\n", .{});
-        return;
+    var payment_attempt = PaymentAttempt{ .gateway_available = order.payment_ok };
+    const previous_state = payment_breaker.getState();
+    const payment_result = vigil.executePolicy(
+        PaymentAttempt,
+        PaymentDecision,
+        &payment_attempt,
+        PaymentAttempt.authorize,
+        .{
+            .retry = .{
+                .max_attempts = 2,
+                .backoff = .{ .exponential = .{
+                    .initial_ms = 2,
+                    .multiplier = 2,
+                    .max_ms = 8,
+                } },
+            },
+            .timeout_ms = 250,
+            .circuit_breaker = payment_breaker,
+            .fallback = PaymentAttempt.fallback,
+        },
+    );
+    const payment = paymentPolicyReport(payment_result);
+    const current_state = payment_breaker.getState();
+
+    if (shouldEmitCircuitOpened(previous_state, current_state)) {
+        emit(rt, .circuit_opened, "payment-gateway");
     }
 
-    if (order.payment_ok) {
-        try payment_breaker.callError(paymentOk);
-    } else {
-        const previous_state = payment_breaker.getState();
-        payment_breaker.callError(paymentFailure) catch {
-            const current_state = payment_breaker.getState();
-            summary.rejected += 1;
-            try publish(broker, summary, eventTopic(.rejected), "payment authorization failed");
-            if (shouldEmitCircuitOpened(previous_state, current_state)) {
-                emit(rt, .circuit_opened, "payment-gateway");
-            }
-            std.debug.print("  decision: rejected by payment gateway\n", .{});
-            return;
-        };
+    if (payment.decision == .unavailable) {
+        summary.dependency_unavailable += 1;
+        try publish(broker, summary, eventTopic(.dependency_unavailable), "payment circuit open");
+        const fallback_from = payment.report.fallback_from orelse payment.report.outcome;
+        std.debug.print(
+            "  decision: payment unavailable via policy outcome={s} fallback_from={s} attempts={d} retries={d}\n",
+            .{ @tagName(payment.report.outcome), @tagName(fallback_from), payment.report.attempts, payment.report.retries },
+        );
+        return;
     }
 
     if (!order.inventory_ok) {
@@ -339,6 +397,19 @@ test "shouldEmitCircuitOpened only reports the transition into open" {
     try std.testing.expect(shouldEmitCircuitOpened(.half_open, .open));
     try std.testing.expect(!shouldEmitCircuitOpened(.closed, .closed));
     try std.testing.expect(!shouldEmitCircuitOpened(.open, .open));
+}
+
+test "payment fallback maps dependency failures to unavailable decisions" {
+    var attempt = PaymentAttempt{ .gateway_available = false };
+    const failure = vigil.PolicyFailure{
+        .outcome = .permanent_failure,
+        .attempts = 2,
+        .retries = 1,
+        .elapsed_ms = 0,
+        .last_error = error.PaymentGatewayUnavailable,
+    };
+
+    try std.testing.expectEqual(PaymentDecision.unavailable, try PaymentAttempt.fallback(&attempt, failure));
 }
 
 test "Summary terminalCount includes every terminal outcome" {

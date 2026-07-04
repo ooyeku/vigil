@@ -103,56 +103,9 @@ pub const CircuitBreaker = struct {
     /// has been exhausted. Successful calls close the breaker once the
     /// half-open success threshold is reached.
     pub fn call(self: *CircuitBreaker, comptime T: type, func: *const fn () T) !T {
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            // Check if circuit should transition from open to half-open
-            if (self.state == .open) {
-                const now_ms = compat.milliTimestamp();
-                const elapsed = now_ms - self.last_failure_time_ms;
-                if (elapsed >= self.config.reset_timeout_ms) {
-                    self.state = .half_open;
-                    self.half_open_request_count = 0;
-                    self.success_count = 0;
-                    self.emitEvent(.circuit_half_open);
-                } else {
-                    return error.CircuitOpen;
-                }
-            }
-
-            // Check half-open limits
-            if (self.state == .half_open) {
-                if (self.half_open_request_count >= self.config.half_open_requests) {
-                    return error.CircuitOpen;
-                }
-                self.half_open_request_count += 1;
-            }
-        }
-
-        // Execute the function
+        try self.beforeCall();
         const result = func();
-
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            // Handle success
-            if (self.state == .half_open) {
-                self.success_count += 1;
-                if (self.success_count >= self.config.half_open_success_threshold) {
-                    self.state = .closed;
-                    self.failure_count = 0;
-                    self.half_open_request_count = 0;
-                    self.success_count = 0;
-                    self.emitEvent(.circuit_closed);
-                }
-            } else if (self.state == .closed) {
-                // Reset failure count on success
-                self.failure_count = 0;
-            }
-        }
-
+        self.recordSuccess();
         return result;
     }
 
@@ -162,66 +115,73 @@ pub const CircuitBreaker = struct {
     /// Once the failure threshold is reached the breaker opens and subsequent
     /// calls return `error.CircuitOpen` until the reset timeout has elapsed.
     pub fn callError(self: *CircuitBreaker, func: *const fn () anyerror!void) !void {
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-
-            // Check if circuit should transition from open to half-open
-            if (self.state == .open) {
-                const now_ms = compat.milliTimestamp();
-                const elapsed = now_ms - self.last_failure_time_ms;
-                if (elapsed >= self.config.reset_timeout_ms) {
-                    self.state = .half_open;
-                    self.half_open_request_count = 0;
-                    self.success_count = 0;
-                    self.emitEvent(.circuit_half_open);
-                } else {
-                    return error.CircuitOpen;
-                }
-            }
-
-            // Check half-open limits
-            if (self.state == .half_open) {
-                if (self.half_open_request_count >= self.config.half_open_requests) {
-                    return error.CircuitOpen;
-                }
-                self.half_open_request_count += 1;
-            }
-        }
-
-        // Execute the function
+        try self.beforeCall();
         func() catch |err| {
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
-                self.recordFailure();
-            }
+            self.recordFailure();
             return err;
         };
 
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+        self.recordSuccess();
+    }
 
-            // Handle success
-            if (self.state == .half_open) {
-                self.success_count += 1;
-                if (self.success_count >= self.config.half_open_success_threshold) {
-                    self.state = .closed;
-                    self.failure_count = 0;
-                    self.half_open_request_count = 0;
-                    self.success_count = 0;
-                    self.emitEvent(.circuit_closed);
-                }
-            } else if (self.state == .closed) {
-                // Reset failure count on success
-                self.failure_count = 0;
+    /// Reserve permission for one protected operation.
+    ///
+    /// Reliability policies use this when they need to compose circuit-breaker
+    /// protection around operations that return values or use custom retry
+    /// logic. Pair every successful reservation with either `recordSuccess()`
+    /// or `recordFailure()`.
+    pub fn beforeCall(self: *CircuitBreaker) CircuitBreakerError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.state == .open) {
+            const now_ms = compat.milliTimestamp();
+            const elapsed = now_ms - self.last_failure_time_ms;
+            if (elapsed >= self.config.reset_timeout_ms) {
+                self.state = .half_open;
+                self.half_open_request_count = 0;
+                self.success_count = 0;
+                self.emitEvent(.circuit_half_open);
+            } else {
+                return error.CircuitOpen;
             }
+        }
+
+        if (self.state == .half_open) {
+            if (self.half_open_request_count >= self.config.half_open_requests) {
+                return error.CircuitOpen;
+            }
+            self.half_open_request_count += 1;
         }
     }
 
-    /// Record a failure
-    fn recordFailure(self: *CircuitBreaker) void {
+    /// Record a successful protected operation.
+    pub fn recordSuccess(self: *CircuitBreaker) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.state == .half_open) {
+            self.success_count += 1;
+            if (self.success_count >= self.config.half_open_success_threshold) {
+                self.state = .closed;
+                self.failure_count = 0;
+                self.half_open_request_count = 0;
+                self.success_count = 0;
+                self.emitEvent(.circuit_closed);
+            }
+        } else if (self.state == .closed) {
+            self.failure_count = 0;
+        }
+    }
+
+    /// Record a failed protected operation.
+    pub fn recordFailure(self: *CircuitBreaker) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.recordFailureLocked();
+    }
+
+    fn recordFailureLocked(self: *CircuitBreaker) void {
         self.failure_count += 1;
         self.last_failure_time_ms = compat.milliTimestamp();
 

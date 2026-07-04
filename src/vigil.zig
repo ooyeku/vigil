@@ -3,7 +3,7 @@
 //! Vigil is a library for building resilient services with explicit
 //! runtime ownership, message-passing inboxes, supervisors, telemetry,
 //! flow control, pub/sub, process groups, circuit breakers, and
-//! checkpointing.
+//! reliability policies, and checkpointing.
 //!
 //! The root package is library-only: it exports APIs and tests, but it
 //! intentionally has no `main` function or `zig build run` step. Runnable
@@ -59,6 +59,8 @@ pub const flow_control = @import("api/flow_control.zig");
 pub const request_reply = @import("api/request_reply.zig");
 /// Runtime-owned registry, telemetry, shutdown, and factory helpers.
 pub const runtime_api = @import("runtime.zig");
+/// Retry, backoff, timeout, fallback, and circuit-breaker policy helpers.
+pub const policy = @import("policy.zig");
 
 /// Event emission and subscription primitives.
 pub const telemetry = @import("telemetry.zig");
@@ -159,6 +161,26 @@ pub const CircuitBreakerConfig = circuit_breaker.CircuitBreakerConfig;
 pub const CircuitState = circuit_breaker.CircuitState;
 /// Value snapshot of circuit-breaker state.
 pub const CircuitBreakerSnapshot = circuit_breaker.CircuitBreakerSnapshot;
+/// Final outcome category for a policy-protected operation.
+pub const PolicyOutcome = policy.PolicyOutcome;
+/// Metadata returned for terminal policy outcomes.
+pub const PolicyReport = policy.PolicyReport;
+/// Failure details passed to fallback handlers and returned by failures.
+pub const PolicyFailure = policy.PolicyFailure;
+/// Retry policy for protected operations.
+pub const RetryPolicy = policy.RetryPolicy;
+/// Delay strategy used between retry attempts.
+pub const BackoffPolicy = policy.BackoffPolicy;
+/// Exponential backoff configuration.
+pub const ExponentialBackoff = policy.ExponentialBackoff;
+/// Deterministic jittered exponential backoff configuration.
+pub const JitteredBackoff = policy.JitteredBackoff;
+/// Generic options type factory for policy-protected operations.
+pub const PolicyOptions = policy.PolicyOptions;
+/// Generic result type factory for policy-protected operations.
+pub const PolicyResult = policy.PolicyResult;
+/// Execute a fallible operation under retry, timeout, fallback, and circuit rules.
+pub const executePolicy = policy.execute;
 
 /// Group of inboxes that can receive broadcast or routed messages.
 pub const ProcessGroup = process_group.ProcessGroup;
@@ -261,6 +283,17 @@ test "v2 root module exports runtime and version" {
     try std.testing.expect(@hasDecl(@This(), "CircuitBreakerSnapshot"));
     try std.testing.expect(@hasDecl(@This(), "TimerSnapshot"));
     try std.testing.expect(@hasDecl(@This(), "ReplyMailboxSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "policy"));
+    try std.testing.expect(@hasDecl(@This(), "PolicyOutcome"));
+    try std.testing.expect(@hasDecl(@This(), "PolicyReport"));
+    try std.testing.expect(@hasDecl(@This(), "PolicyFailure"));
+    try std.testing.expect(@hasDecl(@This(), "RetryPolicy"));
+    try std.testing.expect(@hasDecl(@This(), "BackoffPolicy"));
+    try std.testing.expect(@hasDecl(@This(), "ExponentialBackoff"));
+    try std.testing.expect(@hasDecl(@This(), "JitteredBackoff"));
+    try std.testing.expect(@hasDecl(@This(), "PolicyOptions"));
+    try std.testing.expect(@hasDecl(@This(), "PolicyResult"));
+    try std.testing.expect(@hasDecl(@This(), "executePolicy"));
     try std.testing.expect(@hasDecl(@This(), "distributed_protocol"));
 
     const version = getVersion();

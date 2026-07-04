@@ -1,4 +1,4 @@
-# Vigil API Reference v2.0.0
+# Vigil API Reference v2.2.0
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 
@@ -14,6 +14,7 @@ A process supervision and inter-process communication library for Zig, inspired 
   - [Supervisor Introspection](#supervisor-introspection)
   - [App Builder](#app-builder)
 - [Resilience](#resilience)
+  - [Reliability Policy](#reliability-policy)
   - [Circuit Breaker](#circuit-breaker)
   - [Rate Limiter](#rate-limiter)
   - [Backpressure](#backpressure)
@@ -361,6 +362,102 @@ defer app.shutdown();
 
 ## Resilience
 
+### Reliability Policy
+
+`vigil.executePolicy` composes retry, backoff, timeout classification,
+fallback handlers, and optional circuit-breaker protection around a fallible
+operation. It is synchronous: timeout checks happen before attempts, after
+attempts, and after retry sleeps. A blocking operation is not interrupted while
+it is running.
+
+```zig
+const Result = enum { primary, fallback };
+
+const Client = struct {
+    attempts: u32 = 0,
+
+    fn request(self: *@This()) anyerror!Result {
+        self.attempts += 1;
+        if (self.attempts < 3) return error.TemporaryFailure;
+        return .primary;
+    }
+
+    fn fallback(_: *@This(), failure: vigil.PolicyFailure) anyerror!Result {
+        std.debug.print("using fallback after {d} attempt(s)\n", .{failure.attempts});
+        return .fallback;
+    }
+};
+
+var breaker = try vigil.CircuitBreaker.init(allocator, "dependency", .{});
+defer breaker.deinit();
+
+var client = Client{};
+const result = vigil.executePolicy(Client, Result, &client, Client.request, .{
+    .retry = .{
+        .max_attempts = 3,
+        .backoff = .{ .exponential = .{
+            .initial_ms = 10,
+            .multiplier = 2,
+            .max_ms = 100,
+        } },
+    },
+    .timeout_ms = 500,
+    .circuit_breaker = &breaker,
+    .fallback = Client.fallback,
+});
+
+switch (result) {
+    .success => |success| {
+        std.debug.print("value={s} attempts={d}\n", .{
+            @tagName(success.value),
+            success.report.attempts,
+        });
+    },
+    .fallback => |fallback| {
+        std.debug.print("fallback={s} from={s}\n", .{
+            @tagName(fallback.value),
+            @tagName(fallback.report.fallback_from.?),
+        });
+    },
+    .timeout => |failure| {
+        std.debug.print("timeout after {d} attempt(s)\n", .{failure.attempts});
+    },
+    .circuit_open => |failure| {
+        std.debug.print("circuit open before attempt {d}\n", .{failure.attempts + 1});
+    },
+    .permanent_failure => |failure| {
+        std.debug.print("failed after {d} attempt(s)\n", .{failure.attempts});
+    },
+}
+```
+
+| Type | Description |
+|------|-------------|
+| `PolicyOutcome` | Outcome category: success, retry, timeout, fallback, circuit open, or permanent failure |
+| `PolicyReport` | Attempts, retries, elapsed time, outcome, last error, and fallback source |
+| `PolicyFailure` | Failure details returned by failures and passed to fallback handlers |
+| `PolicyResult(T)` | Typed union returned by `executePolicy` |
+| `PolicyOptions(Context, T)` | Generic options type for retries, timeouts, fallback, circuit breaker, clock, and sleeper |
+| `RetryPolicy` | Total attempts and backoff strategy |
+| `BackoffPolicy` | `.none`, `.fixed_ms`, `.exponential`, or `.jittered` delay strategy |
+| `ExponentialBackoff` | Initial delay, multiplier, and max delay |
+| `JitteredBackoff` | Exponential backoff plus deterministic positive jitter |
+
+| Option | Description |
+|--------|-------------|
+| `retry` | Controls max attempts and delay between retries |
+| `timeout_ms` | Optional synchronous deadline checked around attempts |
+| `circuit_breaker` | Optional `*CircuitBreaker` protecting every attempt |
+| `fallback` | Optional handler used for timeout, circuit-open, and permanent-failure outcomes |
+| `clock` | Optional `fn (*Context) i64` hook for deterministic tests |
+| `sleeper` | Optional `fn (*Context, u64) void` hook for deterministic tests or custom schedulers |
+
+`PolicyReport.fallback_from` is set when the final result is `.fallback`, so
+logs and health endpoints can distinguish fallback caused by timeout,
+circuit-open, or permanent failure.
+
+---
+
 ### Circuit Breaker
 
 Protect services from cascading failures.
@@ -403,6 +500,9 @@ const failures = breaker.getFailureCount();
 |--------|-------------|
 | `call(T, fn)` | Execute function with protection |
 | `callError(fn)` | Execute fallible function |
+| `beforeCall()` | Reserve one protected operation for custom policy composition |
+| `recordSuccess()` | Record success after a custom protected operation |
+| `recordFailure()` | Record failure after a custom protected operation |
 | `getState()` | Get current circuit state |
 | `getFailureCount()` | Get failure count |
 | `forceOpen()` | Manually open circuit |

@@ -92,6 +92,47 @@ if (breaker.getState() == .open) {
 }
 ```
 
+### Reliability Policy
+
+```zig
+const Result = enum { ok, fallback };
+
+const Client = struct {
+    attempts: u32 = 0,
+
+    fn call(self: *@This()) anyerror!Result {
+        self.attempts += 1;
+        if (self.attempts < 3) return error.TemporaryFailure;
+        return .ok;
+    }
+
+    fn fallback(_: *@This(), _: vigil.PolicyFailure) anyerror!Result {
+        return .fallback;
+    }
+};
+
+var client = Client{};
+const result = vigil.executePolicy(Client, Result, &client, Client.call, .{
+    .retry = .{
+        .max_attempts = 3,
+        .backoff = .{ .exponential = .{ .initial_ms = 10, .max_ms = 100 } },
+    },
+    .timeout_ms = 500,
+    .fallback = Client.fallback,
+});
+
+switch (result) {
+    .success => |success| std.debug.print("result={s}\n", .{@tagName(success.value)}),
+    .fallback => |fallback| std.debug.print("fallback={s} from={s}\n", .{
+        @tagName(fallback.value),
+        @tagName(fallback.report.fallback_from.?),
+    }),
+    .timeout => |failure| std.debug.print("timeout after {d} attempt(s)\n", .{failure.attempts}),
+    .circuit_open => |failure| std.debug.print("circuit open after {d} attempt(s)\n", .{failure.attempts}),
+    .permanent_failure => |failure| std.debug.print("failed outcome={s}\n", .{@tagName(failure.outcome)}),
+}
+```
+
 ### Rate Limiting
 
 ```zig
@@ -129,6 +170,7 @@ try group.roundRobin("message"); // Load balance
 
 ### Resilience 
 
+- **Reliability Policies** - Compose retry, backoff, timeout, fallback, and circuit breakers around fallible operations
 - **Circuit Breaker** - Protect services from cascading failures
 - **Rate Limiting** - Token bucket algorithm for flow control
 - **Backpressure** - Strategies for handling overload (drop_oldest, drop_newest, block, error)
@@ -173,6 +215,7 @@ The root package is library-only: use `zig build test` at the repository root, a
 
 See [examples/vigil_showcase](examples/vigil_showcase) for a self-contained resilient order pipeline that demonstrates:
 - Runtime-owned registry, telemetry, shutdown hooks, and inboxes
+- Reliability policies for retry/backoff/fallback around a payment dependency
 - Process groups for worker routing and operations broadcast
 - Pub/Sub event fanout for audit and alert streams
 - Inbox backpressure, rate limiting, and circuit breaker behavior
