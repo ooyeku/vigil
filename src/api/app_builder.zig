@@ -15,14 +15,15 @@
 
 const std = @import("std");
 const compat = @import("../compat.zig");
-const legacy = @import("../legacy.zig");
+const supervisor_mod = @import("../supervisor.zig");
+const process = @import("../process.zig");
 const presets = @import("./presets.zig");
 
-pub const Supervisor = legacy.Supervisor;
-pub const SupervisorOptions = legacy.SupervisorOptions;
-pub const RestartStrategy = legacy.RestartStrategy;
-pub const ChildSpec = legacy.ChildSpec;
-pub const ProcessPriority = legacy.ProcessPriority;
+pub const Supervisor = supervisor_mod.Supervisor;
+pub const SupervisorOptions = supervisor_mod.SupervisorOptions;
+pub const RestartStrategy = supervisor_mod.RestartStrategy;
+pub const ChildSpec = process.ChildSpec;
+pub const ProcessPriority = process.ProcessPriority;
 pub const Preset = presets.Preset;
 pub const PresetConfig = presets.PresetConfig;
 
@@ -57,11 +58,6 @@ pub const AppBuilder = struct {
         return app_builder;
     }
 
-    /// No-op retained for compatibility. Use `shutdown()` for cleanup.
-    pub fn deinit(self: *AppBuilder) void {
-        _ = self;
-    }
-
     /// Add one permanent worker child.
     ///
     /// The id is copied and later freed by `shutdown()`.
@@ -77,6 +73,7 @@ pub const AppBuilder = struct {
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
         try self.allocated_ids.append(self.allocator, id_copy);
+        errdefer _ = self.allocated_ids.pop();
 
         try self.supervisor.?.addChild(.{
             .id = id_copy,
@@ -114,6 +111,7 @@ pub const AppBuilder = struct {
             );
             errdefer self.allocator.free(worker_id);
             try self.allocated_ids.append(self.allocator, worker_id);
+            errdefer _ = self.allocated_ids.pop();
 
             try self.supervisor.?.addChild(.{
                 .id = worker_id,
@@ -153,6 +151,7 @@ pub const AppBuilder = struct {
     pub fn stop(self: *AppBuilder) void {
         if (self.supervisor) |*sup| {
             sup.deinit();
+            self.supervisor = null;
         }
     }
 
@@ -221,6 +220,20 @@ test "AppBuilder add worker" {
     try app_builder.build();
 
     try std.testing.expect(app_builder.supervisor.?.children.items.len == 1);
+}
+
+test "AppBuilder duplicate worker failure keeps cleanup ownership valid" {
+    var app_builder = try app(std.testing.allocator);
+    _ = try app_builder.worker("duplicate", testWorker);
+    try std.testing.expectError(error.AlreadyMonitoring, app_builder.worker("duplicate", testWorker));
+    app_builder.shutdown();
+}
+
+test "AppBuilder stop can be followed by shutdown" {
+    var app_builder = try app(std.testing.allocator);
+    _ = try app_builder.worker("worker", testWorker);
+    app_builder.stop();
+    app_builder.shutdown();
 }
 
 test "AppBuilder add multiple workers" {

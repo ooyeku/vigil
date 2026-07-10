@@ -12,21 +12,6 @@ const Inbox = @import("./inbox.zig").Inbox;
 const InboxError = @import("./inbox.zig").InboxError;
 const compat = @import("../compat.zig");
 
-/// Placeholder for the removed `std.Thread.ResetEvent` in Zig 0.16.
-/// The existing flow uses polling on the inbox for correlation matching, so
-/// this entry is tracked in the map purely for the correlation-id lifecycle
-/// and is never actually waited on. Kept as a stub to preserve public layout
-/// without paying the cost of a real synchronization primitive.
-const ResetEvent = struct {
-    pub fn reset(_: *ResetEvent) void {}
-};
-
-/// Options for a request/reply exchange.
-pub const RequestOptions = struct {
-    /// Maximum time to wait for a correlated reply.
-    timeout_ms: u32 = 5000,
-};
-
 /// Value snapshot of reply-mailbox state.
 pub const ReplyMailboxSnapshot = struct {
     /// Number of active correlation ids being waited on.
@@ -43,13 +28,17 @@ pub const ReplyMailbox = struct {
     /// Inbox used to receive candidate replies.
     inbox: *Inbox,
     /// Tracks active correlation ids.
-    correlation_map: std.StringHashMap(*ResetEvent),
+    correlation_map: std.StringHashMap(void),
     /// Buffer for messages that didn't match the awaited correlation ID.
     /// These are re-sent to the inbox so other consumers can process them.
     stash: std.ArrayListUnmanaged(Message),
     /// Protects correlation map updates.
     mutex: compat.Mutex,
-    /// Allocator for copied correlation ids, event stubs, and stash storage.
+    /// Protects non-matching message storage.
+    stash_mutex: compat.Mutex,
+    /// Ensures only one waiter flushes the stash at a time.
+    flush_mutex: compat.Mutex,
+    /// Allocator for copied correlation ids and stash storage.
     allocator: std.mem.Allocator,
 
     /// Initialize a reply mailbox over an existing inbox.
@@ -59,9 +48,11 @@ pub const ReplyMailbox = struct {
     pub fn init(allocator: std.mem.Allocator, inbox: *Inbox) ReplyMailbox {
         return .{
             .inbox = inbox,
-            .correlation_map = std.StringHashMap(*ResetEvent).init(allocator),
+            .correlation_map = std.StringHashMap(void).init(allocator),
             .stash = .empty,
             .mutex = .{},
+            .stash_mutex = .{},
+            .flush_mutex = .{},
             .allocator = allocator,
         };
     }
@@ -74,7 +65,6 @@ pub const ReplyMailbox = struct {
         var it = self.correlation_map.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
-            self.allocator.destroy(entry.value_ptr.*);
         }
         self.correlation_map.deinit();
 
@@ -88,30 +78,51 @@ pub const ReplyMailbox = struct {
     /// Return a value snapshot of pending replies and stashed messages.
     pub fn snapshot(self: *ReplyMailbox) ReplyMailboxSnapshot {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        const pending_count = self.correlation_map.count();
+        self.mutex.unlock();
+
+        self.stash_mutex.lock();
+        const stashed_count = self.stash.items.len;
+        self.stash_mutex.unlock();
 
         return .{
-            .pending_count = self.correlation_map.count(),
-            .stashed_count = self.stash.items.len,
+            .pending_count = pending_count,
+            .stashed_count = stashed_count,
         };
     }
 
     /// Flush stashed (non-matching) messages back to the inbox so they
     /// are available for other consumers or future waitForReply calls.
     fn flushStash(self: *ReplyMailbox) void {
-        while (self.stash.items.len > 0) {
+        self.flush_mutex.lock();
+        defer self.flush_mutex.unlock();
+
+        while (true) {
+            self.stash_mutex.lock();
+            if (self.stash.items.len == 0) {
+                self.stash_mutex.unlock();
+                return;
+            }
             const stashed = self.stash.items[0];
-            if (stashed.payload) |payload| {
-                self.inbox.send(payload) catch {
+            if (stashed.payload != null) {
+                const copy = stashed.dupe() catch {
+                    self.stash_mutex.unlock();
+                    return;
+                };
+                self.stash_mutex.unlock();
+                self.inbox.sendMessage(copy) catch {
                     // If inbox is closed or full, keep in stash and stop
-                    break;
+                    return;
                 };
                 // Sent successfully, free the stashed message and remove
+                self.stash_mutex.lock();
                 var removed = self.stash.orderedRemove(0);
+                self.stash_mutex.unlock();
                 removed.deinit();
             } else {
                 // No payload to re-send, discard
                 var removed = self.stash.orderedRemove(0);
+                self.stash_mutex.unlock();
                 removed.deinit();
             }
         }
@@ -128,48 +139,32 @@ pub const ReplyMailbox = struct {
         correlation_id: []const u8,
         timeout_ms: u32,
     ) !Message {
-        const pending = blk: {
-            const PendingReply = struct {
-                event: *ResetEvent,
-                correlation_id: []const u8,
-            };
-
-            const event = try self.allocator.create(ResetEvent);
-            errdefer self.allocator.destroy(event);
-            event.* = .{};
-
-            const corr_id_copy = try self.allocator.dupe(u8, correlation_id);
-            errdefer self.allocator.free(corr_id_copy);
-
+        const corr_id_copy = try self.allocator.dupe(u8, correlation_id);
+        var registered = false;
+        errdefer if (!registered) self.allocator.free(corr_id_copy);
+        self.mutex.lock();
+        if (self.correlation_map.contains(correlation_id)) {
+            self.mutex.unlock();
+            return MessageError.DuplicateMessage;
+        }
+        self.correlation_map.put(corr_id_copy, {}) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        registered = true;
+        self.mutex.unlock();
+        defer {
             self.mutex.lock();
-            defer self.mutex.unlock();
-            try self.correlation_map.put(corr_id_copy, event);
-
-            break :blk PendingReply{
-                .event = event,
-                .correlation_id = corr_id_copy,
-            };
-        };
-        const event = pending.event;
-        const corr_id_copy = pending.correlation_id;
-
-        // Helper to cleanup map entry using the copied key
-        const cleanup = struct {
-            fn remove(map: *std.StringHashMap(*ResetEvent), mutex: *compat.Mutex, key: []const u8) void {
-                mutex.lock();
-                _ = map.remove(key);
-                mutex.unlock();
-            }
-        };
+            _ = self.correlation_map.remove(corr_id_copy);
+            self.mutex.unlock();
+            self.allocator.free(corr_id_copy);
+        }
 
         // Wait for reply
         const start_ms = compat.milliTimestamp();
         while (true) {
             const elapsed = compat.milliTimestamp() - start_ms;
-            if (elapsed > timeout_ms) {
-                cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
-                self.allocator.free(corr_id_copy);
-                self.allocator.destroy(event);
+            if (elapsed >= timeout_ms) {
                 self.flushStash();
                 return MessageError.DeliveryTimeout;
             }
@@ -179,37 +174,22 @@ pub const ReplyMailbox = struct {
                 if (msg_opt) |msg| {
                     if (msg.metadata.correlation_id) |msg_corr_id| {
                         if (std.mem.eql(u8, msg_corr_id, corr_id_copy)) {
-                            // Found matching reply
-                            cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
-                            self.allocator.free(corr_id_copy);
-                            self.allocator.destroy(event);
-
-                            // Return a copy of the message, free original
-                            const duped = msg.dupe() catch |err| {
-                                var m = msg;
-                                m.deinit();
-                                self.flushStash();
-                                return err;
-                            };
-                            var orig = msg;
-                            orig.deinit();
                             self.flushStash();
-                            return duped;
+                            return msg;
                         }
                     }
                     // Not our reply — stash it for re-queuing
+                    self.stash_mutex.lock();
                     self.stash.append(self.allocator, msg) catch {
                         // If we can't stash, deinit to avoid leak
                         var m = msg;
                         m.deinit();
                     };
+                    self.stash_mutex.unlock();
                 }
             } else |err| {
                 // Check if inbox is closed
                 if (err == InboxError.InboxClosed) {
-                    cleanup.remove(&self.correlation_map, &self.mutex, corr_id_copy);
-                    self.allocator.free(corr_id_copy);
-                    self.allocator.destroy(event);
                     self.flushStash();
                     return MessageError.ReceiverUnavailable;
                 }
@@ -218,48 +198,7 @@ pub const ReplyMailbox = struct {
             compat.sleep(10 * std.time.ns_per_ms);
         }
     }
-
-    /// Signal that a reply was received (internal use)
-    fn signalReply(self: *ReplyMailbox, correlation_id: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.correlation_map.get(correlation_id)) |event| {
-            event.reset();
-        }
-    }
 };
-
-/// Send a request and wait for a correlated reply.
-///
-/// The helper assigns a fresh correlation id before sending. It returns an
-/// owned reply message, or `MessageError.DeliveryTimeout` when no matching
-/// reply arrives before `options.timeout_ms`.
-pub fn request(
-    inbox: *Inbox,
-    request_msg: Message,
-    options: RequestOptions,
-) !Message {
-    const allocator = inbox.allocator;
-
-    // Create correlation ID
-    const correlation_id = try std.fmt.allocPrint(
-        allocator,
-        "req_{d}",
-        .{compat.milliTimestamp()},
-    );
-    defer allocator.free(correlation_id);
-
-    // Create reply mailbox
-    var reply_mailbox = ReplyMailbox.init(allocator, inbox);
-    defer reply_mailbox.deinit();
-
-    // Send request
-    try inbox.send(request_msg.payload orelse "");
-
-    // Wait for reply
-    return reply_mailbox.waitForReply(correlation_id, options.timeout_ms);
-}
 
 /// Build a reply message for a request.
 ///
@@ -346,19 +285,25 @@ test "reply does not leak temporary response id" {
     try std.testing.expectEqualSlices(u8, "corr456", response.metadata.correlation_id.?);
 }
 
-test "request timeout preserves caller-owned correlation id" {
+test "ReplyMailbox requeues non-matching messages without losing metadata" {
     const allocator = std.testing.allocator;
-
     var inbox = try Inbox.init(allocator);
     defer inbox.close();
+    var reply_mailbox = ReplyMailbox.init(allocator, inbox);
+    defer reply_mailbox.deinit();
 
-    var request_msg = try Message.init(allocator, "req3", "client", "request", null, .normal, null);
-    defer request_msg.deinit();
-    try request_msg.setCorrelationId("caller-owned");
+    var unrelated = try Message.init(allocator, "other-id", "sender", "other", null, .high, null);
+    try unrelated.setCorrelationId("other-correlation");
+    try inbox.sendMessage(unrelated);
 
     try std.testing.expectError(
         MessageError.DeliveryTimeout,
-        request(inbox, request_msg, .{ .timeout_ms = 1 }),
+        reply_mailbox.waitForReply("target-correlation", 1),
     );
-    try std.testing.expectEqualSlices(u8, "caller-owned", request_msg.metadata.correlation_id.?);
+
+    var requeued = try inbox.recv();
+    defer requeued.deinit();
+    try std.testing.expectEqualStrings("other-id", requeued.id);
+    try std.testing.expectEqualStrings("other-correlation", requeued.metadata.correlation_id.?);
+    try std.testing.expectEqual(@as(u32, 2), requeued.metadata.attempt_count);
 }

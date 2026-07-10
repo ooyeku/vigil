@@ -4,7 +4,7 @@ const checkpoint_mod = @import("checkpoint.zig");
 const compat = @import("compat.zig");
 const testing = @import("std").testing;
 
-pub const GenServerState = enum {
+pub const GenServerState = enum(u8) {
     initial,
     running,
     stopped,
@@ -19,7 +19,8 @@ pub fn GenServer(comptime StateType: type) type {
         init_fn: *const fn (self: *@This()) anyerror!void,
         terminate_fn: *const fn (self: *@This()) void,
         supervisor: ?*vigil.Supervisor = null,
-        server_state: GenServerState = .initial,
+        server_state: std.atomic.Value(GenServerState) = std.atomic.Value(GenServerState).init(.initial),
+        next_correlation_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
 
         /// Thread-safe map of correlation_id -> reply mailbox for the call/reply pattern.
         reply_mailboxes: std.StringHashMap(*vigil.ProcessMailbox),
@@ -90,17 +91,21 @@ pub fn GenServer(comptime StateType: type) type {
 
         /// Start the GenServer message loop (blocks until stopped).
         pub fn start(self: *Self) !void {
-            if (self.server_state != .initial) return error.AlreadyRunning;
+            if (self.server_state.cmpxchgStrong(.initial, .running, .acq_rel, .acquire) != null) {
+                return error.AlreadyRunning;
+            }
 
-            try self.init_fn(self);
-            self.server_state = .running;
+            self.init_fn(self) catch |err| {
+                self.server_state.store(.initial, .release);
+                return err;
+            };
             self.last_checkpoint_ms = compat.milliTimestamp();
 
-            while (self.server_state == .running) {
+            while (self.server_state.load(.acquire) == .running) {
                 if (self.mailbox.receive()) |msg_const| {
                     var msg = msg_const;
 
-                    if (self.server_state != .running or (msg.signal != null and msg.signal.? == .terminate)) {
+                    if (self.server_state.load(.acquire) != .running or (msg.signal != null and msg.signal.? == .terminate)) {
                         msg.deinit();
                         break;
                     }
@@ -121,7 +126,7 @@ pub fn GenServer(comptime StateType: type) type {
             // Save final checkpoint before terminating
             self.saveCheckpoint();
             self.terminate_fn(self);
-            self.server_state = .stopped;
+            self.server_state.store(.stopped, .release);
         }
 
         /// Send an asynchronous message to the GenServer
@@ -133,12 +138,22 @@ pub fn GenServer(comptime StateType: type) type {
         /// The handler must call self.reply(msg, payload) to send a response
         /// back to the caller's dedicated reply mailbox.
         pub fn call(self: *Self, msg: *vigil.Message, timeout_ms: ?u32) !vigil.Message {
-            const correlation_id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{compat.milliTimestamp()});
-            errdefer self.allocator.free(correlation_id);
+            const sequence = self.next_correlation_id.fetchAdd(1, .monotonic);
+            const correlation_id = try std.fmt.allocPrint(
+                self.allocator,
+                "call_{d}_{d}",
+                .{ compat.milliTimestamp(), sequence },
+            );
+            var correlation_owned = true;
+            errdefer if (correlation_owned) self.allocator.free(correlation_id);
 
             // Create a temporary reply mailbox dedicated to this call
             const reply_mbx = try self.allocator.create(vigil.ProcessMailbox);
-            errdefer self.allocator.destroy(reply_mbx);
+            var reply_mailbox_owned = true;
+            errdefer if (reply_mailbox_owned) {
+                reply_mbx.deinit();
+                self.allocator.destroy(reply_mbx);
+            };
             reply_mbx.* = vigil.ProcessMailbox.init(self.allocator, .{
                 .capacity = 1,
                 .priority_queues = false,
@@ -151,18 +166,29 @@ pub fn GenServer(comptime StateType: type) type {
                 defer self.reply_mutex.unlock();
                 try self.reply_mailboxes.put(correlation_id, reply_mbx);
             }
+            correlation_owned = false;
+            reply_mailbox_owned = false;
 
             // Prepare and send message with correlation ID
-            var msg_copy = try msg.dupe();
-            errdefer msg_copy.deinit();
-            try msg_copy.setCorrelationId(correlation_id);
-            try self.cast(msg_copy);
+            var msg_copy = msg.dupe() catch |err| {
+                self.cleanupReplyEntry(correlation_id);
+                return err;
+            };
+            msg_copy.setCorrelationId(correlation_id) catch |err| {
+                msg_copy.deinit();
+                self.cleanupReplyEntry(correlation_id);
+                return err;
+            };
+            self.cast(msg_copy) catch |err| {
+                self.cleanupReplyEntry(correlation_id);
+                return err;
+            };
 
             // Wait on the dedicated reply mailbox (not the server's mailbox)
             const start_time = compat.milliTimestamp();
             while (true) {
                 if (timeout_ms) |timeout| {
-                    if (compat.milliTimestamp() - start_time > timeout) {
+                    if (compat.milliTimestamp() - start_time >= timeout) {
                         self.cleanupReplyEntry(correlation_id);
                         return error.Timeout;
                     }
@@ -176,7 +202,10 @@ pub fn GenServer(comptime StateType: type) type {
                         compat.sleep(1 * std.time.ns_per_ms);
                         continue;
                     },
-                    else => return err,
+                    else => {
+                        self.cleanupReplyEntry(correlation_id);
+                        return err;
+                    },
                 }
             }
         }
@@ -187,10 +216,9 @@ pub fn GenServer(comptime StateType: type) type {
             const corr_id = original_msg.metadata.correlation_id orelse return error.InvalidMessage;
 
             self.reply_mutex.lock();
-            const reply_mbx = self.reply_mailboxes.get(corr_id);
-            self.reply_mutex.unlock();
+            defer self.reply_mutex.unlock();
 
-            if (reply_mbx) |mbx| {
+            if (self.reply_mailboxes.get(corr_id)) |mbx| {
                 var response = try vigil.Message.init(
                     self.allocator,
                     "reply",
@@ -200,8 +228,10 @@ pub fn GenServer(comptime StateType: type) type {
                     .normal,
                     null,
                 );
-                errdefer response.deinit();
-                try response.setCorrelationId(corr_id);
+                response.setCorrelationId(corr_id) catch |err| {
+                    response.deinit();
+                    return err;
+                };
                 try mbx.send(response);
             } else {
                 return error.InvalidMessage;
@@ -287,12 +317,12 @@ pub fn GenServer(comptime StateType: type) type {
         /// If running, sends a terminate signal to the message loop.
         /// After calling stop(), join the server thread, then call deinit().
         pub fn stop(self: *Self) void {
-            switch (self.server_state) {
+            switch (self.server_state.load(.acquire)) {
                 .initial => {
-                    self.server_state = .stopped;
+                    self.server_state.store(.stopped, .release);
                 },
                 .running => {
-                    self.server_state = .stopped;
+                    self.server_state.store(.stopped, .release);
                     const msg = vigil.Message.init(self.allocator, "stop", "system", null, .terminate, .critical, null) catch return;
                     self.mailbox.send(msg) catch {};
                 },
@@ -315,20 +345,11 @@ pub fn GenServer(comptime StateType: type) type {
             });
         }
 
-        fn startWrapper(ctx: *anyopaque) void {
-            const self: *Self = @ptrCast(ctx);
-            _ = self.start() catch {};
-        }
-
         fn startFn() void {
             if (current_context.load(.acquire)) |ctx| {
                 const self: *Self = @ptrCast(@alignCast(ctx));
                 _ = self.start() catch {};
             }
-        }
-
-        pub fn getContext() ?*anyopaque {
-            return current_context.load(.acquire);
         }
     };
 }
@@ -383,7 +404,7 @@ test "GenServer message handling" {
                     self.state.ctx.mutex.lock();
                     defer self.state.ctx.mutex.unlock();
                     self.state.ctx.received = true;
-                    self.server_state = .stopped;
+                    self.server_state.store(.stopped, .release);
                 }
             }
         }.handle,
@@ -481,6 +502,40 @@ test "GenServer synchronous call" {
     server.deinit();
 }
 
+test "GenServer timed out call releases reply resources once" {
+    const allocator = testing.allocator;
+    const State = struct {};
+    const ServerType = GenServer(State);
+
+    const server = try ServerType.init(
+        allocator,
+        struct {
+            fn handle(_: *ServerType, _: vigil.Message) !void {}
+        }.handle,
+        struct {
+            fn init_cb(_: *ServerType) !void {}
+        }.init_cb,
+        struct {
+            fn terminate(_: *ServerType) void {}
+        }.terminate,
+        .{},
+    );
+    defer server.deinit();
+
+    var request_message = try vigil.Message.init(
+        allocator,
+        "timeout",
+        "test",
+        "no reply",
+        null,
+        .normal,
+        null,
+    );
+    defer request_message.deinit();
+
+    try testing.expectError(error.Timeout, server.call(&request_message, 1));
+}
+
 test "GenServer supervision" {
     const allocator = testing.allocator;
 
@@ -542,7 +597,7 @@ test "GenServer state management" {
                     self.state.ctx.mutex.lock();
                     defer self.state.ctx.mutex.unlock();
                     self.state.ctx.count += 1;
-                    self.server_state = .stopped;
+                    self.server_state.store(.stopped, .release);
                 }
             }
         }.handle,

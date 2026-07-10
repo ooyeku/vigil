@@ -4,4 +4,7 @@ zig-out/
 .DS_Store
 .vscode/
 
+__pycache__/
+*.py[cod]
+
 CLAUDE.md

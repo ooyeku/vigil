@@ -51,10 +51,10 @@ pub fn main() !void {
 
     // Create application with workers
     var app = try vigil.app(allocator);
+    defer app.shutdown();
     _ = try app.worker("service", serviceFunction);
     _ = try app.workerPool("handlers", handlerFunction, 4);
     try app.start();
-    defer app.shutdown();
 }
 
 fn serviceFunction() void {
@@ -102,7 +102,7 @@ if (rt.whereis("worker")) |mailbox| {
 | `supervisor()` | Create a supervisor builder using runtime options |
 | `register(name, mailbox)` | Register a mailbox in the runtime registry |
 | `whereis(name)` | Look up a registered mailbox |
-| `snapshot(allocator)` | Capture registered mailbox stats, queue depth, handler count, and hook count |
+| `snapshot(allocator)` | Capture registered mailbox stats, active/dead-letter/poison counts, handler count, and hook count |
 | `health(allocator)` | Return compact health/readiness status |
 | `healthWithCircuitBreakers(allocator, breakers)` | Return readiness with caller-owned circuit breakers folded in |
 | `onShutdown(hook)` | Register a shutdown hook |
@@ -112,12 +112,14 @@ if (rt.whereis("worker")) |mailbox| {
 
 `Runtime.snapshot()` returns an owned snapshot for debugging and health endpoints.
 It includes whether the runtime is running, registered process names, mailbox
-queue depth, mailbox capacity, mailbox stats, telemetry handler count, and
-shutdown hook count. Call `deinit()` on the snapshot when finished.
+queue depth, mailbox capacity, mailbox stats, retained dead-letter and poison
+counts, telemetry handler count, and shutdown hook count. Call `deinit()` on
+the snapshot when finished.
 
 `Runtime.health()` returns a compact readiness summary. A running runtime is
-`healthy` when registered inboxes are below capacity, `degraded` when one or
-more registered inboxes are full, and `stopped` after shutdown.
+`healthy` when registered inboxes are below capacity and have no poison
+messages, `degraded` when one or more registered inboxes are full or retain
+poison messages, and `stopped` after shutdown.
 Use `Runtime.healthWithCircuitBreakers()` when an app wants readiness to also
 account for caller-owned dependency circuit breakers; open breakers degrade the
 report and set `ready` to false.
@@ -130,9 +132,12 @@ Standalone runtime primitives expose focused snapshots too:
 - `Timer.snapshot()` reports active, cancelled, repeat, and interval state.
 - `ReplyMailbox.snapshot()` reports pending correlation ids and stashed messages.
 
-### Migrating from pre-2.0 root helpers
+### Migrating from the legacy API
 
-Vigil 2.0 removes the old 0.2 compatibility helpers from `@import("vigil")`. Use `vigil.inboxBuilder`, `vigil.supervisor`, `vigil.Runtime`, or explicit `@import("vigil/legacy")` low-level types.
+Use `vigil.inboxBuilder`, `vigil.supervisor`, `vigil.Runtime`, and the other
+owned root APIs for current code. `vigil/legacy` is a deprecated, reduced set of
+type aliases for migrations; obsolete worker, configuration, and
+supervision-tree APIs are no longer shipped.
 
 ---
 
@@ -208,10 +213,18 @@ inbox.close();
 | Method | Description |
 |--------|-------------|
 | `send(payload)` | Send a message payload |
+| `sendMessage(message)` | Send an owned message without rebuilding its id or metadata |
 | `recv()` | Block until message received |
 | `recvTimeout(ms)` | Receive with timeout (returns `?Message`) |
 | `isClosed()` | Check if inbox is closed |
 | `stats()` | Get mailbox statistics |
+| `deadLetters(allocator)` | Capture an owned, non-consuming dead-letter snapshot |
+| `deadLetter(message, reason)` | Transfer a failed owned message to dead-letter storage |
+| `deadLetterCount()` | Return retained dead-letter count |
+| `replayDeadLetter(id)` | Replay by stable mailbox-local entry id |
+| `discardDeadLetter(id)` | Discard and free one entry |
+| `discardAllDeadLetters()` | Discard and free all entries |
+| `onPoisonMessage(context, handler)` | Register a poison classification callback |
 | `close()` | Close the inbox |
 
 ---
@@ -225,6 +238,8 @@ var inbox = try vigil.inboxBuilder(allocator)
     .capacity(1000)
     .priorityQueues(true)
     .deadLetter(true)
+    .deadLetterCapacity(256)
+    .maxDeliveryAttempts(3)
     .defaultTTL(30_000)
     .build();
 defer inbox.close();
@@ -235,10 +250,49 @@ defer inbox.close();
 | `capacity(n)` | Set maximum message capacity |
 | `priorityQueues(bool)` | Enable/disable priority queues |
 | `deadLetter(bool)` | Enable/disable dead letter queue |
+| `deadLetterCapacity(n)` | Bound retained dead-letter entries |
+| `maxDeliveryAttempts(n)` | Set poison-message attempt threshold |
 | `defaultTTL(ms)` | Set default message TTL |
 | `withRateLimit(config)` | Add rate limiting |
 | `withBackpressure(config)` | Add backpressure handling |
 | `build()` | Create the inbox |
+
+#### Dead-Letter Ownership and Replay
+
+Dead-letter entries use monotonic mailbox-local ids; message ids are not
+required to be unique. Inspection snapshots own deep copies and must be
+deinitialized. `deadLetter(message, reason)` consumes the message after the
+mailbox operation starts, including error paths.
+
+```zig
+var jobs = try vigil.inboxBuilder(allocator)
+    .capacity(1)
+    .deadLetterCapacity(32)
+    .maxDeliveryAttempts(3)
+    .build();
+defer jobs.close();
+
+try jobs.send("active");
+try jobs.send("retained while full"); // accepted into dead-letter storage
+
+var snapshot = try jobs.deadLetters(allocator);
+defer snapshot.deinit();
+const id = snapshot.entries[0].id;
+
+var active = try jobs.recv();
+active.deinit();
+
+const replay = try jobs.replayDeadLetter(id);
+if (replay.status == .replayed) {
+    // The retained message is active again with a renewed TTL window.
+}
+```
+
+Every successful `recv()` increments `message.metadata.attempt_count`. A
+consumer reports processing failure by returning the owned message through
+`deadLetter(message, .delivery_failed)`. At `maxDeliveryAttempts`, the entry is
+classified as `.max_attempts`, will not replay automatically, emits
+`poison_message_detected`, and invokes the optional poison handler.
 
 ---
 
@@ -290,7 +344,7 @@ _ = try builder.childPool("worker", workerFn, 4);
 | `childPool(prefix, fn, count)` | Add multiple workers |
 | `onCrash(handler)` | Set crash callback |
 | `withTelemetry(bool)` | Enable telemetry events |
-| `build()` | Create the supervisor |
+| `build()` | Transfer the configured children into a supervisor |
 
 | Strategy | Description |
 |----------|-------------|
@@ -330,8 +384,6 @@ try supervisor.restartChild("worker_1");
 try supervisor.suspendChild("worker_1");
 try supervisor.resumeChild("worker_1");
 
-// Dynamic scaling (reduces workers with prefix)
-try supervisor.scaleWorkers("worker", 2);
 ```
 
 | Method | Description |
@@ -341,8 +393,6 @@ try supervisor.scaleWorkers("worker", 2);
 | `restartChild(id)` | Force restart a child |
 | `suspendChild(id)` | Pause a child |
 | `resumeChild(id)` | Resume a paused child |
-| `scaleWorkers(prefix, count)` | Scale workers to target count |
-| `getRestartHistory()` | Get recent restart events |
 
 ---
 
@@ -352,11 +402,14 @@ Build applications with pre-configured supervision.
 
 ```zig
 var app = try vigil.app(allocator);
+defer app.shutdown();
 _ = try app.worker("service", serviceFunction);
 _ = try app.workerPool("handlers", handlerFunction, 4);
 try app.start();
-defer app.shutdown();
 ```
+
+`AppBuilder` instances are heap-owned. `shutdown()` releases the builder after
+stopping its supervisor, so do not call builder methods afterward.
 
 ---
 
@@ -588,7 +641,6 @@ try group.route("message", "user_123");   // Consistent hash by key
 
 // Manage members
 _ = group.remove("worker1");
-const count = group.count();
 const member_count = group.memberCount();
 ```
 
@@ -596,7 +648,7 @@ const member_count = group.memberCount();
 |--------|-------------|
 | `add(id, inbox)` | Add a member |
 | `remove(id)` | Remove a member |
-| `count()` | Get member count |
+| `memberCount()` | Get member count |
 | `broadcast(payload)` | Send to all members |
 | `roundRobin(payload)` | Distribute evenly |
 | `route(payload, key)` | Consistent hash routing |
@@ -608,28 +660,23 @@ const member_count = group.memberCount();
 Topic-based messaging with wildcard support.
 
 ```zig
-// Initialize global broker
-try vigil.pubsub.initGlobal(allocator);
+var broker = vigil.PubSubBroker.init(allocator);
+defer broker.deinit();
 
 // Create subscriber
 var subscriber = vigil.Subscriber.init(allocator, inbox);
 defer subscriber.deinit();
 try subscriber.subscribe(&.{"events.user.*", "events.system.#"});
+try broker.subscribe(&subscriber);
 
 // Check if matches topic
 if (subscriber.matches("events.user.created")) {
     // Will receive this topic
 }
 
-// Publish messages
-try vigil.publish("events.user.created", "user_data");
-try vigil.publish("events.system.alert", "alert_data");
-
-// Use broker directly
-var broker = vigil.pubsub.PubSubBroker.init(allocator);
-defer broker.deinit();
-try broker.subscribe(&subscriber);
-try broker.publish("topic", "payload");
+// Publish messages through the explicitly owned broker
+_ = try broker.publish("events.user.created", "user_data");
+_ = try broker.publish("events.system.alert", "alert_data");
 broker.unsubscribe(&subscriber);
 ```
 
@@ -641,7 +688,7 @@ broker.unsubscribe(&subscriber);
 
 ### Request/Reply
 
-Synchronous messaging with automatic correlation.
+Synchronous waiting with explicit correlation ids.
 
 ```zig
 // Create request with correlation ID
@@ -652,9 +699,9 @@ defer request_msg.deinit();
 try request_msg.setCorrelationId("corr_123");
 
 // Create reply (preserves correlation ID)
-var response = try vigil.reply(request_msg, "response_data", allocator);
-defer response.deinit();
+const response = try vigil.reply(request_msg, "response_data", allocator);
 // response.metadata.correlation_id == "corr_123"
+try inbox.sendMessage(response); // consumes response and preserves metadata
 
 // Using ReplyMailbox for waiting
 var reply_mailbox = vigil.request_reply.ReplyMailbox.init(allocator, inbox);
@@ -673,23 +720,19 @@ defer reply_msg.deinit();
 Event hooks for monitoring and debugging. Thread-safe event emission.
 
 ```zig
-// Initialize global telemetry
-try vigil.telemetry.initGlobal(allocator);
+var rt = try vigil.runtime(allocator, .{});
+defer rt.deinit();
 
-// Register event handlers
-if (vigil.telemetry.getGlobal()) |emitter| {
-    try emitter.on(.process_started, struct {
-        fn handler(event: vigil.telemetry.Event) void {
-            std.debug.print("Event: {s} at {d}ms\n", .{
-                @tagName(event.event_type),
-                event.timestamp_ms,
-            });
-        }
-    }.handler);
-}
+try rt.telemetry_emitter.on(.process_started, struct {
+    fn handler(event: vigil.telemetry.Event) void {
+        std.debug.print("Event: {s} at {d}ms\n", .{
+            @tagName(event.event_type),
+            event.timestamp_ms,
+        });
+    }
+}.handler);
 
-// Emit events (thread-safe)
-vigil.telemetry.emit(.{
+rt.telemetry_emitter.emit(.{
     .event_type = .message_sent,
     .timestamp_ms = vigil.compat.milliTimestamp(),
     .metadata = null,
@@ -707,7 +750,7 @@ emitter.removeHandlers(.process_started);
 | Category | Events |
 |----------|--------|
 | Process | `process_started`, `process_stopped`, `process_crashed`, `process_suspended`, `process_resumed` |
-| Message | `message_sent`, `message_received`, `message_expired`, `message_dropped` |
+| Message | `message_sent`, `message_received`, `message_expired`, `message_dropped`, `message_dead_lettered`, `message_replayed`, `message_discarded`, `poison_message_detected` |
 | Supervisor | `supervisor_started`, `supervisor_stopped`, `supervisor_restart`, `supervisor_child_added`, `supervisor_child_removed` |
 | Circuit | `circuit_opened`, `circuit_closed`, `circuit_half_open` |
 | GenServer | `genserver_started`, `genserver_stopped`, `genserver_state_changed` |
@@ -762,21 +805,16 @@ try vigil.expectSignal(std.testing, mock_inbox, .healthCheck);
 Coordinated shutdown with hooks. Hooks run in configurable order.
 
 ```zig
-// Initialize shutdown manager
-try vigil.shutdown.initGlobal(allocator);
+var rt = try vigil.runtime(allocator, .{});
+defer rt.deinit();
 
-// Register shutdown hooks
-try vigil.onShutdown(struct {
+try rt.onShutdown(struct {
     fn cleanup() void {
         std.debug.print("Cleaning up...\n", .{});
     }
 }.cleanup);
 
-// Trigger shutdown (hooks run in reverse order by default)
-vigil.shutdownAll(.{
-    .timeout_ms = 30_000,
-    .order = .reverse,  // or .forward
-});
+rt.shutdown();
 
 // Use manager directly
 var manager = vigil.shutdown.ShutdownManager.init(allocator);
@@ -1053,6 +1091,8 @@ var mailbox = vigil.ProcessMailbox.init(allocator, .{
     .capacity = 1000,
     .priority_queues = true,
     .enable_deadletter = true,
+    .dead_letter_capacity = 256,
+    .max_delivery_attempts = 3,
     .default_ttl_ms = 30_000,
     .max_message_size = 1024 * 1024,
 });
@@ -1117,6 +1157,16 @@ pub const CircuitState = enum {
 };
 ```
 
+### Dead-Letter Types
+
+| Type | Purpose |
+|------|---------|
+| `DeadLetterReason` | Why a message was retained: mailbox full, expired, failed delivery, manual handling, or max attempts |
+| `DeadLetterNotice` | Stable entry id, reason, attempt count, and poison transition flags |
+| `DeadLetterEntry` | Owned message plus dead-letter timestamp and poison state |
+| `DeadLetterSnapshot` | Owned array of copied entries; call `deinit()` |
+| `DeadLetterReplayResult` | `replayed`, `retained`, `poison`, or `not_found` outcome plus an optional notice |
+
 ### Signal
 
 ```zig
@@ -1162,7 +1212,7 @@ pub const VigilError = error{
 
     // Message
     EmptyMailbox, MailboxFull, MessageExpired, MessageTooLarge, InvalidMessage, DeliveryTimeout,
-    RateLimitExceeded, DeliveryFailed,
+    RateLimitExceeded, DeliveryFailed, DeadLetterFull,
 
     // Registry
     AlreadyRegistered, NotRegistered,
@@ -1185,6 +1235,7 @@ pub const VigilError = error{
 |-------|-------------|
 | `InboxClosed` | Inbox was closed while waiting |
 | `OutOfMemory` | Memory allocation failed |
+| `DeadLetterFull` | Bounded dead-letter storage is full |
 
 ### Message Errors
 
@@ -1198,6 +1249,7 @@ pub const VigilError = error{
 | `ReceiverUnavailable` | Receiver not available |
 | `RateLimitExceeded` | Rejected by rate limiter |
 | `DeliveryFailed` | Subscriber delivery failure |
+| `DeadLetterFull` | Bounded dead-letter storage is full |
 
 ### Circuit Breaker Errors
 
@@ -1231,6 +1283,10 @@ zig build
 
 # Run all tests
 zig build test
+
+# Run one API surface independently
+zig build test-root
+zig build test-legacy
 
 # Run the showcase example
 cd examples/vigil_showcase

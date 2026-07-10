@@ -15,13 +15,14 @@
 
 const std = @import("std");
 const compat = @import("../compat.zig");
-const legacy = @import("../legacy.zig");
+const supervisor_mod = @import("../supervisor.zig");
+const process = @import("../process.zig");
 
-pub const Supervisor = legacy.Supervisor;
-pub const SupervisorOptions = legacy.SupervisorOptions;
-pub const RestartStrategy = legacy.RestartStrategy;
-pub const ChildSpec = legacy.ChildSpec;
-pub const ProcessPriority = legacy.ProcessPriority;
+pub const Supervisor = supervisor_mod.Supervisor;
+pub const SupervisorOptions = supervisor_mod.SupervisorOptions;
+pub const RestartStrategy = supervisor_mod.RestartStrategy;
+pub const ChildSpec = process.ChildSpec;
+pub const ProcessPriority = process.ProcessPriority;
 
 /// Restart policy for a supervised child.
 pub const RestartType = enum {
@@ -79,11 +80,6 @@ pub const SupervisorBuilder = struct {
         };
     }
 
-    /// No-op retained for symmetry with other builders.
-    pub fn deinit(self: *SupervisorBuilder) void {
-        _ = self;
-    }
-
     /// Set the restart strategy.
     pub fn strategy(self: SupervisorBuilder, s: RestartStrategy) SupervisorBuilder {
         var result = self;
@@ -134,6 +130,7 @@ pub const SupervisorBuilder = struct {
 
         // Track this allocation so it can be freed when the supervisor is deinitialized
         try self.supervisor.?.trackAllocatedChildId(id_copy);
+        errdefer _ = self.supervisor.?.allocated_child_ids.pop();
 
         try self.supervisor.?.addChild(.{
             .id = id_copy,
@@ -186,9 +183,10 @@ pub const SupervisorBuilder = struct {
     ///
     /// The returned supervisor is owned by the caller and should be
     /// deinitialized after use.
-    pub fn build(self: SupervisorBuilder) Supervisor {
+    pub fn build(self: *SupervisorBuilder) Supervisor {
         if (self.supervisor) |sup| {
             var result = sup;
+            self.supervisor = null;
             result.options.crash_handler = self.crash_handler;
             result.options.enable_telemetry = self.enable_telemetry;
             return result;
@@ -231,6 +229,28 @@ test "SupervisorBuilder basic creation" {
 
     // Verify supervisor was created
     try std.testing.expect(sup.children.items.len == 0);
+}
+
+test "SupervisorBuilder duplicate child failure keeps tracked ids valid" {
+    var builder = supervisor(std.testing.allocator);
+    _ = try builder.child("duplicate", dummyWorker);
+    try std.testing.expectError(error.AlreadyMonitoring, builder.child("duplicate", dummyWorker));
+
+    var built = builder.build();
+    built.deinit();
+}
+
+test "SupervisorBuilder transfers ownership when built" {
+    var builder = supervisor(std.testing.allocator);
+    _ = try builder.child("worker", dummyWorker);
+
+    var first = builder.build();
+    defer first.deinit();
+    var second = builder.build();
+    defer second.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), first.children.items.len);
+    try std.testing.expectEqual(@as(usize, 0), second.children.items.len);
 }
 
 test "SupervisorBuilder wires crash handler and telemetry options" {

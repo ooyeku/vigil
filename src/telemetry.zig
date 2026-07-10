@@ -7,9 +7,6 @@
 //! that still publish through process-wide telemetry.
 
 const std = @import("std");
-const Message = @import("messages.zig").Message;
-const MessagePriority = @import("messages.zig").MessagePriority;
-const Signal = @import("messages.zig").Signal;
 const compat = @import("compat.zig");
 
 /// Event types emitted by Vigil components.
@@ -26,6 +23,10 @@ pub const EventType = enum {
     message_received,
     message_expired,
     message_dropped,
+    message_dead_lettered,
+    message_replayed,
+    message_discarded,
+    poison_message_detected,
 
     // Supervisor events
     supervisor_started,
@@ -57,57 +58,6 @@ pub const Event = struct {
     metadata: ?[]const u8 = null,
 };
 
-/// Detailed process lifecycle event.
-pub const ProcessEvent = struct {
-    /// Base event fields.
-    base: Event,
-    /// Process id. Created helper events allocate a copied id.
-    process_id: []const u8,
-    /// Lifecycle state.
-    state: ProcessState,
-
-    /// Process lifecycle states used in process telemetry.
-    pub const ProcessState = enum {
-        started,
-        stopped,
-        crashed,
-        suspended,
-        resumed,
-    };
-};
-
-/// Detailed message event.
-pub const MessageEvent = struct {
-    /// Base event fields.
-    base: Event,
-    /// Message id.
-    message_id: []const u8,
-    /// Message sender.
-    sender: []const u8,
-    /// Optional logical receiver. Created helper events copy this field.
-    receiver: ?[]const u8,
-    /// Message priority.
-    priority: MessagePriority,
-    /// Payload size reported by the message metadata.
-    size_bytes: usize,
-    /// Optional topic for pub/sub style events.
-    topic: ?[]const u8 = null,
-};
-
-/// Detailed supervisor event.
-pub const SupervisorEvent = struct {
-    /// Base event fields.
-    base: Event,
-    /// Supervisor id, if known. Created helper events copy this field.
-    supervisor_id: ?[]const u8,
-    /// Child id, if known. Created helper events copy this field.
-    child_id: ?[]const u8,
-    /// Restart count at the time of the event.
-    restart_count: u32,
-    /// Optional strategy label.
-    strategy: ?[]const u8 = null,
-};
-
 /// Detailed circuit breaker event.
 pub const CircuitEvent = struct {
     /// Base event fields.
@@ -125,16 +75,6 @@ pub const CircuitEvent = struct {
         closed,
         half_open,
     };
-};
-
-/// Detailed GenServer event.
-pub const GenServerEvent = struct {
-    /// Base event fields.
-    base: Event,
-    /// Server id.
-    server_id: []const u8,
-    /// Optional serialized state snapshot.
-    state_snapshot: ?[]const u8 = null,
 };
 
 /// Event handler function type.
@@ -305,88 +245,6 @@ pub fn emit(event: Event) void {
     if (getGlobal()) |telemetry| {
         telemetry.emit(event);
     }
-}
-
-/// Allocate a detailed process event.
-///
-/// The returned `process_id` is allocated with `allocator` and must be freed by
-/// the caller when the event is no longer needed.
-pub fn createProcessEvent(
-    allocator: std.mem.Allocator,
-    event_type: EventType,
-    process_id: []const u8,
-    state: ProcessEvent.ProcessState,
-) !ProcessEvent {
-    const id_copy = try allocator.dupe(u8, process_id);
-    errdefer allocator.free(id_copy);
-
-    return ProcessEvent{
-        .base = .{
-            .event_type = event_type,
-            .timestamp_ms = compat.milliTimestamp(),
-            .metadata = null,
-        },
-        .process_id = id_copy,
-        .state = state,
-    };
-}
-
-/// Create a detailed message event.
-///
-/// The returned `receiver`, when present, is allocated with `allocator` and
-/// must be freed by the caller.
-pub fn createMessageEvent(
-    allocator: std.mem.Allocator,
-    event_type: EventType,
-    message: Message,
-    receiver: ?[]const u8,
-) !MessageEvent {
-    const receiver_copy = if (receiver) |r| try allocator.dupe(u8, r) else null;
-    errdefer if (receiver_copy) |r| allocator.free(r);
-
-    return MessageEvent{
-        .base = .{
-            .event_type = event_type,
-            .timestamp_ms = compat.milliTimestamp(),
-            .metadata = null,
-        },
-        .message_id = message.id,
-        .sender = message.sender,
-        .receiver = receiver_copy,
-        .priority = message.priority,
-        .size_bytes = message.metadata.size_bytes,
-        .topic = null,
-    };
-}
-
-/// Allocate a detailed supervisor event.
-///
-/// Returned `supervisor_id` and `child_id` fields, when present, are allocated
-/// with `allocator` and must be freed by the caller.
-pub fn createSupervisorEvent(
-    allocator: std.mem.Allocator,
-    event_type: EventType,
-    supervisor_id: ?[]const u8,
-    child_id: ?[]const u8,
-    restart_count: u32,
-) !SupervisorEvent {
-    const sup_id_copy = if (supervisor_id) |id| try allocator.dupe(u8, id) else null;
-    errdefer if (sup_id_copy) |id| allocator.free(id);
-
-    const child_id_copy = if (child_id) |id| try allocator.dupe(u8, id) else null;
-    errdefer if (child_id_copy) |id| allocator.free(id);
-
-    return SupervisorEvent{
-        .base = .{
-            .event_type = event_type,
-            .timestamp_ms = compat.milliTimestamp(),
-            .metadata = null,
-        },
-        .supervisor_id = sup_id_copy,
-        .child_id = child_id_copy,
-        .restart_count = restart_count,
-        .strategy = null,
-    };
 }
 
 /// Allocate a detailed circuit breaker event.

@@ -28,14 +28,15 @@
 //! defer msg.deinit();
 //! ```
 //!
-//! For lower-level 0.2.x-compatible APIs, import the legacy module
-//! explicitly so new code does not accidentally depend on old helpers:
+//! A reduced set of deprecated 0.2.x type aliases remains temporarily in the
+//! legacy module for migrations. Current code should not depend on it:
 //! ```zig
 //! const vigil_legacy = @import("vigil/legacy");
 //! ```
 
 const std = @import("std");
-const legacy = @import("legacy.zig");
+const messages = @import("messages.zig");
+const genserver = @import("genserver.zig");
 const build_options = @import("vigil_build_options");
 
 /// Fluent message construction API. Most callers use the root `msg`
@@ -95,6 +96,8 @@ pub const inboxBuilder = inbox_api.inboxBuilder;
 pub const Inbox = inbox_api.Inbox;
 /// Fluent builder for `Inbox`.
 pub const InboxBuilder = inbox_api.InboxBuilder;
+/// Callback invoked when a failed message first becomes poison.
+pub const PoisonMessageHandler = inbox_api.PoisonMessageHandler;
 /// Start configuring a supervisor.
 pub const supervisor = supervisor_builder.supervisor;
 /// Fluent supervisor builder.
@@ -115,6 +118,8 @@ pub const PresetConfig = presets.PresetConfig;
 pub const Runtime = runtime_api.Runtime;
 /// Runtime feature flags.
 pub const RuntimeOptions = runtime_api.RuntimeOptions;
+/// Runtime-owned inbox configuration.
+pub const InboxOptions = runtime_api.InboxOptions;
 /// Owned runtime-state snapshot for debugging and health reporting.
 pub const RuntimeSnapshot = runtime_api.RuntimeSnapshot;
 /// Compact runtime health/readiness summary.
@@ -142,12 +147,8 @@ pub const BackpressureStrategy = flow_control.BackpressureStrategy;
 /// Wrapper that applies rate limiting/backpressure around an inbox.
 pub const FlowControlledInbox = flow_control.FlowControlledInbox;
 
-/// Send a request message and wait for a correlated reply.
-pub const request = request_reply.request;
 /// Build a reply message that preserves the request correlation id.
 pub const reply = request_reply.reply;
-/// Options for a request/reply exchange.
-pub const RequestOptions = request_reply.RequestOptions;
 /// Reply mailbox for awaiting correlated responses.
 pub const ReplyMailbox = request_reply.ReplyMailbox;
 /// Value snapshot of reply-mailbox state.
@@ -191,10 +192,6 @@ pub const ProcessGroupSnapshot = process_group.ProcessGroupSnapshot;
 /// Snapshot of one process-group member.
 pub const ProcessGroupMemberSnapshot = process_group.ProcessGroupMemberSnapshot;
 
-/// Publish through the optional global pub/sub broker.
-pub const publish = pubsub.publish;
-/// Create and optionally register a global pub/sub subscriber.
-pub const subscribe = pubsub.subscribe;
 /// Topic-based pub/sub broker.
 pub const PubSubBroker = pubsub.PubSubBroker;
 /// Inbox-backed topic subscriber.
@@ -218,13 +215,6 @@ pub const DistributedRegistry = distributed_registry.DistributedRegistry;
 /// Remote process resolution result.
 pub const RemoteProcessInfo = distributed_registry.RemoteProcessInfo;
 
-/// Register a hook with the legacy global shutdown manager.
-/// Prefer `Runtime.onShutdown` for new v2 code.
-pub const onShutdown = shutdown.onShutdown;
-/// Run hooks registered in the legacy global shutdown manager.
-/// Prefer `Runtime.shutdown` for new v2 code.
-pub const shutdownAll = shutdown.shutdownAll;
-
 /// Shared error set for high-level Vigil operations.
 pub const VigilError = errors.VigilError;
 
@@ -234,6 +224,18 @@ pub const Message = msg_builder.Message;
 pub const MessagePriority = msg_builder.MessagePriority;
 /// Lightweight process control signal attached to a message.
 pub const Signal = msg_builder.Signal;
+/// Why a message entered dead-letter storage.
+pub const DeadLetterReason = messages.DeadLetterReason;
+/// Scalar details for a dead-letter lifecycle event.
+pub const DeadLetterNotice = messages.DeadLetterNotice;
+/// One owned entry returned by dead-letter snapshots.
+pub const DeadLetterEntry = messages.DeadLetterEntry;
+/// Owned dead-letter inspection snapshot.
+pub const DeadLetterSnapshot = messages.DeadLetterSnapshot;
+/// Replay outcome for a retained dead-letter entry.
+pub const DeadLetterReplayResult = messages.DeadLetterReplayResult;
+/// Replay status for a retained dead-letter entry.
+pub const DeadLetterReplayStatus = messages.DeadLetterReplayStatus;
 
 /// Low-level supervisor type re-exported for compatibility.
 pub const Supervisor = supervisor_builder.Supervisor;
@@ -241,10 +243,10 @@ pub const Supervisor = supervisor_builder.Supervisor;
 pub const RestartStrategy = supervisor_builder.RestartStrategy;
 /// Process scheduling priority used by supervisor children.
 pub const ProcessPriority = supervisor_builder.ProcessPriority;
-/// Generic server abstraction from the legacy module.
-pub const GenServer = legacy.GenServer;
+/// Generic server abstraction.
+pub const GenServer = genserver.GenServer;
 /// Lower-level mailbox type. Prefer `Inbox` unless you need raw mailbox APIs.
-pub const ProcessMailbox = legacy.ProcessMailbox;
+pub const ProcessMailbox = messages.ProcessMailbox;
 /// Thread-safe local process registry.
 pub const Registry = @import("registry.zig").Registry;
 /// Timer helper for delayed and periodic callbacks.
@@ -269,6 +271,12 @@ test "v2 root module excludes obsolete 0.2 compatibility helpers" {
     try std.testing.expect(!@hasDecl(@This(), "addWorkerGroup"));
     try std.testing.expect(!@hasDecl(@This(), "broadcast"));
     try std.testing.expect(!@hasDecl(@This(), "global_registry"));
+    try std.testing.expect(!@hasDecl(@This(), "publish"));
+    try std.testing.expect(!@hasDecl(@This(), "subscribe"));
+    try std.testing.expect(!@hasDecl(@This(), "onShutdown"));
+    try std.testing.expect(!@hasDecl(@This(), "shutdownAll"));
+    try std.testing.expect(!@hasDecl(@This(), "request"));
+    try std.testing.expect(!@hasDecl(@This(), "RequestOptions"));
 }
 
 test "v2 root module exports runtime and version" {

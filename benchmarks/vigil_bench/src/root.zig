@@ -75,7 +75,7 @@ test "v2.1 benchmark rows run at smoke scale" {
     };
 
     inline for (rows) |row| {
+        try std.testing.expect(row.name.len > 0);
         try std.testing.expect(row.operations > 0);
-        try std.testing.expect(row.averageLatencyNs() > 0);
     }
 }

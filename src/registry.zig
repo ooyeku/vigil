@@ -23,6 +23,10 @@ pub const Registry = struct {
         queue_depth: usize,
         /// Configured mailbox capacity.
         capacity: usize,
+        /// Current retained dead-letter entry count.
+        dead_letter_count: usize,
+        /// Current retained poison-message count.
+        poison_count: usize,
         /// Mailbox usage statistics.
         stats: ProcessMailbox.MailboxStats,
     };
@@ -129,6 +133,8 @@ pub const Registry = struct {
                 .name = name_copy,
                 .queue_depth = mailbox.queuedCount(),
                 .capacity = mailbox.config.capacity,
+                .dead_letter_count = mailbox.deadLetterCount(),
+                .poison_count = mailbox.poisonCount(),
                 .stats = mailbox.getStats(),
             };
             written += 1;

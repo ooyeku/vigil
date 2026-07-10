@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Composable reliability policies**: Added typed retry policies with fixed, exponential, and deterministic jittered backoff, synchronous timeout classification, fallback handlers, circuit-breaker composition, and injectable clock/sleep hooks through `vigil.executePolicy()`.
+- **Dead-letter lifecycle APIs**: Added bounded dead-letter entries with stable ids, owned inspection snapshots, replay, single/all discard, explicit reasons, and poison-message attempt limits across `ProcessMailbox` and `Inbox`.
+- **Dead-letter observability**: Runtime snapshots and health now expose retained dead-letter and poison counts, while runtime-created inboxes emit dead-letter, replay, discard, and poison telemetry events.
+- **Poison-message hooks**: Added `Inbox.onPoisonMessage()` for application handling when a repeatedly rejected message first crosses its configured attempt threshold.
+
+### Changed
+- **v2.2 development version**: Advanced `build.zig.zon` to `2.2.0`, matching the roadmap's Operate and Recover release line.
+- **Mailbox capacity is global**: Priority mailboxes now enforce configured capacity across all priority queues, matching `queuedCount()`, `hasCapacity()`, and runtime health semantics.
+- **Delivery attempts are tracked**: Successful mailbox receives increment `Message.metadata.attempt_count`; replay renews the message TTL window.
+- **Legacy isolation**: Current root and high-level APIs now import concrete modules directly; `vigil/legacy` is a reduced compatibility boundary instead of an internal dependency.
+
+### Fixed
+- **Dead-letter accounting and callbacks**: Retained overflow is no longer counted as dropped, poison counts are constant-time and current, and lifecycle callbacks may safely close their inbox.
+- **Flow-control drops**: `drop_newest` now actually skips the send, `drop_oldest` updates drop statistics without pretending to deliver, and blocking backpressure observes inbox shutdown.
+- **Message identity and TTL precision**: High-level messages use allocation-free monotonic ids, `MessageBuilder` no longer leaks its temporary id, and TTL timestamps now use millisecond precision.
+- **GenServer ownership and concurrency**: Correlation ids are unique, server lifecycle state is atomic, timeout/error cleanup no longer double-frees reply resources, and replies cannot race mailbox destruction.
+- **Builder cleanup**: Failed duplicate child registration no longer leaves freed ids in cleanup lists, and `AppBuilder.stop()` can safely be followed by `shutdown()`.
+- **Deterministic cancellation tests**: Timer cancellation now joins its worker before returning, and the supervisor lifecycle test uses an explicit worker gate instead of timing assumptions.
+- **Optimized benchmark smoke tests**: ReleaseSafe tests no longer assume every operation takes at least one nanosecond after integer averaging.
+
+### Removed
+- **Obsolete legacy subsystems**: Removed the unused worker state, legacy configuration, supervision-tree, and stale standalone verification-test sources and exports.
+- **Unused compatibility surface**: Removed global pub/sub and shutdown APIs, the broken unused one-inbox `request()` helper, no-op builder destructors, empty option/error types, redundant count aliases, incomplete supervisor scaling/history methods, and unused detailed telemetry constructors.
+
+## [2.1.0] - 2026-06-28
+
+### Added
+- **Runtime snapshots and health**: Added owned runtime snapshots, compact readiness summaries, registered inbox queue statistics, and circuit-breaker-aware health checks.
+- **Component introspection**: Added snapshots for registries, inboxes, process groups, pub/sub brokers, circuit breakers, timers, reply mailboxes, telemetry handlers, and shutdown hooks.
+- **Benchmark harness**: Added a standalone benchmark package covering messaging, registries, telemetry, timers, process groups, pub/sub, request/reply, contention, throughput, latency, and observed allocations.
+- **Operational server status**: Expanded the TCP server example with runtime-owned services and health/status reporting.
+
+### Changed
+- **Library-only root package**: Kept runnable examples and benchmarks in their own packages while the repository root focuses on the public library and its tests.
+
 ## [2.0.0] - 2026-06-13
 
 ### Added

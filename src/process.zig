@@ -32,7 +32,6 @@
 //! // Get process statistics
 //! const stats = process.getStats();
 //! ```
-const ProcessMod = @This();
 const std = @import("std");
 const Thread = std.Thread;
 const compat = @import("compat.zig");

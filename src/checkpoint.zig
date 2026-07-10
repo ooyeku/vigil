@@ -206,16 +206,6 @@ pub const MemoryCheckpointer = struct {
     };
 };
 
-/// Configuration for periodic checkpointing.
-pub const CheckpointConfig = struct {
-    /// Interval between saves.
-    interval_ms: u32,
-    /// Backend used to persist serialized state.
-    checkpointer: Checkpointer,
-    /// Whether checkpointing is active.
-    enabled: bool = true,
-};
-
 test "MemoryCheckpointer save and load" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

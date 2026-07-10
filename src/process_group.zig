@@ -19,16 +19,6 @@ pub const BroadcastResult = struct {
     failed: usize = 0,
 };
 
-/// Supported routing styles for a process group.
-pub const RoutingStrategy = enum {
-    /// Send to every current member.
-    broadcast,
-    /// Distribute messages across members in insertion order.
-    round_robin,
-    /// Route messages by hashing a caller-provided key.
-    consistent_hash,
-};
-
 /// Member entry in a process group.
 pub const GroupMember = struct {
     /// Stable member id copied by `ProcessGroup.add`.
@@ -264,14 +254,6 @@ pub const ProcessGroup = struct {
 
         try member.inbox.send(payload);
     }
-
-    /// Deprecated: use `memberCount()` instead.
-    pub const count = memberCount;
-};
-
-pub const ProcessGroupError = error{
-    /// Routing was requested on an empty group.
-    NoMembers,
 };
 
 test "ProcessGroup basic operations" {

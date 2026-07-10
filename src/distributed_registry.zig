@@ -519,11 +519,6 @@ pub const DistributedRegistry = struct {
     }
 };
 
-pub const DistributedRegistryError = error{
-    InvalidNodeFormat,
-    AlreadySyncing,
-};
-
 test "DistributedRegistry basic operations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -249,6 +249,9 @@ pub fn main() !void {
     var rt = try vigil.runtime(allocator, .{});
     defer rt.deinit();
     try rt.telemetry_emitter.on(.message_sent, telemetryPrinter);
+    try rt.telemetry_emitter.on(.message_dead_lettered, telemetryPrinter);
+    try rt.telemetry_emitter.on(.message_replayed, telemetryPrinter);
+    try rt.telemetry_emitter.on(.poison_message_detected, telemetryPrinter);
     try rt.telemetry_emitter.on(.circuit_opened, telemetryPrinter);
     try rt.onShutdown(shutdownHook);
 
@@ -274,11 +277,19 @@ pub fn main() !void {
     var alerts = try rt.inbox(.{ .capacity = 8 });
     defer alerts.close();
 
+    var recovery = try rt.inbox(.{
+        .capacity = 1,
+        .dead_letter_capacity = 8,
+        .max_delivery_attempts = 3,
+    });
+    defer recovery.close();
+
     try rt.register("orders.intake", intake.mailbox);
     try rt.register("orders.fulfillment.a", fulfillment_a.mailbox);
     try rt.register("orders.fulfillment.b", fulfillment_b.mailbox);
     try rt.register("ops.audit", audit.mailbox);
     try rt.register("ops.alerts", alerts.mailbox);
+    try rt.register("ops.recovery", recovery.mailbox);
 
     var fulfillment_group = try vigil.ProcessGroup.init(allocator, "fulfillment");
     defer fulfillment_group.deinit();
@@ -328,6 +339,20 @@ pub fn main() !void {
         try processOrder(&rt, &broker, &fulfillment_group, intake, &limiter, &payment_breaker, &summary, order);
         std.debug.print("\n", .{});
     }
+
+    try recovery.send("primary job");
+    try recovery.send("retained recovery job");
+    var dead_letters = try recovery.deadLetters(allocator);
+    const recovery_id = dead_letters.entries[0].id;
+    std.debug.print("dead-letter recovery: retained={d} id={d}\n", .{ dead_letters.entries.len, recovery_id });
+    dead_letters.deinit();
+
+    var primary_job = try recovery.recv();
+    primary_job.deinit();
+    const replay = try recovery.replayDeadLetter(recovery_id);
+    std.debug.print("dead-letter recovery: replay={s}\n\n", .{@tagName(replay.status)});
+    var recovered_job = try recovery.recv();
+    recovered_job.deinit();
 
     std.debug.print("registry lookup: orders.intake is {s}\n\n", .{
         if (rt.whereis("orders.intake") != null) "registered" else "missing",

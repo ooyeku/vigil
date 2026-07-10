@@ -20,7 +20,6 @@
 //! try supervisor.start();
 //! try supervisor.startMonitoring();
 //! ```
-const SupervisorMod = @This();
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const compat = @import("compat.zig");
@@ -347,38 +346,6 @@ pub const Supervisor = struct {
         return null;
     }
 
-    /// Terminate a child process by ID.
-    /// Stops the process but keeps it in the supervision tree.
-    /// Returns error.ChildNotFound if the child does not exist.
-    pub fn terminateChild(self: *Supervisor, id: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.children.items) |*child| {
-            if (std.mem.eql(u8, child.spec.id, id)) {
-                return child.stop();
-            }
-        }
-        return error.ChildNotFound;
-    }
-
-    /// Delete a child process by ID.
-    /// Stops the process and removes it from the supervision tree.
-    /// Returns error.ChildNotFound if the child does not exist.
-    pub fn deleteChild(self: *Supervisor, id: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.children.items, 0..) |*child, i| {
-            if (std.mem.eql(u8, child.spec.id, id)) {
-                child.stop() catch {};
-                _ = self.children.orderedRemove(i);
-                return;
-            }
-        }
-        return error.ChildNotFound;
-    }
-
     /// Supervisor introspection information
     pub const InspectionInfo = struct {
         child_count: usize,
@@ -430,51 +397,6 @@ pub const Supervisor = struct {
         return null;
     }
 
-    /// Scale workers with given prefix to target count
-    pub fn scaleWorkers(self: *Supervisor, prefix: []const u8, target_count: usize) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Collect IDs of workers to remove (safer than indices)
-        var workers_to_remove: std.ArrayList([]const u8) = .empty;
-        defer workers_to_remove.deinit(self.allocator);
-
-        var current_count: usize = 0;
-        for (self.children.items) |*child| {
-            if (std.mem.startsWith(u8, child.spec.id, prefix)) {
-                current_count += 1;
-            }
-        }
-
-        if (target_count > current_count) {
-            // Add new workers - would need start_fn, simplified for now
-            _ = target_count - current_count;
-        } else if (target_count < current_count) {
-            // Collect IDs of workers to remove (from end to preserve order)
-            const to_remove = current_count - target_count;
-            var found: usize = 0;
-            var i: usize = self.children.items.len;
-            while (i > 0 and found < to_remove) {
-                i -= 1;
-                if (std.mem.startsWith(u8, self.children.items[i].spec.id, prefix)) {
-                    workers_to_remove.append(self.allocator, self.children.items[i].spec.id) catch continue;
-                    found += 1;
-                }
-            }
-
-            // Remove workers by ID (safe approach)
-            for (workers_to_remove.items) |id| {
-                for (self.children.items, 0..) |*child, idx| {
-                    if (std.mem.eql(u8, child.spec.id, id)) {
-                        child.stop() catch {};
-                        _ = self.children.orderedRemove(idx);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     /// Force restart a child
     pub fn restartChild(self: *Supervisor, id: []const u8) !void {
         self.mutex.lock();
@@ -516,19 +438,6 @@ pub const Supervisor = struct {
         return error.ChildNotFound;
     }
 
-    /// Restart history entry
-    pub const RestartHistoryEntry = struct {
-        child_id: []const u8,
-        timestamp_ms: i64,
-        reason: []const u8,
-    };
-
-    /// Get restart history (simplified - would track in real impl)
-    pub fn getRestartHistory(self: *Supervisor) []const RestartHistoryEntry {
-        _ = self;
-        return &[_]RestartHistoryEntry{};
-    }
-
     fn notifyChildCrash(self: *Supervisor, child_id: []const u8) void {
         if (self.options.crash_handler) |handler| {
             handler(child_id);
@@ -540,60 +449,6 @@ pub const Supervisor = struct {
                 .timestamp_ms = compat.milliTimestamp(),
                 .metadata = child_id,
             });
-        }
-    }
-
-    // Internal functions below this point
-
-    /// Internal function to handle child process failure according to restart strategy
-    fn handleChildFailure(self: *Supervisor, failed_child: *Process.ChildProcess) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const current_time = compat.milliTimestamp();
-        self.stats.last_failure_time = current_time;
-        self.notifyChildCrash(failed_child.spec.id);
-
-        // Reset restart count if outside time window
-        const time_diff = current_time - self.last_restart_time;
-        if (time_diff > self.options.max_seconds * 1000) {
-            self.restart_count = 0;
-        }
-
-        // Check restart limits
-        self.restart_count += 1;
-        if (self.restart_count > self.options.max_restarts) {
-            return error.TooManyRestarts;
-        }
-
-        self.last_restart_time = current_time;
-
-        // Apply restart strategy according to configuration
-        switch (self.options.strategy) {
-            .one_for_one => {
-                try failed_child.start();
-                self.stats.total_restarts += 1;
-            },
-            .one_for_all => {
-                for (self.children.items) |*child| {
-                    child.stop() catch {};
-                    try child.start();
-                }
-                self.stats.total_restarts += 1;
-            },
-            .rest_for_one => {
-                var found_failed = false;
-                for (self.children.items) |*child| {
-                    if (child == failed_child) {
-                        found_failed = true;
-                    }
-                    if (found_failed) {
-                        child.stop() catch {};
-                        try child.start();
-                    }
-                }
-                self.stats.total_restarts += 1;
-            },
         }
     }
 
@@ -673,6 +528,16 @@ pub const Supervisor = struct {
 
 test "supervisor basic operations" {
     const allocator = std.testing.allocator;
+    const WorkerGate = struct {
+        var stop = std.atomic.Value(bool).init(false);
+
+        fn run() void {
+            while (!stop.load(.acquire)) {
+                compat.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+    };
+    WorkerGate.stop.store(false, .release);
 
     const options = SupervisorOptions{
         .strategy = .one_for_one,
@@ -682,27 +547,22 @@ test "supervisor basic operations" {
 
     var supervisor = Supervisor.init(allocator, options);
     defer supervisor.deinit();
+    defer WorkerGate.stop.store(true, .release);
 
     try supervisor.addChild(.{
         .id = "test1",
-        .start_fn = struct {
-            fn testFn() void {
-                compat.sleep(200 * std.time.ns_per_ms);
-            }
-        }.testFn,
+        .start_fn = WorkerGate.run,
         .restart_type = .permanent,
         .shutdown_timeout_ms = 100,
     });
 
     try supervisor.start();
 
-    // Wait for process to start
-    compat.sleep(150 * std.time.ns_per_ms);
-
     const stats = supervisor.getStats();
     try std.testing.expect(stats.active_children == 1);
     try std.testing.expect(stats.total_restarts == 0);
 
+    WorkerGate.stop.store(true, .release);
     try supervisor.shutdown(5000);
 
     // Verify shutdown completed successfully

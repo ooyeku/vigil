@@ -1,9 +1,8 @@
 //! Graceful shutdown for Vigil.
 //!
 //! A `ShutdownManager` stores plain function hooks and runs them in forward or
-//! reverse order. New v2 applications should usually use `Runtime.onShutdown`
-//! and `Runtime.shutdown`; the global helpers remain for compatibility and
-//! process-wide integrations.
+//! reverse order. New applications should usually use `Runtime.onShutdown`
+//! and `Runtime.shutdown`.
 
 const std = @import("std");
 const compat = @import("compat.zig");
@@ -102,62 +101,6 @@ pub const ShutdownManager = struct {
         }
     }
 };
-
-/// Optional process-wide shutdown manager.
-var global_shutdown: ?ShutdownManager = null;
-var shutdown_mutex: compat.Mutex = .{};
-
-/// Initialize the optional global shutdown manager if needed.
-pub fn initGlobal(allocator: std.mem.Allocator) !void {
-    shutdown_mutex.lock();
-    defer shutdown_mutex.unlock();
-
-    if (global_shutdown == null) {
-        global_shutdown = ShutdownManager.init(allocator);
-    }
-}
-
-/// Deinitialize and release the global shutdown manager.
-/// Must only be called during shutdown when no other threads are
-/// registering hooks or calling shutdownAll.
-pub fn deinitGlobal() void {
-    shutdown_mutex.lock();
-    defer shutdown_mutex.unlock();
-
-    if (global_shutdown) |*s| {
-        s.deinit();
-        global_shutdown = null;
-    }
-}
-
-/// Get global shutdown manager.
-///
-/// SAFETY: The returned pointer is valid as long as `deinitGlobal()` has
-/// not been called.  Callers must ensure `deinitGlobal()` is only invoked
-/// after all shutdown operations have completed.
-pub fn getGlobal() ?*ShutdownManager {
-    shutdown_mutex.lock();
-    defer shutdown_mutex.unlock();
-    return if (global_shutdown) |*s| s else null;
-}
-
-/// Register a hook with the optional global shutdown manager.
-///
-/// Does nothing when the global manager has not been initialized.
-pub fn onShutdown(hook: ShutdownHook) !void {
-    if (getGlobal()) |manager| {
-        try manager.onShutdown(hook);
-    }
-}
-
-/// Run hooks registered with the optional global shutdown manager.
-///
-/// Does nothing when the global manager has not been initialized.
-pub fn shutdownAll(options: ShutdownOptions) void {
-    if (getGlobal()) |manager| {
-        manager.shutdown(options);
-    }
-}
 
 test "ShutdownManager hooks" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

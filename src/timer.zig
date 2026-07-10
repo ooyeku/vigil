@@ -55,10 +55,16 @@ pub const Timer = struct {
         self.joinExistingThread();
     }
 
-    /// Request cancellation of the active timeout or interval.
+    /// Cancel active work and wait for the timer thread to stop.
+    ///
+    /// Callbacks must not call `cancel()` on their own timer.
     pub fn cancel(self: *Timer) void {
         if (self.context) |ctx| {
             ctx.cancelled.store(true, .release);
+        }
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
         }
     }
 

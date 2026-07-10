@@ -5,8 +5,9 @@
 //! what an inbox should do once queued work crosses a high-water mark.
 
 const std = @import("std");
-const Message = @import("../messages.zig").Message;
-const MessageError = @import("../messages.zig").MessageError;
+const messages = @import("../messages.zig");
+const Message = messages.Message;
+const MessageError = messages.MessageError;
 const compat = @import("../compat.zig");
 
 /// Policy applied when queued messages reach a configured high-water mark.
@@ -202,7 +203,7 @@ pub const FlowControlledInbox = struct {
     }
 
     /// Return statistics from the wrapped inbox.
-    pub fn stats(self: *FlowControlledInbox) @import("../legacy.zig").MailboxStats {
+    pub fn stats(self: *FlowControlledInbox) messages.ProcessMailbox.MailboxStats {
         return self.inbox.stats();
     }
 };

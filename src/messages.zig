@@ -37,13 +37,11 @@
 //!     // Handle expired message
 //! }
 //! ```
-const MessageMod = @This();
 const std = @import("std");
 const compat = @import("compat.zig");
 const Mutex = compat.Mutex;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const Time = std.time.Time;
 
 /// Error set for message handling operations.
 /// These errors cover the full range of potential failures in message processing,
@@ -77,6 +75,8 @@ pub const MessageError = error{
     RateLimitExceeded,
     /// Message could not be delivered to a subscriber.
     DeliveryFailed,
+    /// Dead-letter storage is enabled but has reached its configured capacity.
+    DeadLetterFull,
 };
 
 /// Message priority levels for handling urgent communications.
@@ -221,7 +221,7 @@ pub const Signal = enum {
 /// - trace_id: ?[]const u8, // For distributed tracing
 /// - size_bytes: usize, // Total message size in bytes
 pub const MessageMetadata = struct {
-    /// Creation timestamp in Unix seconds.
+    /// Creation timestamp in Unix milliseconds.
     timestamp: i64,
     /// Time-to-live in milliseconds. Null means no expiry.
     ttl_ms: ?u32,
@@ -331,7 +331,7 @@ pub const Message = struct {
             .signal = signal,
             .priority = priority,
             .metadata = .{
-                .timestamp = compat.timestamp(),
+                .timestamp = compat.milliTimestamp(),
                 .ttl_ms = ttl_ms,
                 .correlation_id = null,
                 .reply_to = null,
@@ -364,9 +364,9 @@ pub const Message = struct {
     /// Return true if the message has a TTL and that TTL has elapsed.
     pub fn isExpired(self: Message) bool {
         if (self.metadata.ttl_ms) |ttl| {
-            const current_time = compat.timestamp();
-            const elapsed_ms = @as(u64, @intCast(current_time - self.metadata.timestamp)) * 1000;
-            return elapsed_ms >= ttl;
+            const current_time_ms = compat.milliTimestamp();
+            if (current_time_ms <= self.metadata.timestamp) return false;
+            return current_time_ms - self.metadata.timestamp >= @as(i64, ttl);
         }
         return false;
     }
@@ -376,10 +376,11 @@ pub const Message = struct {
     /// The id is copied.
     /// Useful for request-response patterns and message chains.
     pub fn setCorrelationId(self: *Message, correlation_id: []const u8) !void {
+        const id_copy = try self.allocator.dupe(u8, correlation_id);
         if (self.metadata.correlation_id) |old_id| {
             self.allocator.free(old_id);
         }
-        self.metadata.correlation_id = try self.allocator.dupe(u8, correlation_id);
+        self.metadata.correlation_id = id_copy;
     }
 
     /// Set or replace the reply-to address for responses.
@@ -387,10 +388,11 @@ pub const Message = struct {
     /// The address is copied.
     /// Required for createResponse() to work.
     pub fn setReplyTo(self: *Message, reply_to: []const u8) !void {
+        const reply_to_copy = try self.allocator.dupe(u8, reply_to);
         if (self.metadata.reply_to) |old_rt| {
             self.allocator.free(old_rt);
         }
-        self.metadata.reply_to = try self.allocator.dupe(u8, reply_to);
+        self.metadata.reply_to = reply_to_copy;
     }
 
     /// Create a response message to this message.
@@ -429,26 +431,31 @@ pub const Message = struct {
     ///
     /// The returned message is independent and must be deinitialized.
     pub fn dupe(self: *const Message) !Message {
-        const new_id = try self.allocator.dupe(u8, self.id);
-        errdefer self.allocator.free(new_id);
+        return self.cloneWithAllocator(self.allocator);
+    }
 
-        const new_sender = try self.allocator.dupe(u8, self.sender);
-        errdefer self.allocator.free(new_sender);
+    /// Deep-copy this message using `allocator` for the returned ownership.
+    pub fn cloneWithAllocator(self: *const Message, allocator: Allocator) !Message {
+        const new_id = try allocator.dupe(u8, self.id);
+        errdefer allocator.free(new_id);
 
-        const new_payload = if (self.payload) |p| try self.allocator.dupe(u8, p) else null;
-        errdefer if (new_payload) |p| self.allocator.free(p);
+        const new_sender = try allocator.dupe(u8, self.sender);
+        errdefer allocator.free(new_sender);
+
+        const new_payload = if (self.payload) |p| try allocator.dupe(u8, p) else null;
+        errdefer if (new_payload) |p| allocator.free(p);
 
         // Duplicate metadata strings
         var new_reply_to: ?[]const u8 = null;
         if (self.metadata.reply_to) |rt| {
-            new_reply_to = try self.allocator.dupe(u8, rt);
-            errdefer self.allocator.free(new_reply_to.?);
+            new_reply_to = try allocator.dupe(u8, rt);
+            errdefer allocator.free(new_reply_to.?);
         }
 
         var new_correlation_id: ?[]const u8 = null;
         if (self.metadata.correlation_id) |cid| {
-            new_correlation_id = try self.allocator.dupe(u8, cid);
-            errdefer self.allocator.free(new_correlation_id.?);
+            new_correlation_id = try allocator.dupe(u8, cid);
+            errdefer allocator.free(new_correlation_id.?);
         }
 
         return Message{
@@ -466,9 +473,90 @@ pub const Message = struct {
                 .trace_id = self.metadata.trace_id,
                 .size_bytes = self.metadata.size_bytes,
             },
-            .allocator = self.allocator,
+            .allocator = allocator,
         };
     }
+};
+
+/// Why a message was moved out of the active mailbox.
+pub const DeadLetterReason = enum {
+    mailbox_full,
+    expired,
+    delivery_failed,
+    manual,
+    max_attempts,
+};
+
+/// Immutable scalar information about a dead-letter lifecycle event.
+pub const DeadLetterNotice = struct {
+    id: u64,
+    reason: DeadLetterReason,
+    attempt_count: u32,
+    poisoned: bool,
+    newly_poisoned: bool = false,
+};
+
+/// One mailbox-owned dead-letter entry.
+pub const DeadLetterEntry = struct {
+    id: u64,
+    message: Message,
+    reason: DeadLetterReason,
+    dead_lettered_at_ms: i64,
+    poisoned: bool,
+
+    pub fn deinit(self: *const DeadLetterEntry) void {
+        self.message.deinit();
+    }
+
+    fn cloneWithAllocator(self: *const DeadLetterEntry, allocator: Allocator) !DeadLetterEntry {
+        return .{
+            .id = self.id,
+            .message = try self.message.cloneWithAllocator(allocator),
+            .reason = self.reason,
+            .dead_lettered_at_ms = self.dead_lettered_at_ms,
+            .poisoned = self.poisoned,
+        };
+    }
+
+    fn notice(self: *const DeadLetterEntry, newly_poisoned: bool) DeadLetterNotice {
+        return .{
+            .id = self.id,
+            .reason = self.reason,
+            .attempt_count = self.message.metadata.attempt_count,
+            .poisoned = self.poisoned,
+            .newly_poisoned = newly_poisoned,
+        };
+    }
+};
+
+/// Owned copy of a mailbox's current dead-letter entries.
+pub const DeadLetterSnapshot = struct {
+    allocator: Allocator,
+    entries: []DeadLetterEntry,
+
+    pub fn deinit(self: *DeadLetterSnapshot) void {
+        for (self.entries) |*entry| entry.deinit();
+        self.allocator.free(self.entries);
+    }
+};
+
+/// Result of accepting a message into the active queue or dead-letter storage.
+pub const MessageDelivery = union(enum) {
+    enqueued,
+    dead_lettered: DeadLetterNotice,
+};
+
+/// Result of trying to move a dead-letter entry back to the active queue.
+pub const DeadLetterReplayStatus = enum {
+    replayed,
+    retained,
+    poison,
+    not_found,
+};
+
+pub const DeadLetterReplayResult = struct {
+    status: DeadLetterReplayStatus,
+    notice: ?DeadLetterNotice,
 };
 
 /// Configuration options for mailbox behavior.
@@ -490,8 +578,12 @@ pub const MailboxConfig = struct {
     default_ttl_ms: ?u32 = 60_000,
     /// Enable priority-based queues.
     priority_queues: bool = true,
-    /// Enable the dead-letter queue for overflowed priority messages.
+    /// Enable dead-letter storage for undeliverable messages.
     enable_deadletter: bool = true,
+    /// Maximum retained dead-letter entries. Zero rejects all dead letters.
+    dead_letter_capacity: usize = 100,
+    /// Failed delivery attempts after which a rejected message becomes poison.
+    max_delivery_attempts: u32 = 3,
 };
 
 /// Process mailbox with priority queues and monitoring.
@@ -511,10 +603,7 @@ pub const MailboxConfig = struct {
 /// - deinit: fn (self: *ProcessMailbox) void
 /// - send: fn (self: *ProcessMailbox, msg: Message) MessageError!void
 /// - receive: fn (self: *ProcessMailbox) MessageError!Message
-/// - peek: fn (self: *ProcessMailbox) MessageError!Message
-/// - clear: fn (self: *ProcessMailbox) void
 /// - getStats: fn (self: *ProcessMailbox) MailboxStats
-/// - hasCapacity: fn (self: *ProcessMailbox, msg_size: usize) bool
 ///
 /// Example:
 /// ```zig
@@ -543,8 +632,12 @@ pub const ProcessMailbox = struct {
     messages: std.ArrayList(Message),
     /// Priority queues indexed by `MessagePriority.toInt()`.
     priority_queues: ?[5]std.ArrayList(Message),
-    /// Queue for undeliverable messages when enabled.
-    deadletter_queue: ?std.ArrayList(Message),
+    /// Bounded queue for undeliverable messages when enabled.
+    deadletter_queue: ?std.ArrayList(DeadLetterEntry),
+    /// Monotonic identifier assigned to the next dead-letter entry.
+    next_dead_letter_id: u64,
+    /// Current number of poison entries in dead-letter storage.
+    current_poison_count: usize,
     /// Protects queue state.
     mutex: Mutex,
     /// Mailbox behavior settings.
@@ -564,6 +657,14 @@ pub const ProcessMailbox = struct {
         messages_expired: usize = 0,
         /// Messages dropped due to constraints.
         messages_dropped: usize = 0,
+        /// Messages retained in dead-letter storage.
+        messages_dead_lettered: usize = 0,
+        /// Dead-letter entries successfully returned to the active queue.
+        dead_letters_replayed: usize = 0,
+        /// Dead-letter entries explicitly discarded.
+        dead_letters_discarded: usize = 0,
+        /// Messages classified as poison after repeated failed delivery.
+        poison_messages: usize = 0,
         /// Maximum queue size reached.
         peak_usage: usize = 0,
         /// Total size of queued messages.
@@ -584,6 +685,8 @@ pub const ProcessMailbox = struct {
                 .empty
             else
                 null,
+            .next_dead_letter_id = 1,
+            .current_poison_count = 0,
             .mutex = .{},
             .config = config,
             .stats = .{},
@@ -614,8 +717,8 @@ pub const ProcessMailbox = struct {
 
         // Clean up deadletter queue if enabled
         if (self.deadletter_queue) |*queue| {
-            for (queue.items) |*msg| {
-                msg.deinit();
+            for (queue.items) |*entry| {
+                entry.deinit();
             }
             queue.deinit(self.allocator);
         }
@@ -626,70 +729,174 @@ pub const ProcessMailbox = struct {
     /// This function consumes `msg`; after calling it, do not use or deinit the
     /// original message value, even when an error is returned.
     pub fn send(self: *ProcessMailbox, msg: Message) MessageError!void {
+        _ = try self.sendWithDisposition(msg);
+    }
+
+    /// Send a message and report whether it entered the active or dead-letter queue.
+    ///
+    /// This function consumes `msg` on both success and error.
+    pub fn sendWithDisposition(self: *ProcessMailbox, msg: Message) MessageError!MessageDelivery {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Take ownership of the message
         var msg_mut = msg;
         errdefer msg_mut.deinit();
 
-        // Validate message size
         if (msg_mut.metadata.size_bytes > self.config.max_message_size) {
             return MessageError.MessageTooLarge;
         }
 
-        // Check for expired TTL
+        if (msg_mut.metadata.ttl_ms == null) {
+            msg_mut.metadata.ttl_ms = self.config.default_ttl_ms;
+        }
+
         if (msg_mut.isExpired()) {
             self.stats.messages_expired += 1;
+            if (self.deadletter_queue != null) {
+                const notice = self.appendDeadLetterLocked(msg_mut, .expired) catch |err| {
+                    self.stats.messages_dropped += 1;
+                    return err;
+                };
+                return .{ .dead_lettered = notice };
+            }
+            self.stats.messages_dropped += 1;
             return MessageError.MessageExpired;
         }
 
-        // Handle priority queues if enabled
-        if (self.priority_queues) |*queues| {
-            const queue_idx = msg_mut.priority.toInt();
-            const queue = &queues[queue_idx];
-
-            if (queue.items.len >= self.config.capacity) {
-                // Try to move to deadletter queue if enabled
-                if (self.deadletter_queue) |*dlq| {
-                    dlq.append(self.allocator, msg_mut) catch |err| switch (err) {
-                        error.OutOfMemory => {
-                            return MessageError.OutOfMemory;
-                        },
-                    };
+        if (self.activeQueuedCountLocked() >= self.config.capacity) {
+            if (self.deadletter_queue != null) {
+                const notice = self.appendDeadLetterLocked(msg_mut, .mailbox_full) catch |err| {
                     self.stats.messages_dropped += 1;
-                    return;
-                }
-                self.stats.messages_dropped += 1;
-                return MessageError.MailboxFull;
+                    return err;
+                };
+                return .{ .dead_lettered = notice };
             }
-
-            queue.append(self.allocator, msg_mut) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    return MessageError.OutOfMemory;
-                },
-            };
-        } else {
-            // Use standard queue
-            if (self.messages.items.len >= self.config.capacity) {
-                self.stats.messages_dropped += 1;
-                return MessageError.MailboxFull;
-            }
-
-            self.messages.append(self.allocator, msg_mut) catch |err| switch (err) {
-                error.OutOfMemory => {
-                    return MessageError.OutOfMemory;
-                },
-            };
+            self.stats.messages_dropped += 1;
+            return MessageError.MailboxFull;
         }
 
-        // Update stats
-        self.stats.messages_received += 1;
-        self.stats.total_size_bytes += msg_mut.metadata.size_bytes;
-        self.stats.peak_usage = @max(
-            self.stats.peak_usage,
-            self.messages.items.len,
-        );
+        try self.appendActiveLocked(msg_mut, true);
+        return .enqueued;
+    }
+
+    /// Move a caller-owned failed message into dead-letter storage.
+    ///
+    /// The message is consumed on both success and error. Messages rejected
+    /// after `max_delivery_attempts` are classified as poison.
+    pub fn deadLetter(self: *ProcessMailbox, msg: Message, reason: DeadLetterReason) MessageError!DeadLetterNotice {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var msg_mut = msg;
+        errdefer msg_mut.deinit();
+
+        if (reason == .delivery_failed and msg_mut.metadata.attempt_count == 0) {
+            msg_mut.metadata.attempt_count = 1;
+        }
+        if (self.deadletter_queue == null) {
+            self.stats.messages_dropped += 1;
+            return MessageError.DeliveryFailed;
+        }
+        return self.appendDeadLetterLocked(msg_mut, reason) catch |err| {
+            self.stats.messages_dropped += 1;
+            return err;
+        };
+    }
+
+    /// Return an owned, deep-copy snapshot of all dead-letter entries.
+    pub fn snapshotDeadLetters(self: *ProcessMailbox, allocator: Allocator) !DeadLetterSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const queue = self.deadletter_queue orelse return .{
+            .allocator = allocator,
+            .entries = try allocator.alloc(DeadLetterEntry, 0),
+        };
+        const entries = try allocator.alloc(DeadLetterEntry, queue.items.len);
+        errdefer allocator.free(entries);
+
+        var written: usize = 0;
+        errdefer for (entries[0..written]) |*entry| entry.deinit();
+        for (queue.items) |*entry| {
+            entries[written] = try entry.cloneWithAllocator(allocator);
+            written += 1;
+        }
+        return .{ .allocator = allocator, .entries = entries };
+    }
+
+    /// Return the number of retained dead-letter entries.
+    pub fn deadLetterCount(self: *ProcessMailbox) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return if (self.deadletter_queue) |queue| queue.items.len else 0;
+    }
+
+    /// Return the number of currently retained poison entries.
+    pub fn poisonCount(self: *ProcessMailbox) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.current_poison_count;
+    }
+
+    /// Try to replay one dead-letter entry by its stable mailbox-local id.
+    ///
+    /// A full active queue retains the entry for a later replay. Poison entries
+    /// are never replayed implicitly.
+    pub fn replayDeadLetter(self: *ProcessMailbox, id: u64) MessageError!DeadLetterReplayResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const queue = if (self.deadletter_queue) |*deadletters| deadletters else return .{
+            .status = .not_found,
+            .notice = null,
+        };
+        const index = findDeadLetterIndex(queue.items, id) orelse return .{
+            .status = .not_found,
+            .notice = null,
+        };
+        const entry = &queue.items[index];
+        const notice = entry.notice(false);
+        if (entry.poisoned) return .{ .status = .poison, .notice = notice };
+        if (self.activeQueuedCountLocked() >= self.config.capacity) {
+            return .{ .status = .retained, .notice = notice };
+        }
+
+        // A replay is a new delivery window, so renew the original TTL clock.
+        entry.message.metadata.timestamp = compat.milliTimestamp();
+        try self.appendActiveLocked(entry.message, false);
+        _ = queue.orderedRemove(index);
+        self.stats.dead_letters_replayed += 1;
+        return .{ .status = .replayed, .notice = notice };
+    }
+
+    /// Discard and deinitialize one dead-letter entry.
+    pub fn discardDeadLetter(self: *ProcessMailbox, id: u64) ?DeadLetterNotice {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const queue = if (self.deadletter_queue) |*deadletters| deadletters else return null;
+        const index = findDeadLetterIndex(queue.items, id) orelse return null;
+        var entry = queue.orderedRemove(index);
+        const notice = entry.notice(false);
+        if (entry.poisoned) self.current_poison_count -= 1;
+        entry.deinit();
+        self.stats.dead_letters_discarded += 1;
+        return notice;
+    }
+
+    /// Discard and deinitialize every retained dead-letter entry.
+    pub fn discardAllDeadLetters(self: *ProcessMailbox) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const queue = if (self.deadletter_queue) |*deadletters| deadletters else return 0;
+        const discarded = queue.items.len;
+        for (queue.items) |*entry| entry.deinit();
+        queue.clearRetainingCapacity();
+        self.current_poison_count = 0;
+        self.stats.dead_letters_discarded += discarded;
+        return discarded;
     }
 
     /// Receive the next message with priority handling.
@@ -725,7 +932,8 @@ pub const ProcessMailbox = struct {
                         self.stats.total_size_bytes -= msg.metadata.size_bytes;
                         continue;
                     }
-                    const msg = queue.orderedRemove(0);
+                    var msg = queue.orderedRemove(0);
+                    msg.metadata.attempt_count +|= 1;
                     self.stats.messages_sent += 1;
                     self.stats.total_size_bytes -= msg.metadata.size_bytes;
                     return msg;
@@ -760,69 +968,42 @@ pub const ProcessMailbox = struct {
             return MessageError.EmptyMailbox;
         }
 
-        const msg = self.messages.orderedRemove(0);
+        var msg = self.messages.orderedRemove(0);
+        msg.metadata.attempt_count +|= 1;
         self.stats.messages_sent += 1;
         self.stats.total_size_bytes -= msg.metadata.size_bytes;
         return msg;
     }
 
-    /// Return a copy of the next message value without removing it.
+    /// Drop and deinitialize the oldest active message without delivering it.
     ///
-    /// The mailbox still owns the underlying message storage. Do not call
-    /// `deinit()` on the returned value.
-    pub fn peek(self: *ProcessMailbox) MessageError!Message {
+    /// Returns false when the mailbox is empty. This is used by send-side
+    /// backpressure and does not increment delivery-attempt or sent counters.
+    pub fn dropOldest(self: *ProcessMailbox) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.priority_queues) |queues| {
-            // Check queues in priority order
-            for (queues) |queue| {
-                if (queue.items.len > 0) {
-                    const msg = queue.items[0];
-                    if (msg.isExpired()) {
-                        return MessageError.MessageExpired;
-                    }
-                    return msg;
-                }
-            }
-            return MessageError.EmptyMailbox;
-        }
-
-        if (self.messages.items.len == 0) {
-            return MessageError.EmptyMailbox;
-        }
-
-        const msg = self.messages.items[0];
-        if (msg.isExpired()) {
-            return MessageError.MessageExpired;
-        }
-
-        return msg;
-    }
-
-    /// Deinitialize and remove all queued messages.
-    pub fn clear(self: *ProcessMailbox) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Clear main message queue
-        for (self.messages.items) |*msg| {
-            msg.deinit();
-        }
-        self.messages.clearRetainingCapacity();
-
-        // Clear priority queues if enabled
+        var dropped: Message = undefined;
         if (self.priority_queues) |*queues| {
-            for (queues) |*queue| {
-                for (queue.items) |*msg| {
-                    msg.deinit();
+            var selected_queue: ?usize = null;
+            var oldest_timestamp: i64 = std.math.maxInt(i64);
+            for (queues, 0..) |queue, index| {
+                if (queue.items.len > 0 and queue.items[0].metadata.timestamp < oldest_timestamp) {
+                    selected_queue = index;
+                    oldest_timestamp = queue.items[0].metadata.timestamp;
                 }
-                queue.clearRetainingCapacity();
             }
+            const index = selected_queue orelse return false;
+            dropped = queues[index].orderedRemove(0);
+        } else {
+            if (self.messages.items.len == 0) return false;
+            dropped = self.messages.orderedRemove(0);
         }
 
-        // Reset stats
-        self.stats.total_size_bytes = 0;
+        self.stats.messages_dropped += 1;
+        self.stats.total_size_bytes -= dropped.metadata.size_bytes;
+        dropped.deinit();
+        return true;
     }
 
     /// Return a snapshot of mailbox statistics.
@@ -836,36 +1017,66 @@ pub const ProcessMailbox = struct {
     pub fn queuedCount(self: *ProcessMailbox) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.activeQueuedCountLocked();
+    }
 
+    fn activeQueuedCountLocked(self: *ProcessMailbox) usize {
         if (self.priority_queues) |queues| {
             var total: usize = 0;
-            for (queues) |queue| {
-                total += queue.items.len;
-            }
+            for (queues) |queue| total += queue.items.len;
             return total;
         }
-
         return self.messages.items.len;
     }
 
-    /// Return whether a message of `msg_size` can currently be accepted.
-    pub fn hasCapacity(self: *ProcessMailbox, msg_size: usize) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (msg_size > self.config.max_message_size) {
-            return false;
+    fn appendActiveLocked(self: *ProcessMailbox, msg: Message, count_received: bool) MessageError!void {
+        if (self.priority_queues) |*queues| {
+            queues[msg.priority.toInt()].append(self.allocator, msg) catch return MessageError.OutOfMemory;
+        } else {
+            self.messages.append(self.allocator, msg) catch return MessageError.OutOfMemory;
         }
+        if (count_received) self.stats.messages_received += 1;
+        self.stats.total_size_bytes += msg.metadata.size_bytes;
+        self.stats.peak_usage = @max(self.stats.peak_usage, self.activeQueuedCountLocked());
+    }
 
-        const current_count = if (self.priority_queues) |queues| blk: {
-            var total: usize = 0;
-            for (queues) |queue| {
-                total += queue.items.len;
-            }
-            break :blk total;
-        } else self.messages.items.len;
+    fn appendDeadLetterLocked(
+        self: *ProcessMailbox,
+        msg: Message,
+        requested_reason: DeadLetterReason,
+    ) MessageError!DeadLetterNotice {
+        const queue = if (self.deadletter_queue) |*deadletters| deadletters else return MessageError.DeliveryFailed;
+        if (queue.items.len >= self.config.dead_letter_capacity) return MessageError.DeadLetterFull;
 
-        return current_count < self.config.capacity;
+        const attempt_limit = @max(@as(u32, 1), self.config.max_delivery_attempts);
+        const poisoned = requested_reason == .max_attempts or
+            (requested_reason == .delivery_failed and msg.metadata.attempt_count >= attempt_limit);
+        const reason: DeadLetterReason = if (poisoned) .max_attempts else requested_reason;
+        const id = self.next_dead_letter_id;
+        self.next_dead_letter_id +%= 1;
+        if (self.next_dead_letter_id == 0) self.next_dead_letter_id = 1;
+
+        const entry: DeadLetterEntry = .{
+            .id = id,
+            .message = msg,
+            .reason = reason,
+            .dead_lettered_at_ms = compat.milliTimestamp(),
+            .poisoned = poisoned,
+        };
+        queue.append(self.allocator, entry) catch return MessageError.OutOfMemory;
+        self.stats.messages_dead_lettered += 1;
+        if (poisoned) {
+            self.stats.poison_messages += 1;
+            self.current_poison_count += 1;
+        }
+        return entry.notice(poisoned);
+    }
+
+    fn findDeadLetterIndex(entries: []const DeadLetterEntry, id: u64) ?usize {
+        for (entries, 0..) |entry, index| {
+            if (entry.id == id) return index;
+        }
+        return null;
     }
 };
 
@@ -952,7 +1163,7 @@ test "Message TTL and expiration" {
     try mailbox.send(msg);
 
     // Set timestamp in the past to force expiration on next receive
-    mailbox.messages.items[0].metadata.timestamp -= 2;
+    mailbox.messages.items[0].metadata.timestamp -= 2_000;
 
     // Try to receive - should get EmptyMailbox since expired messages are removed
     try testing.expectError(MessageError.EmptyMailbox, mailbox.receive());
@@ -999,6 +1210,38 @@ test "Message correlation and response" {
     }
 }
 
+test "Message metadata replacement preserves old values on allocation failure" {
+    var correlation_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
+    var correlation_message = try Message.init(
+        correlation_allocator.allocator(),
+        "id",
+        "sender",
+        "payload",
+        null,
+        .normal,
+        null,
+    );
+    defer correlation_message.deinit();
+    try correlation_message.setCorrelationId("old-correlation");
+    try testing.expectError(error.OutOfMemory, correlation_message.setCorrelationId("new-correlation"));
+    try testing.expectEqualStrings("old-correlation", correlation_message.metadata.correlation_id.?);
+
+    var reply_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
+    var reply_message = try Message.init(
+        reply_allocator.allocator(),
+        "id",
+        "sender",
+        "payload",
+        null,
+        .normal,
+        null,
+    );
+    defer reply_message.deinit();
+    try reply_message.setReplyTo("old-reply");
+    try testing.expectError(error.OutOfMemory, reply_message.setReplyTo("new-reply"));
+    try testing.expectEqualStrings("old-reply", reply_message.metadata.reply_to.?);
+}
+
 test "Mailbox capacity and message size limits" {
     const allocator = testing.allocator;
     var mailbox = ProcessMailbox.init(allocator, .{
@@ -1039,4 +1282,151 @@ test "ProcessMailbox queuedCount reports actual queued messages" {
     var received = try mailbox.receive();
     defer received.deinit();
     try testing.expectEqual(@as(usize, 1), mailbox.queuedCount());
+}
+
+test "ProcessMailbox retains overflow in bounded dead-letter storage" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 1,
+        .priority_queues = false,
+        .dead_letter_capacity = 1,
+    });
+    defer mailbox.deinit();
+
+    try mailbox.send(try Message.init(allocator, "active", "sender", "one", null, .normal, null));
+    const overflow = try mailbox.sendWithDisposition(
+        try Message.init(allocator, "overflow", "sender", "two", null, .normal, null),
+    );
+    const first_notice = switch (overflow) {
+        .enqueued => return error.ExpectedDeadLetter,
+        .dead_lettered => |notice| notice,
+    };
+    try testing.expectEqual(@as(u64, 1), first_notice.id);
+    try testing.expectEqual(DeadLetterReason.mailbox_full, first_notice.reason);
+    try testing.expectEqual(@as(usize, 1), mailbox.deadLetterCount());
+
+    try testing.expectError(
+        MessageError.DeadLetterFull,
+        mailbox.send(try Message.init(allocator, "overflow-2", "sender", "three", null, .normal, null)),
+    );
+    const stats = mailbox.getStats();
+    try testing.expectEqual(@as(usize, 1), stats.messages_dead_lettered);
+    try testing.expectEqual(@as(usize, 1), stats.messages_dropped);
+}
+
+test "ProcessMailbox snapshots replays and discards dead letters" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 1,
+        .priority_queues = true,
+        .dead_letter_capacity = 4,
+    });
+    defer mailbox.deinit();
+
+    try mailbox.send(try Message.init(allocator, "active", "sender", "one", null, .low, null));
+    try mailbox.send(try Message.init(allocator, "retained", "sender", "two", null, .critical, null));
+
+    var snapshot = try mailbox.snapshotDeadLetters(allocator);
+    defer snapshot.deinit();
+    try testing.expectEqual(@as(usize, 1), snapshot.entries.len);
+    try testing.expectEqualStrings("retained", snapshot.entries[0].message.id);
+    const dead_letter_id = snapshot.entries[0].id;
+
+    const retained = try mailbox.replayDeadLetter(dead_letter_id);
+    try testing.expectEqual(DeadLetterReplayStatus.retained, retained.status);
+
+    var active = try mailbox.receive();
+    active.deinit();
+    const replayed = try mailbox.replayDeadLetter(dead_letter_id);
+    try testing.expectEqual(DeadLetterReplayStatus.replayed, replayed.status);
+    try testing.expectEqual(@as(usize, 0), mailbox.deadLetterCount());
+
+    var delivered = try mailbox.receive();
+    defer delivered.deinit();
+    try testing.expectEqualStrings("retained", delivered.id);
+    try testing.expectEqual(@as(u32, 1), delivered.metadata.attempt_count);
+
+    try testing.expectEqual(@as(usize, 0), mailbox.discardAllDeadLetters());
+    const stats = mailbox.getStats();
+    try testing.expectEqual(@as(usize, 1), stats.dead_letters_replayed);
+}
+
+test "ProcessMailbox classifies repeatedly rejected delivery as poison" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 1,
+        .dead_letter_capacity = 4,
+        .max_delivery_attempts = 2,
+    });
+    defer mailbox.deinit();
+
+    try mailbox.send(try Message.init(allocator, "job", "sender", "work", null, .normal, null));
+    const first_attempt = try mailbox.receive();
+    const first_dead_letter = try mailbox.deadLetter(first_attempt, .delivery_failed);
+    try testing.expect(!first_dead_letter.poisoned);
+
+    const first_replay = try mailbox.replayDeadLetter(first_dead_letter.id);
+    try testing.expectEqual(DeadLetterReplayStatus.replayed, first_replay.status);
+    const second_attempt = try mailbox.receive();
+    const poison = try mailbox.deadLetter(second_attempt, .delivery_failed);
+    try testing.expect(poison.poisoned);
+    try testing.expect(poison.newly_poisoned);
+    try testing.expectEqual(DeadLetterReason.max_attempts, poison.reason);
+
+    const poison_replay = try mailbox.replayDeadLetter(poison.id);
+    try testing.expectEqual(DeadLetterReplayStatus.poison, poison_replay.status);
+    try testing.expect(mailbox.discardDeadLetter(poison.id) != null);
+    try testing.expectEqual(@as(usize, 0), mailbox.deadLetterCount());
+
+    const stats = mailbox.getStats();
+    try testing.expectEqual(@as(usize, 1), stats.poison_messages);
+    try testing.expectEqual(@as(usize, 1), stats.dead_letters_discarded);
+}
+
+test "ProcessMailbox serializes concurrent replay and discard" {
+    const allocator = std.heap.smp_allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 1,
+        .dead_letter_capacity = 4,
+    });
+    defer mailbox.deinit();
+
+    try mailbox.send(try Message.init(allocator, "active", "sender", "one", null, .normal, null));
+    const overflow = try mailbox.sendWithDisposition(
+        try Message.init(allocator, "overflow", "sender", "two", null, .normal, null),
+    );
+    const id = switch (overflow) {
+        .enqueued => return error.ExpectedDeadLetter,
+        .dead_lettered => |notice| notice.id,
+    };
+    var active = try mailbox.receive();
+    active.deinit();
+
+    const Context = struct {
+        target: *ProcessMailbox,
+        id: u64,
+    };
+    const replay = struct {
+        fn run(context: Context) void {
+            _ = context.target.replayDeadLetter(context.id) catch return;
+        }
+    }.run;
+    const discard = struct {
+        fn run(context: Context) void {
+            _ = context.target.discardDeadLetter(context.id);
+        }
+    }.run;
+    const context = Context{ .target = &mailbox, .id = id };
+    const replay_thread = try std.Thread.spawn(.{}, replay, .{context});
+    const discard_thread = try std.Thread.spawn(.{}, discard, .{context});
+    replay_thread.join();
+    discard_thread.join();
+
+    try testing.expect(mailbox.deadLetterCount() + mailbox.queuedCount() <= 1);
+    if (mailbox.receive()) |message| {
+        var owned = message;
+        owned.deinit();
+    } else |err| try testing.expectEqual(MessageError.EmptyMailbox, err);
+    const stats = mailbox.getStats();
+    try testing.expectEqual(@as(usize, 1), stats.dead_letters_replayed + stats.dead_letters_discarded);
 }

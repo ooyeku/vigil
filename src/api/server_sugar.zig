@@ -13,20 +13,18 @@
 //! ```
 
 const std = @import("std");
-const legacy = @import("../legacy.zig");
+const messages = @import("../messages.zig");
+const genserver = @import("../genserver.zig");
 const compat = @import("../compat.zig");
 
-pub const Message = legacy.Message;
-pub const GenServer = legacy.GenServer;
+pub const Message = messages.Message;
+pub const GenServer = genserver.GenServer;
 
 /// Options for synchronous `call` requests.
 pub const CallOptions = struct {
     /// Optional timeout in milliseconds.
     timeout: ?u32 = 5000,
 };
-
-/// Options for asynchronous `cast` requests.
-pub const CastOptions = struct {};
 
 /// Generate a typed GenServer wrapper from state and handlers.
 ///
@@ -39,6 +37,7 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
     return struct {
         const Wrapper = @This();
         const Self = GenServer(StateType);
+        var next_message_id = std.atomic.Value(u64).init(1);
 
         /// Running server handle returned by `spawn`.
         ///
@@ -110,10 +109,11 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
 
         /// Send an asynchronous payload to an initialized server.
         pub fn castPayload(self: *Self, payload: []const u8) !void {
-            const id = try std.fmt.allocPrint(self.allocator, "cast_{d}", .{compat.milliTimestamp()});
-            defer self.allocator.free(id);
+            const sequence = next_message_id.fetchAdd(1, .monotonic);
+            var id_buffer: [64]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buffer, "cast_{d}_{d}", .{ compat.milliTimestamp(), sequence });
 
-            var message = try Message.init(
+            const message = try Message.init(
                 self.allocator,
                 id,
                 "anonymous",
@@ -122,15 +122,14 @@ pub fn server(comptime StateType: type, comptime Handlers: type) type {
                 .normal,
                 null,
             );
-            errdefer message.deinit();
-
             try self.cast(message);
         }
 
         /// Send a synchronous payload request to an initialized server.
         pub fn callPayload(self: *Self, payload: []const u8, options: CallOptions) !Message {
-            const id = try std.fmt.allocPrint(self.allocator, "call_{d}", .{compat.milliTimestamp()});
-            defer self.allocator.free(id);
+            const sequence = next_message_id.fetchAdd(1, .monotonic);
+            var id_buffer: [64]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buffer, "call_{d}_{d}", .{ compat.milliTimestamp(), sequence });
 
             var message = try Message.init(
                 self.allocator,

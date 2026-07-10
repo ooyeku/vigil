@@ -28,6 +28,10 @@ pub const InboxOptions = struct {
     priority_queues: bool = true,
     /// Enable dead-letter handling for messages that cannot be delivered.
     dead_letter: bool = true,
+    /// Maximum retained dead-letter entries per inbox.
+    dead_letter_capacity: usize = 100,
+    /// Failed deliveries allowed before a rejected message becomes poison.
+    max_delivery_attempts: u32 = 3,
     /// Default time-to-live for messages created through this inbox.
     /// Set to null to create messages without a default TTL.
     default_ttl_ms: ?u32 = 30_000,
@@ -81,6 +85,10 @@ pub const RuntimeHealth = struct {
     overloaded_inboxes: usize,
     /// Number of supplied circuit breakers that are currently open.
     unhealthy_circuit_breakers: usize,
+    /// Number of retained dead-letter messages across registered inboxes.
+    dead_lettered_messages: usize,
+    /// Number of currently retained poison messages across registered inboxes.
+    poison_messages: usize,
     /// Number of telemetry handlers registered on this runtime.
     telemetry_handler_count: usize,
     /// Number of shutdown hooks registered on this runtime.
@@ -157,7 +165,9 @@ pub const Runtime = struct {
         var builder = inbox_api.inboxBuilder(self.allocator)
             .capacity(options.capacity)
             .priorityQueues(options.priority_queues)
-            .deadLetter(options.dead_letter);
+            .deadLetter(options.dead_letter)
+            .deadLetterCapacity(options.dead_letter_capacity)
+            .maxDeliveryAttempts(options.max_delivery_attempts);
 
         if (options.default_ttl_ms) |ttl_ms| {
             builder = builder.defaultTTL(ttl_ms);
@@ -165,7 +175,11 @@ pub const Runtime = struct {
             builder.default_ttl_ms_val = null;
         }
 
-        return try builder.build();
+        const result = try builder.build();
+        if (self.options.telemetry_enabled) {
+            result.setTelemetryEmitter(&self.telemetry_emitter);
+        }
+        return result;
     }
 
     /// Create a supervisor builder preconfigured from runtime options.
@@ -214,15 +228,19 @@ pub const Runtime = struct {
         defer state.deinit();
 
         var overloaded_inboxes: usize = 0;
+        var dead_lettered_messages: usize = 0;
+        var poison_messages: usize = 0;
         for (state.processes) |process| {
             if (process.capacity > 0 and process.queue_depth >= process.capacity) {
                 overloaded_inboxes += 1;
             }
+            dead_lettered_messages += process.dead_letter_count;
+            poison_messages += process.poison_count;
         }
 
         const status: RuntimeHealthStatus = if (!state.running)
             .stopped
-        else if (overloaded_inboxes > 0)
+        else if (overloaded_inboxes > 0 or poison_messages > 0)
             .degraded
         else
             .healthy;
@@ -233,6 +251,8 @@ pub const Runtime = struct {
             .registered_count = state.registered_count,
             .overloaded_inboxes = overloaded_inboxes,
             .unhealthy_circuit_breakers = 0,
+            .dead_lettered_messages = dead_lettered_messages,
+            .poison_messages = poison_messages,
             .telemetry_handler_count = state.telemetry_handler_count,
             .shutdown_hook_count = state.shutdown_hook_count,
         };
@@ -388,6 +408,44 @@ test "Runtime snapshot exposes registered mailbox and runtime service state" {
     try std.testing.expectEqualStrings("orders.inbox", snapshot.processes[0].name);
     try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].queue_depth);
     try std.testing.expectEqual(@as(usize, 2), snapshot.processes[0].capacity);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.processes[0].dead_letter_count);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.processes[0].poison_count);
+}
+
+test "Runtime snapshot and health expose dead-letter and poison state" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var ib = try rt.inbox(.{
+        .capacity = 1,
+        .dead_letter_capacity = 4,
+        .max_delivery_attempts = 1,
+    });
+    defer ib.close();
+    try rt.register("jobs.inbox", ib.mailbox);
+
+    try ib.send("job");
+    const failed = try ib.recv();
+    const notice = try ib.deadLetter(failed, .delivery_failed);
+    try std.testing.expect(notice.poisoned);
+
+    var snapshot = try rt.snapshot(std.testing.allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].dead_letter_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].poison_count);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].stats.poison_messages);
+
+    const report = try rt.health(std.testing.allocator);
+    try std.testing.expectEqual(RuntimeHealthStatus.degraded, report.status);
+    try std.testing.expect(!report.ready);
+    try std.testing.expectEqual(@as(usize, 1), report.dead_lettered_messages);
+    try std.testing.expectEqual(@as(usize, 1), report.poison_messages);
+
+    try std.testing.expect(try ib.discardDeadLetter(notice.id));
+    const recovered = try rt.health(std.testing.allocator);
+    try std.testing.expectEqual(RuntimeHealthStatus.healthy, recovered.status);
+    try std.testing.expectEqual(@as(usize, 0), recovered.dead_lettered_messages);
+    try std.testing.expectEqual(@as(usize, 0), recovered.poison_messages);
 }
 
 test "Runtime health reports degraded queues and stopped runtime" {

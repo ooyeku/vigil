@@ -38,6 +38,8 @@ pub const VigilError = error{
     RateLimitExceeded,
     /// A message could not be delivered.
     DeliveryFailed,
+    /// Dead-letter storage reached its configured capacity.
+    DeadLetterFull,
 
     /// A registry name is already in use.
     AlreadyRegistered,

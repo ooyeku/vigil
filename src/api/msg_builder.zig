@@ -16,12 +16,14 @@
 //! ```
 
 const std = @import("std");
-const legacy = @import("../legacy.zig");
+const messages = @import("../messages.zig");
 const compat = @import("../compat.zig");
 
-pub const Message = legacy.Message;
-pub const MessagePriority = legacy.MessagePriority;
-pub const Signal = legacy.Signal;
+var next_message_id = std.atomic.Value(u64).init(1);
+
+pub const Message = messages.Message;
+pub const MessagePriority = messages.MessagePriority;
+pub const Signal = messages.Signal;
 
 /// Fluent builder for an owned `Message`.
 ///
@@ -91,9 +93,12 @@ pub const MessageBuilder = struct {
     /// The caller owns the returned `Message` and must call `deinit()`.
     /// The allocator must stay valid until that deinit call.
     pub fn build(self: MessageBuilder, allocator: std.mem.Allocator) !Message {
+        const sequence = next_message_id.fetchAdd(1, .monotonic);
+        var id_buffer: [64]u8 = undefined;
+        const message_id = try std.fmt.bufPrint(&id_buffer, "msg_{d}_{d}", .{ compat.milliTimestamp(), sequence });
         var message = try Message.init(
             allocator,
-            try std.fmt.allocPrint(allocator, "msg_{d}", .{compat.milliTimestamp()}),
+            message_id,
             self.sender orelse "anonymous",
             self.payload,
             self.signal_val,
@@ -202,6 +207,15 @@ test "MessageBuilder chaining all methods" {
     try std.testing.expect(message.signal == .healthCheck);
     try std.testing.expectEqualSlices(u8, "req_456", message.metadata.correlation_id.?);
     try std.testing.expectEqualSlices(u8, "response_channel", message.metadata.reply_to.?);
+}
+
+test "MessageBuilder creates unique ids without temporary allocations" {
+    var first = try msg("first").build(std.testing.allocator);
+    defer first.deinit();
+    var second = try msg("second").build(std.testing.allocator);
+    defer second.deinit();
+
+    try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
 }
 
 test "MessageBuilder with different priorities" {

@@ -15,14 +15,29 @@
 //! ```
 
 const std = @import("std");
-const legacy = @import("../legacy.zig");
+const messages = @import("../messages.zig");
 const compat = @import("../compat.zig");
+const telemetry = @import("../telemetry.zig");
 const flow_control = @import("./flow_control.zig");
 
-pub const Message = legacy.Message;
-pub const ProcessMailbox = legacy.ProcessMailbox;
-pub const Signal = legacy.Signal;
-pub const MessageError = legacy.MessageError;
+pub const Message = messages.Message;
+pub const ProcessMailbox = messages.ProcessMailbox;
+pub const Signal = messages.Signal;
+pub const MessageError = messages.MessageError;
+pub const DeadLetterReason = messages.DeadLetterReason;
+pub const DeadLetterNotice = messages.DeadLetterNotice;
+pub const DeadLetterSnapshot = messages.DeadLetterSnapshot;
+pub const DeadLetterReplayStatus = messages.DeadLetterReplayStatus;
+pub const DeadLetterReplayResult = messages.DeadLetterReplayResult;
+
+/// Called once when a failed delivery first crosses the poison threshold.
+pub const PoisonMessageHandler = *const fn (context: ?*anyopaque, notice: DeadLetterNotice) void;
+
+const LifecycleTargets = struct {
+    emitter: ?*telemetry.TelemetryEmitter,
+    poison_context: ?*anyopaque,
+    poison_handler: ?PoisonMessageHandler,
+};
 
 /// Error returned when attempting to receive from a closed inbox
 pub const InboxError = error{
@@ -38,7 +53,7 @@ pub const InboxError = error{
 /// flag and then spins until all in-flight operations have finished
 /// before deallocating.
 pub const Inbox = struct {
-    /// Underlying mailbox. Exposed for interop with registries and legacy APIs.
+    /// Underlying mailbox. Exposed for registry and low-level API interop.
     /// The `Inbox` owns this pointer; do not deinitialize it directly.
     mailbox: *ProcessMailbox,
     /// Allocator used for the inbox object, mailbox, and messages sent through
@@ -49,11 +64,21 @@ pub const Inbox = struct {
     /// Number of in-flight operations (send / recv / recvTimeout).
     /// `close()` waits for this to reach zero before deallocating.
     active_ops: std.atomic.Value(u32),
+    /// Monotonic suffix used to make high-level message ids unique per inbox.
+    next_message_id: std.atomic.Value(u64),
     /// Optional token-bucket limiter applied before sending.
     rate_limiter: ?flow_control.RateLimiter,
     /// Optional backpressure policy applied when queued messages cross the
     /// configured high-water mark.
     backpressure_config: ?flow_control.BackpressureConfig,
+    /// Optional runtime emitter for dead-letter lifecycle events.
+    telemetry_emitter: ?*telemetry.TelemetryEmitter,
+    /// Protects telemetry and poison-hook configuration.
+    lifecycle_mutex: compat.Mutex,
+    /// Optional user context supplied to the poison-message handler.
+    poison_context: ?*anyopaque,
+    /// Optional callback invoked on the first poison classification.
+    poison_handler: ?PoisonMessageHandler,
 
     /// Allocate a new inbox with default mailbox settings.
     ///
@@ -79,8 +104,13 @@ pub const Inbox = struct {
             .allocator = allocator,
             .closed = std.atomic.Value(bool).init(false),
             .active_ops = std.atomic.Value(u32).init(0),
+            .next_message_id = std.atomic.Value(u64).init(1),
             .rate_limiter = null,
             .backpressure_config = null,
+            .telemetry_emitter = null,
+            .lifecycle_mutex = .{},
+            .poison_context = null,
+            .poison_handler = null,
         };
 
         return inbox_ptr;
@@ -120,30 +150,55 @@ pub const Inbox = struct {
     /// the inbox is closed, the mailbox is full, a rate limit is exceeded, or
     /// allocation fails.
     pub fn send(self: *Inbox, payload: []const u8) !void {
-        if (self.closed.load(.acquire)) {
-            return InboxError.InboxClosed;
-        }
-        // Track this operation so close() waits for us
-        _ = self.active_ops.fetchAdd(1, .acq_rel);
-        defer _ = self.active_ops.fetchSub(1, .acq_rel);
+        try self.beginOperation();
+        errdefer self.endOperation();
 
-        // Re-check after incrementing to handle close() racing with us
-        if (self.closed.load(.acquire)) {
-            return InboxError.InboxClosed;
+        if (!try self.applyFlowControl()) {
+            self.endOperation();
+            return;
         }
 
-        try self.applyFlowControl();
-
+        const sequence = self.next_message_id.fetchAdd(1, .monotonic);
+        var id_buffer: [64]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "inbox_{d}", .{sequence});
         const message = try Message.init(
             self.allocator,
-            "inbox_msg", // Static string - Message.init will dupe it
+            id,
             "inbox_sender",
             payload,
             null,
             .normal,
             null,
         );
-        try self.mailbox.send(message);
+        const delivery = try self.mailbox.sendWithDisposition(message);
+        const targets = self.captureLifecycleTargets();
+        self.endOperation();
+
+        switch (delivery) {
+            .enqueued => {},
+            .dead_lettered => |notice| emitDeadLetterLifecycle(targets, .message_dead_lettered, notice),
+        }
+    }
+
+    /// Send an existing owned message without rebuilding its metadata.
+    ///
+    /// This consumes `message` on success and error, including when the inbox
+    /// is already closed. It is primarily useful for lossless re-queueing.
+    pub fn sendMessage(self: *Inbox, message: Message) !void {
+        self.beginOperation() catch |err| {
+            message.deinit();
+            return err;
+        };
+        errdefer self.endOperation();
+
+        const delivery = try self.mailbox.sendWithDisposition(message);
+        const targets = self.captureLifecycleTargets();
+        self.endOperation();
+
+        switch (delivery) {
+            .enqueued => {},
+            .dead_lettered => |notice| emitDeadLetterLifecycle(targets, .message_dead_lettered, notice),
+        }
     }
 
     /// Receive the next available message, blocking until one arrives.
@@ -196,7 +251,7 @@ pub const Inbox = struct {
             if (self.closed.load(.acquire)) {
                 return InboxError.InboxClosed;
             }
-            if (compat.milliTimestamp() - start > timeout_ms) {
+            if (timeout_ms != 0 and compat.milliTimestamp() - start >= timeout_ms) {
                 return null;
             }
             // Track this operation so close() waits for us
@@ -214,6 +269,9 @@ pub const Inbox = struct {
             } else |err| switch (err) {
                 error.EmptyMailbox => {
                     _ = self.active_ops.fetchSub(1, .acq_rel);
+                    if (timeout_ms == 0 or compat.milliTimestamp() - start >= timeout_ms) {
+                        return null;
+                    }
                     compat.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
@@ -226,43 +284,187 @@ pub const Inbox = struct {
     }
 
     /// Return a snapshot of the underlying mailbox statistics.
-    pub fn stats(self: *Inbox) legacy.MailboxStats {
+    pub fn stats(self: *Inbox) ProcessMailbox.MailboxStats {
         return self.mailbox.getStats();
     }
 
-    fn queuedCount(self: *Inbox) usize {
-        const inbox_stats = self.stats();
-        if (inbox_stats.messages_received < inbox_stats.messages_sent) {
-            return 0;
-        }
-        return inbox_stats.messages_received - inbox_stats.messages_sent;
+    /// Attach an emitter used for dead-letter lifecycle events.
+    ///
+    /// `emitter` must outlive this inbox. `Runtime.inbox()` configures this
+    /// automatically when runtime telemetry is enabled.
+    pub fn setTelemetryEmitter(self: *Inbox, emitter: ?*telemetry.TelemetryEmitter) void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.telemetry_emitter = emitter;
     }
 
-    fn applyFlowControl(self: *Inbox) !void {
+    /// Register or replace the poison-message callback.
+    pub fn onPoisonMessage(
+        self: *Inbox,
+        context: ?*anyopaque,
+        handler: PoisonMessageHandler,
+    ) void {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        self.poison_context = context;
+        self.poison_handler = handler;
+    }
+
+    /// Move a failed, caller-owned message into this inbox's dead-letter queue.
+    ///
+    /// If the inbox is already closed, the caller retains the message. Once
+    /// the mailbox operation begins, the message is consumed on success or error.
+    pub fn deadLetter(self: *Inbox, message: Message, reason: DeadLetterReason) !DeadLetterNotice {
+        try self.beginOperation();
+        errdefer self.endOperation();
+
+        const notice = try self.mailbox.deadLetter(message, reason);
+        const targets = self.captureLifecycleTargets();
+        self.endOperation();
+
+        emitDeadLetterLifecycle(targets, .message_dead_lettered, notice);
+        if (notice.newly_poisoned) emitPoison(targets, notice);
+        return notice;
+    }
+
+    /// Capture an owned snapshot without consuming dead-letter entries.
+    pub fn deadLetters(self: *Inbox, allocator: std.mem.Allocator) !DeadLetterSnapshot {
+        try self.beginOperation();
+        defer self.endOperation();
+        return try self.mailbox.snapshotDeadLetters(allocator);
+    }
+
+    /// Return the current number of retained dead-letter entries.
+    pub fn deadLetterCount(self: *Inbox) !usize {
+        try self.beginOperation();
+        defer self.endOperation();
+        return self.mailbox.deadLetterCount();
+    }
+
+    /// Try to move a dead-letter entry back into the active queue.
+    pub fn replayDeadLetter(self: *Inbox, id: u64) !DeadLetterReplayResult {
+        try self.beginOperation();
+        errdefer self.endOperation();
+
+        const result = try self.mailbox.replayDeadLetter(id);
+        const targets = self.captureLifecycleTargets();
+        self.endOperation();
+
+        if (result.status == .replayed) {
+            emitDeadLetterLifecycle(targets, .message_replayed, result.notice.?);
+        }
+        return result;
+    }
+
+    /// Discard one dead-letter entry, returning false when the id is absent.
+    pub fn discardDeadLetter(self: *Inbox, id: u64) !bool {
+        try self.beginOperation();
+        errdefer self.endOperation();
+
+        const notice = self.mailbox.discardDeadLetter(id);
+        const targets = self.captureLifecycleTargets();
+        self.endOperation();
+
+        if (notice == null) return false;
+        emitDeadLetterLifecycle(targets, .message_discarded, notice.?);
+        return true;
+    }
+
+    /// Discard every dead-letter entry and return the number removed.
+    pub fn discardAllDeadLetters(self: *Inbox) !usize {
+        try self.beginOperation();
+        errdefer self.endOperation();
+
+        const discarded = self.mailbox.discardAllDeadLetters();
+        const targets = self.captureLifecycleTargets();
+        self.endOperation();
+
+        if (discarded > 0) {
+            emitTelemetry(targets.emitter, .message_discarded, "all");
+        }
+        return discarded;
+    }
+
+    fn queuedCount(self: *Inbox) usize {
+        return self.mailbox.queuedCount();
+    }
+
+    fn beginOperation(self: *Inbox) !void {
+        if (self.closed.load(.acquire)) return InboxError.InboxClosed;
+        _ = self.active_ops.fetchAdd(1, .acq_rel);
+        if (self.closed.load(.acquire)) {
+            _ = self.active_ops.fetchSub(1, .acq_rel);
+            return InboxError.InboxClosed;
+        }
+    }
+
+    fn endOperation(self: *Inbox) void {
+        _ = self.active_ops.fetchSub(1, .acq_rel);
+    }
+
+    fn captureLifecycleTargets(self: *Inbox) LifecycleTargets {
+        self.lifecycle_mutex.lock();
+        defer self.lifecycle_mutex.unlock();
+        return .{
+            .emitter = self.telemetry_emitter,
+            .poison_context = self.poison_context,
+            .poison_handler = self.poison_handler,
+        };
+    }
+
+    fn emitDeadLetterLifecycle(
+        targets: LifecycleTargets,
+        event_type: telemetry.EventType,
+        notice: DeadLetterNotice,
+    ) void {
+        emitTelemetry(targets.emitter, event_type, @tagName(notice.reason));
+    }
+
+    fn emitPoison(targets: LifecycleTargets, notice: DeadLetterNotice) void {
+        if (targets.emitter) |value| {
+            value.emit(.{
+                .event_type = .poison_message_detected,
+                .timestamp_ms = compat.milliTimestamp(),
+                .metadata = @tagName(notice.reason),
+            });
+        }
+        if (targets.poison_handler) |callback| callback(targets.poison_context, notice);
+    }
+
+    fn emitTelemetry(emitter: ?*telemetry.TelemetryEmitter, event_type: telemetry.EventType, metadata: []const u8) void {
+        if (emitter) |value| {
+            value.emit(.{
+                .event_type = event_type,
+                .timestamp_ms = compat.milliTimestamp(),
+                .metadata = metadata,
+            });
+        }
+    }
+
+    fn applyFlowControl(self: *Inbox) !bool {
         if (self.rate_limiter) |*limiter| {
             if (!limiter.allow()) {
                 return MessageError.RateLimitExceeded;
             }
         }
 
-        const config = self.backpressure_config orelse return;
-        if (self.queuedCount() < config.high_watermark) return;
+        const config = self.backpressure_config orelse return true;
+        if (self.queuedCount() < config.high_watermark) return true;
 
         switch (config.strategy) {
             .drop_oldest => {
-                if (self.mailbox.receive()) |old_msg| {
-                    var owned_old_msg = old_msg;
-                    owned_old_msg.deinit();
-                } else |_| {}
+                _ = self.mailbox.dropOldest();
             },
-            .drop_newest => return,
+            .drop_newest => return false,
             .block => {
-                while (self.queuedCount() >= config.low_watermark) {
+                while (self.queuedCount() > config.low_watermark) {
+                    if (self.closed.load(.acquire)) return InboxError.InboxClosed;
                     compat.sleep(10 * std.time.ns_per_ms);
                 }
             },
             .return_error => return MessageError.MailboxFull,
         }
+        return true;
     }
 };
 
@@ -291,6 +493,10 @@ pub const InboxBuilder = struct {
     priority_queues_val: bool = true,
     /// Whether dead-letter support is enabled.
     dead_letter_val: bool = true,
+    /// Maximum retained dead-letter entries.
+    dead_letter_capacity_val: usize = 100,
+    /// Delivery failures allowed before a message becomes poison.
+    max_delivery_attempts_val: u32 = 3,
     /// Default TTL for messages. Null disables the default.
     default_ttl_ms_val: ?u32 = 30_000,
     /// Optional send rate limit.
@@ -323,6 +529,20 @@ pub const InboxBuilder = struct {
         return result;
     }
 
+    /// Set the maximum number of retained dead-letter entries.
+    pub fn deadLetterCapacity(self: InboxBuilder, limit: usize) InboxBuilder {
+        var result = self;
+        result.dead_letter_capacity_val = limit;
+        return result;
+    }
+
+    /// Set the delivery-failure threshold for poison classification.
+    pub fn maxDeliveryAttempts(self: InboxBuilder, attempts: u32) InboxBuilder {
+        var result = self;
+        result.max_delivery_attempts_val = @max(@as(u32, 1), attempts);
+        return result;
+    }
+
     /// Set the default message TTL in milliseconds.
     pub fn defaultTTL(self: InboxBuilder, ms: u32) InboxBuilder {
         var result = self;
@@ -348,6 +568,12 @@ pub const InboxBuilder = struct {
     ///
     /// The caller owns the returned pointer and must call `close()`.
     pub fn build(self: InboxBuilder) !*Inbox {
+        if (self.backpressure_config) |config| {
+            if (config.low_watermark > config.high_watermark) {
+                return error.InvalidConfiguration;
+            }
+        }
+
         const inbox_ptr = try self.allocator.create(Inbox);
         errdefer self.allocator.destroy(inbox_ptr);
 
@@ -358,6 +584,8 @@ pub const InboxBuilder = struct {
             .capacity = self.capacity_val,
             .priority_queues = self.priority_queues_val,
             .enable_deadletter = self.dead_letter_val,
+            .dead_letter_capacity = self.dead_letter_capacity_val,
+            .max_delivery_attempts = self.max_delivery_attempts_val,
             .default_ttl_ms = self.default_ttl_ms_val,
         });
 
@@ -366,8 +594,13 @@ pub const InboxBuilder = struct {
             .allocator = self.allocator,
             .closed = std.atomic.Value(bool).init(false),
             .active_ops = std.atomic.Value(u32).init(0),
+            .next_message_id = std.atomic.Value(u64).init(1),
             .rate_limiter = if (self.rate_limit_config) |config| flow_control.RateLimiter.init(config.max_per_second) else null,
             .backpressure_config = self.backpressure_config,
+            .telemetry_emitter = null,
+            .lifecycle_mutex = .{},
+            .poison_context = null,
+            .poison_handler = null,
         };
 
         return inbox_ptr;
@@ -582,7 +815,7 @@ test "Inbox memory leak fix - repeated sends and cleanup" {
     // The testing allocator will detect any leaks across all cycles
 }
 
-test "Inbox message ID is consistent" {
+test "Inbox message IDs are unique" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -595,18 +828,18 @@ test "Inbox message ID is consistent" {
     try inbox_ptr.send("msg2");
     try inbox_ptr.send("msg3");
 
-    // Receive and verify message IDs are all "inbox_msg"
+    // Receive and verify each high-level send gets a distinct id.
     var msg1 = try inbox_ptr.recv();
     defer msg1.deinit();
-    try std.testing.expectEqualSlices(u8, "inbox_msg", msg1.id);
 
     var msg2 = try inbox_ptr.recv();
     defer msg2.deinit();
-    try std.testing.expectEqualSlices(u8, "inbox_msg", msg2.id);
 
     var msg3 = try inbox_ptr.recv();
     defer msg3.deinit();
-    try std.testing.expectEqualSlices(u8, "inbox_msg", msg3.id);
+    try std.testing.expect(!std.mem.eql(u8, msg1.id, msg2.id));
+    try std.testing.expect(!std.mem.eql(u8, msg1.id, msg3.id));
+    try std.testing.expect(!std.mem.eql(u8, msg2.id, msg3.id));
 }
 
 test "InboxBuilder applies rate limiting" {
@@ -642,6 +875,19 @@ test "InboxBuilder applies return_error backpressure" {
     try std.testing.expectError(MessageError.MailboxFull, inbox_ptr.send("second"));
 }
 
+test "InboxBuilder rejects inverted backpressure watermarks" {
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        inboxBuilder(std.testing.allocator)
+            .withBackpressure(.{
+                .strategy = .block,
+                .high_watermark = 1,
+                .low_watermark = 2,
+            })
+            .build(),
+    );
+}
+
 test "InboxBuilder drop_newest backpressure keeps existing message" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -664,6 +910,7 @@ test "InboxBuilder drop_newest backpressure keeps existing message" {
     defer msg.deinit();
     try std.testing.expectEqualStrings("first", msg.payload.?);
     try std.testing.expectEqual(@as(?Message, null), try inbox_ptr.recvTimeout(5));
+    try std.testing.expectEqual(@as(usize, 0), try inbox_ptr.deadLetterCount());
 }
 
 test "InboxBuilder drop_oldest backpressure replaces existing message" {
@@ -688,6 +935,7 @@ test "InboxBuilder drop_oldest backpressure replaces existing message" {
     defer msg.deinit();
     try std.testing.expectEqualStrings("second", msg.payload.?);
     try std.testing.expectEqual(@as(?Message, null), try inbox_ptr.recvTimeout(5));
+    try std.testing.expectEqual(@as(usize, 1), inbox_ptr.stats().messages_dropped);
 }
 
 test "Inbox supports concurrent producer and consumer churn" {
@@ -737,4 +985,99 @@ test "Inbox supports concurrent producer and consumer churn" {
     consumer_thread.join();
 
     try std.testing.expectEqual(@as(usize, 0), inbox_ptr.mailbox.queuedCount());
+}
+
+test "Inbox exposes dead-letter lifecycle telemetry and poison hook" {
+    const Recorder = struct {
+        var dead_lettered = std.atomic.Value(usize).init(0);
+        var replayed = std.atomic.Value(usize).init(0);
+        var discarded = std.atomic.Value(usize).init(0);
+        var poison_events = std.atomic.Value(usize).init(0);
+        var poison_hooks = std.atomic.Value(usize).init(0);
+
+        fn event(value: telemetry.Event) void {
+            const counter = switch (value.event_type) {
+                .message_dead_lettered => &dead_lettered,
+                .message_replayed => &replayed,
+                .message_discarded => &discarded,
+                .poison_message_detected => &poison_events,
+                else => return,
+            };
+            _ = counter.fetchAdd(1, .acq_rel);
+        }
+
+        fn poison(_: ?*anyopaque, notice: DeadLetterNotice) void {
+            if (notice.poisoned and notice.newly_poisoned) {
+                _ = poison_hooks.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+
+    Recorder.dead_lettered.store(0, .release);
+    Recorder.replayed.store(0, .release);
+    Recorder.discarded.store(0, .release);
+    Recorder.poison_events.store(0, .release);
+    Recorder.poison_hooks.store(0, .release);
+
+    var emitter = telemetry.TelemetryEmitter.init(std.testing.allocator);
+    defer emitter.deinit();
+    try emitter.on(.message_dead_lettered, Recorder.event);
+    try emitter.on(.message_replayed, Recorder.event);
+    try emitter.on(.message_discarded, Recorder.event);
+    try emitter.on(.poison_message_detected, Recorder.event);
+
+    var inbox_ptr = try inboxBuilder(std.testing.allocator)
+        .capacity(1)
+        .deadLetterCapacity(4)
+        .maxDeliveryAttempts(2)
+        .build();
+    defer inbox_ptr.close();
+    inbox_ptr.setTelemetryEmitter(&emitter);
+    inbox_ptr.onPoisonMessage(null, Recorder.poison);
+
+    try inbox_ptr.send("active");
+    try inbox_ptr.send("overflow");
+    var snapshot = try inbox_ptr.deadLetters(std.testing.allocator);
+    const overflow_id = snapshot.entries[0].id;
+    snapshot.deinit();
+
+    var active = try inbox_ptr.recv();
+    active.deinit();
+    try std.testing.expectEqual(DeadLetterReplayStatus.replayed, (try inbox_ptr.replayDeadLetter(overflow_id)).status);
+
+    const first_attempt = try inbox_ptr.recv();
+    const first_failure = try inbox_ptr.deadLetter(first_attempt, .delivery_failed);
+    try std.testing.expect(!first_failure.poisoned);
+    try std.testing.expectEqual(DeadLetterReplayStatus.replayed, (try inbox_ptr.replayDeadLetter(first_failure.id)).status);
+
+    const second_attempt = try inbox_ptr.recv();
+    const poison = try inbox_ptr.deadLetter(second_attempt, .delivery_failed);
+    try std.testing.expect(poison.poisoned);
+    try std.testing.expect(try inbox_ptr.discardDeadLetter(poison.id));
+
+    try std.testing.expectEqual(@as(usize, 3), Recorder.dead_lettered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), Recorder.replayed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.discarded.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.poison_events.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), Recorder.poison_hooks.load(.acquire));
+}
+
+test "Inbox poison hook can close its inbox without deadlocking" {
+    const Closer = struct {
+        fn close(context: ?*anyopaque, _: DeadLetterNotice) void {
+            const target: *Inbox = @ptrCast(@alignCast(context.?));
+            target.close();
+        }
+    };
+
+    var inbox_ptr = try inboxBuilder(std.testing.allocator)
+        .maxDeliveryAttempts(1)
+        .build();
+    inbox_ptr.onPoisonMessage(inbox_ptr, Closer.close);
+
+    try inbox_ptr.send("poison");
+    const failed = try inbox_ptr.recv();
+    _ = try inbox_ptr.deadLetter(failed, .delivery_failed);
+    // The hook closed and destroyed inbox_ptr. Reaching this line proves the
+    // callback ran after the operation released its close reference.
 }

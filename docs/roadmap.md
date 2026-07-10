@@ -21,6 +21,8 @@ Current status:
 - v2.1.0 shipped the measurement and first runtime-introspection foundation.
 - v2.2.0 has started with first-class reliability policies for retry, backoff,
   timeout classification, fallback, and circuit-breaker composition.
+- v2.2.0 now includes bounded dead-letter inspection, replay, discard,
+  poison-message limits, lifecycle telemetry, and runtime health integration.
 
 ## Product Direction
 

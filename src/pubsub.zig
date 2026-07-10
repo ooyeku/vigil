@@ -152,13 +152,6 @@ pub const Subscriber = struct {
         return false;
     }
 
-    /// Return the number of patterns registered on this subscriber.
-    pub fn patternCount(self: *Subscriber) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.patterns.items.len;
-    }
-
     /// Return a value snapshot of subscriber state.
     pub fn snapshot(self: *Subscriber) SubscriberSnapshot {
         self.mutex.lock();
@@ -208,13 +201,6 @@ pub const PubSubBroker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.subscribers.append(self.allocator, subscriber);
-    }
-
-    /// Return the number of subscribers registered with this broker.
-    pub fn subscriberCount(self: *PubSubBroker) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.subscribers.items.len;
     }
 
     /// Unregister a subscriber pointer if present.
@@ -299,79 +285,6 @@ pub const PubSubBroker = struct {
         };
     }
 };
-
-/// Optional global pub/sub broker used by convenience functions.
-///
-/// New v2 applications may prefer owning a `PubSubBroker` directly so tests and
-/// services do not share process-wide state.
-var global_broker: ?PubSubBroker = null;
-var broker_mutex: compat.Mutex = .{};
-
-/// Initialize the optional global broker if it has not already been created.
-pub fn initGlobal(allocator: std.mem.Allocator) !void {
-    broker_mutex.lock();
-    defer broker_mutex.unlock();
-
-    if (global_broker == null) {
-        global_broker = PubSubBroker.init(allocator);
-    }
-}
-
-/// Deinitialize and release the global broker.
-/// Must only be called during shutdown when no other threads are
-/// publishing or subscribing.
-pub fn deinitGlobal() void {
-    broker_mutex.lock();
-    defer broker_mutex.unlock();
-
-    if (global_broker) |*b| {
-        b.deinit();
-        global_broker = null;
-    }
-}
-
-/// Get global broker.
-///
-/// SAFETY: The returned pointer is valid as long as `deinitGlobal()` has
-/// not been called.  Callers must ensure `deinitGlobal()` is only invoked
-/// during shutdown after all publish/subscribe operations have completed.
-pub fn getGlobal() ?*PubSubBroker {
-    broker_mutex.lock();
-    defer broker_mutex.unlock();
-    return if (global_broker) |*b| b else null;
-}
-
-/// Publish through the optional global broker.
-///
-/// Returns a `PublishResult` with delivery/failure counts, or null if no global
-/// broker is initialized.
-pub fn publish(topic: []const u8, payload: []const u8) !?PublishResult {
-    if (getGlobal()) |broker| {
-        return try broker.publish(topic, payload);
-    }
-    return null;
-}
-
-/// Allocate a subscriber and subscribe it to topic patterns.
-///
-/// If a global broker exists, the new subscriber is registered with it. The
-/// caller owns the returned pointer and should call `deinit()` and destroy it
-/// with the same allocator when finished.
-pub fn subscribe(allocator: std.mem.Allocator, inbox: *Inbox, patterns: []const []const u8) !*Subscriber {
-    const subscriber = try allocator.create(Subscriber);
-    errdefer allocator.destroy(subscriber);
-
-    subscriber.* = Subscriber.init(allocator, inbox);
-    errdefer subscriber.deinit();
-
-    try subscriber.subscribe(patterns);
-
-    if (getGlobal()) |broker| {
-        try broker.subscribe(subscriber);
-    }
-
-    return subscriber;
-}
 
 test "TopicPattern matching" {
     const pattern = TopicPattern{ .pattern = "events.*" };
