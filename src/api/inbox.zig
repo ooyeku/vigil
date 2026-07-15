@@ -286,6 +286,54 @@ pub const Inbox = struct {
         }
     }
 
+    /// Receive one message without blocking.
+    ///
+    /// Returns null immediately when the inbox is empty. The returned
+    /// `Message`, when present, is owned by the caller and must be
+    /// deinitialized. This is the explicit fast path; `recvTimeout(0)` is
+    /// equivalent.
+    pub fn tryRecv(self: *Inbox) !?Message {
+        try self.beginOperation();
+        defer self.endOperation();
+
+        if (self.mailbox.receive()) |msg| {
+            return msg;
+        } else |err| switch (err) {
+            error.EmptyMailbox => return null,
+            else => return err,
+        }
+    }
+
+    /// Receive up to `buffer.len` messages without blocking.
+    ///
+    /// The whole batch is taken under one mailbox lock and one expiry sweep,
+    /// so draining N messages costs far less than N `tryRecv()` calls on deep
+    /// queues. Returns the number of messages written, zero when empty. The
+    /// caller owns each returned message and must deinitialize all of them.
+    pub fn recvBatch(self: *Inbox, buffer: []Message) !usize {
+        try self.beginOperation();
+        defer self.endOperation();
+        return self.mailbox.receiveBatch(buffer);
+    }
+
+    /// Send each payload in order, stopping at the first failure.
+    ///
+    /// Returns the number of payloads accepted. When the very first send
+    /// fails its error is returned instead, so callers can distinguish "the
+    /// inbox rejected everything" from partial progress and retry the
+    /// remainder.
+    pub fn sendBatch(self: *Inbox, payloads: []const []const u8) !usize {
+        var accepted: usize = 0;
+        for (payloads) |payload| {
+            self.send(payload) catch |err| {
+                if (accepted == 0) return err;
+                return accepted;
+            };
+            accepted += 1;
+        }
+        return accepted;
+    }
+
     /// Return a snapshot of the underlying mailbox statistics.
     pub fn stats(self: *Inbox) ProcessMailbox.MailboxStats {
         var operation = self.acquireOperation() catch return .{};
@@ -1220,4 +1268,57 @@ test "Inbox peekMessages inspects the queue without consuming" {
     var msg = try target.recv();
     defer msg.deinit();
     try std.testing.expectEqualStrings("first", msg.payload.?);
+}
+
+test "Inbox batch send and receive preserve delivery order" {
+    const allocator = std.testing.allocator;
+    var target = try inboxBuilder(allocator).capacity(16).build();
+    defer target.close();
+
+    const payloads = [_][]const u8{ "one", "two", "three", "four", "five" };
+    try std.testing.expectEqual(@as(usize, 5), try target.sendBatch(&payloads));
+
+    var buffer: [3]Message = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try target.recvBatch(&buffer));
+    defer for (buffer) |msg| msg.deinit();
+    try std.testing.expectEqualStrings("one", buffer[0].payload.?);
+    try std.testing.expectEqualStrings("two", buffer[1].payload.?);
+    try std.testing.expectEqualStrings("three", buffer[2].payload.?);
+
+    // Remaining messages come out through the nonblocking fast path.
+    var fourth = (try target.tryRecv()).?;
+    defer fourth.deinit();
+    try std.testing.expectEqualStrings("four", fourth.payload.?);
+
+    var fifth = (try target.tryRecv()).?;
+    defer fifth.deinit();
+    try std.testing.expectEqualStrings("five", fifth.payload.?);
+
+    try std.testing.expect(try target.tryRecv() == null);
+
+    var empty: [2]Message = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try target.recvBatch(&empty));
+}
+
+test "Inbox recvBatch respects priority delivery order" {
+    const allocator = std.testing.allocator;
+    var target = try inboxBuilder(allocator).capacity(8).build();
+    defer target.close();
+
+    // Raw mailbox sends with explicit priorities.
+    const low = try Message.init(allocator, "low", "test", "low", null, .low, null);
+    try target.mailbox.send(low);
+    const critical = try Message.init(allocator, "critical", "test", "critical", null, .critical, null);
+    try target.mailbox.send(critical);
+    const normal = try Message.init(allocator, "normal", "test", "normal", null, .normal, null);
+    try target.mailbox.send(normal);
+
+    var buffer: [4]Message = undefined;
+    const received = try target.recvBatch(&buffer);
+    try std.testing.expectEqual(@as(usize, 3), received);
+    defer for (buffer[0..received]) |msg| msg.deinit();
+
+    try std.testing.expectEqualStrings("critical", buffer[0].id);
+    try std.testing.expectEqualStrings("normal", buffer[1].id);
+    try std.testing.expectEqualStrings("low", buffer[2].id);
 }

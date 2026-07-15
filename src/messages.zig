@@ -1007,6 +1007,53 @@ pub const ProcessMailbox = struct {
         self.not_empty.broadcast();
     }
 
+    /// Receive up to `buffer.len` messages under one lock and one expiry
+    /// sweep, in delivery order.
+    ///
+    /// Nonblocking: returns the number of messages written to `buffer`, which
+    /// is zero when the mailbox is empty. The caller owns every returned
+    /// message and must deinitialize each one.
+    pub fn receiveBatch(self: *ProcessMailbox, buffer: []Message) usize {
+        if (buffer.len == 0) return 0;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now_ms = compat.milliTimestamp();
+        var written: usize = 0;
+
+        if (self.priority_queues) |*queues| {
+            for (queues) |*queue| {
+                self.expireQueueLocked(queue, now_ms);
+            }
+            for (queues) |*queue| {
+                while (written < buffer.len) {
+                    const taken = queue.popFront() orelse break;
+                    buffer[written] = self.markDeliveredLocked(taken);
+                    written += 1;
+                }
+                if (written == buffer.len) break;
+            }
+            return written;
+        }
+
+        self.expireQueueLocked(&self.messages, now_ms);
+        while (written < buffer.len) {
+            const taken = self.messages.popFront() orelse break;
+            buffer[written] = self.markDeliveredLocked(taken);
+            written += 1;
+        }
+        return written;
+    }
+
+    fn markDeliveredLocked(self: *ProcessMailbox, msg: Message) Message {
+        var delivered = msg;
+        delivered.metadata.attempt_count +|= 1;
+        self.stats.messages_sent +|= 1;
+        self.stats.total_size_bytes -|= delivered.metadata.size_bytes;
+        return delivered;
+    }
+
     fn receiveLocked(self: *ProcessMailbox) MessageError!Message {
         // One clock read per receive; expiry sweeps over deep queues compare
         // against it instead of reading the clock per message.
@@ -1021,11 +1068,7 @@ pub const ProcessMailbox = struct {
             // Now take the front of the highest-priority non-empty queue.
             for (queues) |*queue| {
                 if (queue.popFront()) |taken| {
-                    var msg = taken;
-                    msg.metadata.attempt_count +|= 1;
-                    self.stats.messages_sent +|= 1;
-                    self.stats.total_size_bytes -|= msg.metadata.size_bytes;
-                    return msg;
+                    return self.markDeliveredLocked(taken);
                 }
             }
             return MessageError.EmptyMailbox;
@@ -1034,11 +1077,8 @@ pub const ProcessMailbox = struct {
         // Standard queue handling
         self.expireQueueLocked(&self.messages, now_ms);
 
-        var msg = self.messages.popFront() orelse return MessageError.EmptyMailbox;
-        msg.metadata.attempt_count +|= 1;
-        self.stats.messages_sent +|= 1;
-        self.stats.total_size_bytes -|= msg.metadata.size_bytes;
-        return msg;
+        const taken = self.messages.popFront() orelse return MessageError.EmptyMailbox;
+        return self.markDeliveredLocked(taken);
     }
 
     fn expireQueueLocked(self: *ProcessMailbox, queue: *RingQueue(Message), now_ms: i64) void {
