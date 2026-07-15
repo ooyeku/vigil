@@ -193,6 +193,28 @@ pub fn benchInbox(allocator: std.mem.Allocator, iterations: usize) !BenchmarkRes
     };
 }
 
+pub fn benchInboxThroughputProfile(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
+    var rt = try vigil.runtime(allocator, .{});
+    defer rt.deinit();
+    var inbox = try rt.inboxWithProfile(.throughput, iterations + 1);
+    defer inbox.close();
+
+    const start = nowNs();
+    for (0..iterations) |_| {
+        try inbox.send("payload");
+    }
+    for (0..iterations) |_| {
+        var msg = try inbox.recv();
+        defer msg.deinit();
+    }
+
+    return .{
+        .name = "inbox send+recv (throughput)",
+        .operations = iterations * 2,
+        .elapsed_ns = elapsedSince(start),
+    };
+}
+
 pub fn benchRegistryLookup(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
     var registry = vigil.Registry.init(allocator);
     defer registry.deinit();
@@ -574,6 +596,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("iterations={d}\n\n", .{iterations});
 
     printResult(try runBenchmark(benchInbox, iterations));
+    printResult(try runBenchmark(benchInboxThroughputProfile, iterations));
     printResult(try runBenchmark(benchRegistryLookup, iterations));
     printResult(try runBenchmark(benchRegistryRegister, iterations));
     printResult(try runBenchmark(benchRegistryContention, iterations));

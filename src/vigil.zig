@@ -124,6 +124,8 @@ pub const PresetConfig = presets.PresetConfig;
 pub const Runtime = runtime_api.Runtime;
 /// Runtime feature flags.
 pub const RuntimeOptions = runtime_api.RuntimeOptions;
+/// Feature profile for inbox construction: safe, balanced, or throughput.
+pub const RuntimeProfile = runtime_api.RuntimeProfile;
 /// Runtime-owned inbox configuration.
 pub const InboxOptions = runtime_api.InboxOptions;
 /// Owned runtime-state snapshot for debugging and health reporting.

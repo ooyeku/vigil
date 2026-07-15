@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-07-15
+
+### Added
+- **Runtime timer service**: Added `vigil.TimerService` and `Runtime.timers()` — a min-heap scheduler running timeouts, intervals, and delayed sends on one thread with cancellation handles, replacing thread-per-timer; ~37x faster scheduling and allocation-free.
+- **Batch and nonblocking messaging**: Added `Inbox.tryRecv()`, `Inbox.recvBatch()` (one lock and one expiry sweep for N messages), `Inbox.sendBatch()`, `PubSubBroker.publishBatch()`, and `ProcessGroup.broadcastBatch()`.
+- **Adaptive flow control**: Added the `.adaptive` backpressure strategy (progressive delay between watermarks, blocking at the high mark), `RateLimiter.allowN()` bulk admission, a working `burst_size`, and `FlowControlledInbox.flowStats()` counters for accepted/throttled/dropped/blocked/delayed sends.
+- **Checkpoint pipeline**: Added `vigil.CheckpointService` with async background writes, unchanged-state skip, compression hooks, version headers with a migration hook, and latency/size metrics.
+- **Distributed peer metrics**: Added `DistributedRegistry.snapshot()` with per-peer health (alive, last seen, consecutive failures, reconnects) and cache/query/heartbeat/sync counters.
+- **Runtime profiles**: Added `vigil.RuntimeProfile` (`safe`, `balanced`, `throughput`) and `Runtime.inboxWithProfile()` so hot paths can opt out of priority queues, dead-letter machinery, and TTLs.
+- **Fanout counters**: Pub/sub brokers and process groups now expose lifetime delivered/failed counters in their snapshots.
+- **Concurrency primitives**: Added `compat.futex` and `compat.Condition` (wait/timedWait/signal/broadcast) for Zig 0.16.
+
+### Changed
+- **Mailbox queues are ring buffers**: Replaced `ArrayList` + `orderedRemove(0)` with a ring buffer, making pop-front O(1).
+- **Message expiry is lazy**: Receives check only queue heads, making receive cost independent of queue depth; a send that finds the mailbox full reclaims expired messages in one sweep before reporting overflow.
+- **Blocking receives park on a condition**: `Inbox.recv`/`recvTimeout` wake on send instead of poll-sleeping; ~10x contention throughput and microsecond wake latency.
+- **Messages use one allocation**: id, sender, and payload share a single owned buffer (3x fewer allocations per message).
+- **Telemetry dispatch is allocation-free**: disabled emitters cost one atomic load, no-handler emitters never lock, small handler sets dispatch from the stack, and `wouldEmit()` lets callers skip event construction.
+- **Registry is sharded**: 64 cache-line-aligned shards give ~2.6x concurrent lookup throughput; snapshots are per-shard consistent.
+- **Pub/sub patterns are precompiled**: subscribe-time segment compilation plus one topic parse per publish; publish/broadcast snapshot subscribers on the stack.
+- **Rate limiter is lock-free**: GCRA virtual-time algorithm replaces the mutex-guarded float token bucket.
+- **Distributed registry uses persistent connections**: one connection per peer with exponential reconnect backoff, batched registration sync, per-connection listener threads, and network I/O moved off the registry mutex.
+
+### Fixed
+- **Distributed registry worked at all on macOS**: `compat.sockets.socket()` passed Zig's artificial `SOCK_CLOEXEC` flag to the raw Darwin syscall, so every peer socket failed with EINVAL; the flag is now stripped and applied via fcntl.
+- **Short receive timeouts always poll once**: `recvTimeout` and `waitForReply` could hit their deadline before the first poll when the thread was descheduled, missing already-queued messages.
+- **Checkpoint writes are atomic**: `FileCheckpointer` writes to a temp file and renames into place, so a crash mid-write cannot corrupt the previous good checkpoint.
+
 ## [2.2.1] - 2026-07-15
 
 ### Fixed

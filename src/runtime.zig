@@ -38,6 +38,42 @@ pub const InboxOptions = struct {
     default_ttl_ms: ?u32 = 30_000,
 };
 
+/// Feature profile selecting how much mailbox machinery an inbox carries.
+///
+/// Profiles trade features for hot-path cost at configuration time:
+/// `safe` keeps every delivery guarantee, `throughput` strips the ones a
+/// pipeline stage often does not need. Use `Runtime.inboxWithProfile()` or
+/// `RuntimeProfile.inboxOptions()` to apply one.
+pub const RuntimeProfile = enum {
+    /// Full feature set with conservative defaults: priority queues,
+    /// dead-letter retention, and a 30s default TTL.
+    safe,
+    /// Priority queues and dead-letter retention without default TTLs, so
+    /// receives skip expiry bookkeeping entirely.
+    balanced,
+    /// Minimal hot path: one FIFO ring, no priority scan, no dead-letter
+    /// machinery, no TTLs. Failed sends are simply errors; use this for
+    /// high-volume stages that handle retry themselves.
+    throughput,
+
+    /// Return inbox options implementing this profile.
+    pub fn inboxOptions(self: RuntimeProfile, queue_capacity: usize) InboxOptions {
+        return switch (self) {
+            .safe => .{ .capacity = queue_capacity },
+            .balanced => .{
+                .capacity = queue_capacity,
+                .default_ttl_ms = null,
+            },
+            .throughput => .{
+                .capacity = queue_capacity,
+                .priority_queues = false,
+                .dead_letter = false,
+                .default_ttl_ms = null,
+            },
+        };
+    }
+};
+
 /// Per-process information captured by a runtime snapshot.
 pub const RuntimeProcessSnapshot = Registry.RegisteredMailboxSnapshot;
 
@@ -198,6 +234,17 @@ pub const Runtime = struct {
             result.setTelemetryEmitter(&self.telemetry_emitter);
         }
         return result;
+    }
+
+    /// Create an inbox configured by a feature profile.
+    ///
+    /// Shorthand for `inbox(profile.inboxOptions(queue_capacity))`.
+    pub fn inboxWithProfile(
+        self: *Runtime,
+        profile: RuntimeProfile,
+        queue_capacity: usize,
+    ) !*inbox_api.Inbox {
+        return self.inbox(profile.inboxOptions(queue_capacity));
     }
 
     /// Create a supervisor builder preconfigured from runtime options.
@@ -711,4 +758,34 @@ test "Runtime owns a lazily created timer service" {
     // Shutdown stops the scheduler; deinit releases it.
     rt.shutdown();
     try std.testing.expect(!service.snapshot().running);
+}
+
+test "Runtime profiles configure inbox feature sets" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const safe_options = RuntimeProfile.safe.inboxOptions(64);
+    try std.testing.expect(safe_options.priority_queues);
+    try std.testing.expect(safe_options.dead_letter);
+    try std.testing.expect(safe_options.default_ttl_ms != null);
+
+    const balanced_options = RuntimeProfile.balanced.inboxOptions(64);
+    try std.testing.expect(balanced_options.priority_queues);
+    try std.testing.expect(balanced_options.default_ttl_ms == null);
+
+    const throughput_options = RuntimeProfile.throughput.inboxOptions(64);
+    try std.testing.expect(!throughput_options.priority_queues);
+    try std.testing.expect(!throughput_options.dead_letter);
+    try std.testing.expect(throughput_options.default_ttl_ms == null);
+
+    var fast = try rt.inboxWithProfile(.throughput, 8);
+    defer fast.close();
+    try std.testing.expect(fast.mailbox.priority_queues == null);
+    try std.testing.expect(fast.mailbox.deadletter_queue == null);
+
+    try fast.send("payload");
+    var msg = try fast.recv();
+    defer msg.deinit();
+    try std.testing.expectEqualStrings("payload", msg.payload.?);
+    try std.testing.expect(msg.metadata.ttl_ms == null);
 }

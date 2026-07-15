@@ -1,4 +1,4 @@
-# Vigil API Reference v2.2.0
+# Vigil API Reference v2.3.0
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 
@@ -32,6 +32,7 @@ A process supervision and inter-process communication library for Zig, inspired 
   - [Distributed Registry](#distributed-registry)
   - [Registry](#registry)
   - [Timer](#timer)
+  - [Timer Service](#timer-service)
 - [Configuration Presets](#configuration-presets)
 - [Low-Level API](#low-level-api)
 - [Types Reference](#types-reference)
@@ -106,8 +107,36 @@ if (rt.whereis("worker")) |mailbox| {
 | `snapshot(allocator)` | Capture registered mailbox stats, active/dead-letter/poison counts, handler count, and hook count |
 | `health(allocator)` | Return compact health/readiness status |
 | `healthWithCircuitBreakers(allocator, breakers)` | Return readiness with caller-owned circuit breakers folded in |
+| `inboxWithProfile(profile, capacity)` | Create an inbox from a `safe`/`balanced`/`throughput` profile |
+| `timers()` | Lazily create the runtime-owned timer service |
+| `enableTimeline(capacity)` / `timelineSnapshot(allocator)` | Record and inspect recent telemetry events |
+| `debugDump(allocator)` | Render a human-readable runtime state dump |
 | `onShutdown(hook)` | Register a shutdown hook |
-| `shutdown()` | Mark runtime stopped and run shutdown hooks |
+| `shutdown()` | Mark runtime stopped, stop owned services, and run shutdown hooks |
+
+### Runtime Profiles
+
+Profiles choose how much mailbox machinery an inbox carries, trading features
+for hot-path cost:
+
+| Profile | Priority queues | Dead-letter | Default TTL | Use for |
+|---------|-----------------|-------------|-------------|---------|
+| `.safe` | yes | yes | 30s | Defaults; every delivery guarantee |
+| `.balanced` | yes | yes | none | Most services; skips expiry bookkeeping |
+| `.throughput` | no | no | none | Hot pipeline stages that handle retry themselves |
+
+```zig
+var fast = try rt.inboxWithProfile(.throughput, 1024);
+defer fast.close();
+```
+
+**Which API should I use?** Prefer the ergonomic APIs (`Inbox.send`/`recv`,
+`.safe`/`.balanced` profiles) until a profiler says otherwise — they are
+already allocation-light and wake receivers without polling. Reach for the
+fast paths (`.throughput` profile, `tryRecv`, `recvBatch`, `sendBatch`,
+`publishBatch`, `broadcastBatch`, `RateLimiter.allowN`) on measured hot
+loops: they trade dead-letter recovery, priorities, and TTLs for fewer
+branches and amortized locking.
 
 ### Runtime Introspection
 
@@ -253,8 +282,11 @@ inbox.close();
 |--------|-------------|
 | `send(payload)` | Send a message payload |
 | `sendMessage(message)` | Send an owned message without rebuilding its id or metadata |
-| `recv()` | Block until message received |
-| `recvTimeout(ms)` | Receive with timeout (returns `?Message`) |
+| `recv()` | Block until message received (parks on a condition, no polling) |
+| `recvTimeout(ms)` | Receive with timeout (returns `?Message`; `0` is a nonblocking poll) |
+| `tryRecv()` | Explicit nonblocking receive (returns `?Message`) |
+| `recvBatch(buffer)` | Drain up to `buffer.len` messages under one lock and expiry sweep |
+| `sendBatch(payloads)` | Send payloads in order, stopping at the first failure |
 | `queueDepth()` | Read active queue depth with shutdown-safe operation pinning |
 | `dropOldest()` | Drop the oldest active message with shutdown-safe operation pinning |
 | `acquireOperation()` | Pin lifetime across a multi-step wrapper operation |
@@ -1014,7 +1046,35 @@ const test_ckpt = mem_ckpt.toCheckpointer();
 
 File checkpoint ids must be a single non-empty path component. Empty ids,
 `.`/`..`, path separators, and NUL bytes are rejected with
-`error.InvalidCheckpointId`.
+`error.InvalidCheckpointId`. File writes are atomic: state is written to a
+temporary file and renamed into place, so a crash mid-write cannot corrupt
+the previous good checkpoint.
+
+For production pipelines, wrap any backend in `CheckpointService`: it stamps
+a version header on every save, applies optional encode/decode transforms
+(compression hooks), skips byte-identical saves, persists asynchronously on
+one background thread, and reports latency/size metrics.
+
+```zig
+var service = vigil.CheckpointService.init(allocator, ckpt, .{
+    .version = 2,
+    .encode = compress,          // optional TransformFn hooks
+    .decode = decompress,
+    .migrate = migrateFromV1,    // called for older stored versions
+});
+try service.start();             // enables saveAsync()
+defer service.deinit();          // drains queued saves before stopping
+
+try service.saveAsync("machine", serialized); // never blocks on storage
+service.flush();                               // wait for queued saves
+const state = try service.load("machine", allocator); // verify + migrate + decode
+const stats = service.metrics(); // saves, skipped, failures, bytes, latency, pending
+```
+
+Loading a checkpoint whose version differs from `options.version` calls the
+`migrate` hook, or fails with `error.CheckpointVersionMismatch` when none is
+configured. Headerless data from plain `Checkpointer` backends is treated as
+version 0.
 
 ---
 
@@ -1213,6 +1273,39 @@ timer.cancel();
 Intervals must be greater than zero; `setInterval(0, ...)` returns
 `error.InvalidInterval`. After a one-shot callback finishes,
 `snapshot().active` is false.
+
+`vigil.Timer` spawns one thread per timer and is kept for compatibility;
+prefer the timer service below for new code.
+
+---
+
+### Timer Service
+
+One scheduler thread drives every timeout, interval, and delayed send from a
+min-heap of deadlines — no thread per timer. `Runtime.timers()` owns the
+service lifecycle; a standalone `vigil.TimerService` needs `start()` and a
+stable address.
+
+```zig
+var rt = try vigil.runtime(allocator, .{});
+defer rt.deinit();
+const timers = try rt.timers();
+
+const id = try timers.setTimeout(1000, onDeadline);
+_ = try timers.setInterval(500, onTick);
+_ = try timers.sendAfter(250, inbox.mailbox, msg); // owns msg; no detached thread
+_ = timers.cancel(id);
+
+const state = timers.snapshot(); // running, pending, fired, cancelled
+```
+
+| Method | Description |
+|--------|-------------|
+| `setTimeout(delay_ms, fn)` | Run once after a delay; returns a cancellation id |
+| `setInterval(interval_ms, fn)` | Run repeatedly until cancelled |
+| `sendAfter(delay_ms, mailbox, msg)` | Deliver an owned message after a delay |
+| `cancel(id)` | Cancel a pending timer (releases undelivered sends) |
+| `pendingCount()` / `snapshot()` | Inspect scheduled work and lifetime counters |
 
 ---
 

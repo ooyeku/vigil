@@ -32,7 +32,16 @@ Current status:
   timers, fault injection, fake distributed registry, full-queue and
   slow-consumer helpers) plus property/fuzz tests for routing and protocol
   parsing, and the `examples/ops_toolkit` operational examples.
-- v2.2.0 has shipped; the next arc is the v2.3.0 Scale The Runtime work.
+- v2.2.0 has shipped.
+- v2.3.0 has shipped: ring-buffer mailboxes with lazy expiry and condition
+  wakeups, single-allocation messages, the runtime timer service, batch and
+  nonblocking messaging, allocation-free telemetry, precompiled pub/sub
+  fanout, the sharded registry, lock-free adaptive flow control, persistent
+  distributed peer connections with metrics, the async versioned checkpoint
+  pipeline, and safe/balanced/throughput runtime profiles. Messaging
+  throughput improved ~70x and timer scheduling ~37x over the v2.2.1
+  baselines; see `benchmarks/vigil_bench/README.md`. The next arc is the
+  v3.0.0 Stabilize And Integrate release.
 
 ## Product Direction
 
@@ -206,6 +215,8 @@ examples.
 - Examples show production-flavored failure handling.
 
 ## v2.3.0: Scale The Runtime
+
+Status: shipped.
 
 v2.3.0 should contain most of the major implementation improvements. This is the
 release where Vigil becomes materially faster, more scalable, and more capable

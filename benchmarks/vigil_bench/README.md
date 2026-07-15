@@ -19,6 +19,38 @@ registration, telemetry emission, timer scheduling, process-group routing,
 process-group broadcast, pub/sub fanout, request/reply correlation, and
 concurrent inbox producer/consumer contention.
 
+## Baseline (v2.3.0)
+
+Captured on 2026-07-15 with Zig 0.16.0 on Darwin arm64 using:
+
+```bash
+zig build run -Doptimize=ReleaseSafe -- --iterations 10000
+```
+
+| Benchmark | Ops | Avg | Throughput | Allocs/Op |
+| --- | ---: | ---: | ---: | ---: |
+| inbox send+recv | 20,000 | 127 ns | 7,855,459/s | 0.501 |
+| inbox send+recv (throughput profile) | 20,000 | 121 ns | 8,247,422/s | 0.501 |
+| registry lookup | 10,000 | 10 ns | 100,000,000/s | 0.000 |
+| registry register | 10,000 | 182 ns | 5,485,463/s | 1.038 |
+| registry contention (8 threads) | 80,000 | 23 ns | 42,238,648/s | 0.001 |
+| telemetry emit | 10,000 | 7 ns | 135,135,135/s | 0.000 |
+| timer schedule+join (legacy Timer) | 10,000 | 19,420 ns | 51,491/s | 1.000 |
+| timer service schedule | 10,000 | 464 ns | 2,153,316/s | 0.001 |
+| process group route | 10,000 | 113 ns | 8,810,572/s | 1.006 |
+| process group broadcast | 40,000 | 120 ns | 8,290,155/s | 1.002 |
+| pubsub fanout | 40,000 | 120 ns | 8,316,008/s | 1.002 |
+| request/reply correlate | 10,000 | 322 ns | 3,104,625/s | 8.000 |
+| inbox contention | 20,000 | 262 ns | 3,808,798/s | 0.500 |
+
+Versus the v2.2.1 baseline below: inbox send+recv is ~70x faster (ring
+buffers, lazy expiry, single-allocation messages), receive cost is now
+independent of queue depth, contention throughput is ~10x higher (condition
+wakeups instead of poll-sleeps), timer scheduling is ~37x faster on one
+shared scheduler thread instead of a thread per timer, telemetry emission is
+allocation-free, and fanout costs one allocation per delivered message
+instead of three.
+
 ## Baseline (v2.2.1)
 
 Captured on 2026-07-15 with Zig 0.16.0 on Darwin arm64 using:
