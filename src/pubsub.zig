@@ -29,18 +29,34 @@ pub const SubscriberSnapshot = struct {
     closed: bool,
 };
 
-/// Owned snapshot of broker subscribers.
+/// Owned inspection of one subscriber, including its topic patterns.
+pub const SubscriberInspection = struct {
+    /// Copied topic pattern strings, owned by the enclosing snapshot.
+    patterns: []const []const u8,
+    /// Current queued message count for the subscriber inbox.
+    queue_depth: usize,
+    /// Whether the subscriber inbox has been closed.
+    closed: bool,
+};
+
+/// Owned snapshot of broker subscribers and their subscriptions.
 pub const PubSubBrokerSnapshot = struct {
     allocator: std.mem.Allocator,
     /// Number of subscriber pointers registered with the broker.
     subscriber_count: usize,
     /// Total topic patterns across all subscribers.
     total_pattern_count: usize,
-    /// Per-subscriber snapshots.
-    subscribers: []SubscriberSnapshot,
+    /// Per-subscriber inspections with copied patterns.
+    subscribers: []SubscriberInspection,
 
-    /// Release snapshot storage.
+    /// Release copied patterns and snapshot storage.
     pub fn deinit(self: *PubSubBrokerSnapshot) void {
+        for (self.subscribers) |subscriber| {
+            for (subscriber.patterns) |pattern| {
+                self.allocator.free(pattern);
+            }
+            self.allocator.free(subscriber.patterns);
+        }
         self.allocator.free(self.subscribers);
     }
 };
@@ -64,28 +80,27 @@ pub const TopicPattern = struct {
 };
 
 fn matchPattern(pattern: []const u8, topic: []const u8) bool {
-    var pattern_idx: usize = 0;
-    var topic_idx: usize = 0;
+    var pattern_segments = std.mem.splitScalar(u8, pattern, '.');
+    var topic_segments = std.mem.splitScalar(u8, topic, '.');
 
-    while (pattern_idx < pattern.len and topic_idx < topic.len) {
-        if (pattern[pattern_idx] == '*') {
-            // Single level wildcard - match until next separator
-            pattern_idx += 1;
-            while (topic_idx < topic.len and topic[topic_idx] != '.') {
-                topic_idx += 1;
-            }
-        } else if (pattern[pattern_idx] == '#') {
-            // Multi-level wildcard - match rest
-            return true;
-        } else if (pattern[pattern_idx] == topic[topic_idx]) {
-            pattern_idx += 1;
-            topic_idx += 1;
-        } else {
-            return false;
+    while (pattern_segments.next()) |pattern_segment| {
+        if (std.mem.eql(u8, pattern_segment, "#")) {
+            // The multi-level wildcard is valid only as the final segment and
+            // matches zero or more remaining topic levels.
+            return pattern_segments.next() == null;
         }
+
+        const topic_segment = topic_segments.next() orelse return false;
+        if (std.mem.eql(u8, pattern_segment, "*")) {
+            // A single-level wildcard must consume one non-empty level.
+            if (topic_segment.len == 0) return false;
+            continue;
+        }
+
+        if (!std.mem.eql(u8, pattern_segment, topic_segment)) return false;
     }
 
-    return pattern_idx == pattern.len and topic_idx == topic.len;
+    return topic_segments.next() == null;
 }
 
 /// Inbox-backed pub/sub subscriber.
@@ -131,6 +146,12 @@ pub const Subscriber = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        const original_len = self.patterns.items.len;
+        errdefer while (self.patterns.items.len > original_len) {
+            const removed = self.patterns.pop().?;
+            self.allocator.free(removed.pattern);
+        };
+
         for (patterns) |pattern| {
             const pattern_copy = try self.allocator.dupe(u8, pattern);
             errdefer self.allocator.free(pattern_copy);
@@ -162,6 +183,28 @@ pub const Subscriber = struct {
             .queue_depth = self.inbox.mailbox.queuedCount(),
             .closed = self.inbox.isClosed(),
         };
+    }
+
+    /// Return owned copies of the subscribed topic patterns.
+    ///
+    /// The caller owns the returned slice and each pattern string.
+    pub fn snapshotPatterns(self: *Subscriber, allocator: std.mem.Allocator) ![]const []const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const patterns = try allocator.alloc([]const u8, self.patterns.items.len);
+        errdefer allocator.free(patterns);
+
+        var written: usize = 0;
+        errdefer for (patterns[0..written]) |pattern| {
+            allocator.free(pattern);
+        };
+
+        for (self.patterns.items) |pattern| {
+            patterns[written] = try allocator.dupe(u8, pattern.pattern);
+            written += 1;
+        }
+        return patterns;
     }
 };
 
@@ -200,6 +243,10 @@ pub const PubSubBroker = struct {
     pub fn subscribe(self: *PubSubBroker, subscriber: *Subscriber) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        for (self.subscribers.items) |existing| {
+            if (existing == subscriber) return;
+        }
         try self.subscribers.append(self.allocator, subscriber);
     }
 
@@ -267,14 +314,26 @@ pub const PubSubBroker = struct {
         self.mutex.unlock();
         defer allocator.free(subscribers_copy);
 
-        const subscribers = try allocator.alloc(SubscriberSnapshot, subscribers_copy.len);
+        const subscribers = try allocator.alloc(SubscriberInspection, subscribers_copy.len);
         errdefer allocator.free(subscribers);
 
+        var written: usize = 0;
+        errdefer for (subscribers[0..written]) |inspection| {
+            for (inspection.patterns) |pattern| allocator.free(pattern);
+            allocator.free(inspection.patterns);
+        };
+
         var total_pattern_count: usize = 0;
-        for (subscribers_copy, 0..) |subscriber, i| {
+        for (subscribers_copy) |subscriber| {
             const subscriber_snapshot = subscriber.snapshot();
-            subscribers[i] = subscriber_snapshot;
-            total_pattern_count += subscriber_snapshot.pattern_count;
+            const patterns = try subscriber.snapshotPatterns(allocator);
+            subscribers[written] = .{
+                .patterns = patterns,
+                .queue_depth = subscriber_snapshot.queue_depth,
+                .closed = subscriber_snapshot.closed,
+            };
+            written += 1;
+            total_pattern_count += patterns.len;
         }
 
         return .{
@@ -295,6 +354,41 @@ test "TopicPattern matching" {
     const multi_pattern = TopicPattern{ .pattern = "events.#" };
     try std.testing.expect(multi_pattern.matches("events.user.created"));
     try std.testing.expect(multi_pattern.matches("events.system.alerts"));
+    try std.testing.expect(multi_pattern.matches("events"));
+
+    try std.testing.expect(!pattern.matches("events."));
+    try std.testing.expect(!(TopicPattern{ .pattern = "events.#.invalid" }).matches("events.any.invalid"));
+    try std.testing.expect(!(TopicPattern{ .pattern = "ev*nts.user" }).matches("events.user"));
+}
+
+test "Subscriber subscribe rolls back partial allocation failure" {
+    const allocator = std.testing.allocator;
+    var inbox = try Inbox.init(allocator);
+    defer inbox.close();
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 2 });
+    var subscriber = Subscriber.init(failing.allocator(), inbox);
+    defer subscriber.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, subscriber.subscribe(&.{ "one", "two" }));
+    try std.testing.expectEqual(@as(usize, 0), subscriber.patterns.items.len);
+}
+
+test "PubSubBroker ignores duplicate subscriber registration" {
+    const allocator = std.testing.allocator;
+    var broker = PubSubBroker.init(allocator);
+    defer broker.deinit();
+    var inbox = try Inbox.init(allocator);
+    defer inbox.close();
+    var subscriber = Subscriber.init(allocator, inbox);
+    defer subscriber.deinit();
+    try subscriber.subscribe(&.{"events.#"});
+
+    try broker.subscribe(&subscriber);
+    try broker.subscribe(&subscriber);
+    const result = try broker.publish("events.created", "once");
+    try std.testing.expectEqual(@as(usize, 1), result.delivered);
+    try std.testing.expectEqual(@as(usize, 1), inbox.mailbox.queuedCount());
 }
 
 test "PubSubBroker publish/subscribe" {
@@ -364,7 +458,9 @@ test "PubSubBroker snapshot reports subscribers and pattern counts" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.subscriber_count);
     try std.testing.expectEqual(@as(usize, 2), snapshot.total_pattern_count);
     try std.testing.expectEqual(@as(usize, 1), snapshot.subscribers.len);
-    try std.testing.expectEqual(@as(usize, 2), snapshot.subscribers[0].pattern_count);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.subscribers[0].patterns.len);
+    try std.testing.expectEqualStrings("orders.*", snapshot.subscribers[0].patterns[0]);
+    try std.testing.expectEqualStrings("system.#", snapshot.subscribers[0].patterns[1]);
     try std.testing.expectEqual(@as(usize, 0), snapshot.subscribers[0].queue_depth);
     try std.testing.expect(!snapshot.subscribers[0].closed);
 }
@@ -403,5 +499,58 @@ test "PubSubBroker fanout stress reports all deliveries" {
     try std.testing.expectEqual(@as(usize, subscriber_count * iterations), delivered);
     for (inboxes) |inbox| {
         try std.testing.expectEqual(iterations, inbox.mailbox.queuedCount());
+    }
+}
+
+test "pubsub property: generated topics match themselves and wildcard forms" {
+    var prng = std.Random.DefaultPrng.init(0x70b1_c5);
+    const random = prng.random();
+
+    const segment_alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+    var topic_buffer: [128]u8 = undefined;
+    var pattern_buffer: [128]u8 = undefined;
+
+    for (0..500) |_| {
+        // Build a random topic of 1..5 non-empty segments.
+        const segment_count = 1 + random.uintLessThan(usize, 5);
+        var topic_len: usize = 0;
+        var last_segment_start: usize = 0;
+        for (0..segment_count) |segment_index| {
+            if (segment_index != 0) {
+                topic_buffer[topic_len] = '.';
+                topic_len += 1;
+            }
+            last_segment_start = topic_len;
+            const segment_len = 1 + random.uintLessThan(usize, 8);
+            for (0..segment_len) |_| {
+                topic_buffer[topic_len] = segment_alphabet[random.uintLessThan(usize, segment_alphabet.len)];
+                topic_len += 1;
+            }
+        }
+        const topic = topic_buffer[0..topic_len];
+
+        // A topic always matches itself as an exact pattern.
+        try std.testing.expect(matchPattern(topic, topic));
+
+        // Replacing the final segment with `*` still matches.
+        const star_len = last_segment_start + 1;
+        @memcpy(pattern_buffer[0..last_segment_start], topic[0..last_segment_start]);
+        pattern_buffer[last_segment_start] = '*';
+        try std.testing.expect(matchPattern(pattern_buffer[0..star_len], topic));
+
+        // `*` must not match across additional levels.
+        const extended = try std.fmt.bufPrint(topic_buffer[topic_len..], ".extra", .{});
+        try std.testing.expect(!matchPattern(
+            pattern_buffer[0..star_len],
+            topic_buffer[0 .. topic_len + extended.len],
+        ));
+
+        // A `#` suffix matches the topic and any deeper topic.
+        if (last_segment_start > 0) {
+            pattern_buffer[last_segment_start] = '#';
+            const hash_pattern = pattern_buffer[0..star_len];
+            try std.testing.expect(matchPattern(hash_pattern, topic));
+            try std.testing.expect(matchPattern(hash_pattern, topic_buffer[0 .. topic_len + extended.len]));
+        }
     }
 }

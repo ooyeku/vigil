@@ -45,7 +45,7 @@ pub const RateLimiter = struct {
             .tokens = @as(f64, @floatFromInt(max_per_second)),
             .max_tokens = @as(f64, @floatFromInt(max_per_second)),
             .refill_rate = tokens_per_ms,
-            .last_refill_ms = compat.milliTimestamp(),
+            .last_refill_ms = compat.monotonicMilliTimestamp(),
             .mutex = .{},
         };
     }
@@ -58,8 +58,8 @@ pub const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const now_ms = compat.milliTimestamp();
-        const elapsed_ms = @as(f64, @floatFromInt(now_ms - self.last_refill_ms));
+        const now_ms = compat.monotonicMilliTimestamp();
+        const elapsed_ms = @as(f64, @floatFromInt(@max(@as(i64, 0), now_ms - self.last_refill_ms)));
         self.last_refill_ms = now_ms;
 
         // Refill tokens based on elapsed time
@@ -77,7 +77,7 @@ pub const RateLimiter = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.tokens = self.max_tokens;
-        self.last_refill_ms = compat.milliTimestamp();
+        self.last_refill_ms = compat.monotonicMilliTimestamp();
     }
 
     /// Return the current token count without forcing a refill calculation.
@@ -139,6 +139,11 @@ pub const FlowControlledInbox = struct {
 
     /// Send a payload after applying rate-limit and backpressure rules.
     pub fn send(self: *FlowControlledInbox, payload: []const u8) !void {
+        var operation = try self.inbox.acquireOperation();
+        defer operation.release();
+
+        if (self.inbox.isClosed()) return error.InboxClosed;
+
         // Check rate limit
         if (self.rate_limiter) |*limiter| {
             if (!limiter.allow()) {
@@ -148,15 +153,20 @@ pub const FlowControlledInbox = struct {
 
         // Check backpressure
         if (self.backpressure_config) |config| {
-            const inbox_stats = self.inbox.stats();
-            const current_count = inbox_stats.messages_received - inbox_stats.messages_sent;
+            if (config.low_watermark > config.high_watermark or
+                (config.strategy == .block and config.low_watermark == 0))
+            {
+                return error.InvalidConfiguration;
+            }
+
+            const current_count = self.inbox.mailbox.queuedCount();
 
             if (current_count >= config.high_watermark) {
                 switch (config.strategy) {
                     .drop_oldest => {
-                        // Try to receive and drop oldest
-                        _ = self.inbox.recvTimeout(0) catch null;
-                        // Then send new message
+                        // Drop through the mailbox so ownership and drop
+                        // statistics are updated together.
+                        _ = self.inbox.mailbox.dropOldest();
                         try self.inbox.send(payload);
                     },
                     .drop_newest => {
@@ -166,8 +176,8 @@ pub const FlowControlledInbox = struct {
                     .block => {
                         // Wait until below low watermark
                         while (true) {
-                            const current_stats = self.inbox.stats();
-                            const current = current_stats.messages_received - current_stats.messages_sent;
+                            if (self.inbox.isClosed()) return error.InboxClosed;
+                            const current = self.inbox.mailbox.queuedCount();
                             if (current < config.low_watermark) break;
                             compat.sleep(10 * std.time.ns_per_ms);
                         }
@@ -289,4 +299,35 @@ test "FlowControlledInbox backpressure drop_oldest" {
 
     // Should still accept new messages (dropping oldest)
     try flow_inbox.send("new");
+
+    try std.testing.expectEqual(@as(usize, 5), inbox.mailbox.queuedCount());
+    const stats = inbox.stats();
+    try std.testing.expectEqual(@as(usize, 6), stats.messages_dropped);
+
+    var saw_new = false;
+    while (try inbox.recvTimeout(0)) |msg| {
+        defer msg.deinit();
+        if (std.mem.eql(u8, msg.payload.?, "new")) saw_new = true;
+    }
+    try std.testing.expect(saw_new);
+}
+
+test "FlowControlledInbox rejects invalid blocking watermarks" {
+    const allocator = std.testing.allocator;
+    var inbox = try @import("./inbox.zig").inbox(allocator);
+    defer inbox.close();
+
+    var zero_low = FlowControlledInbox.init(allocator, inbox, null, .{
+        .strategy = .block,
+        .high_watermark = 1,
+        .low_watermark = 0,
+    });
+    try std.testing.expectError(error.InvalidConfiguration, zero_low.send("blocked forever"));
+
+    var inverted = FlowControlledInbox.init(allocator, inbox, null, .{
+        .strategy = .block,
+        .high_watermark = 1,
+        .low_watermark = 2,
+    });
+    try std.testing.expectError(error.InvalidConfiguration, inverted.send("invalid"));
 }

@@ -39,6 +39,13 @@ test "Mutex basic lock/unlock" {
     m.unlock();
 }
 
+test "monotonic clock does not move backwards" {
+    const before = monotonicMilliTimestamp();
+    sleep(1 * std.time.ns_per_ms);
+    const after = monotonicMilliTimestamp();
+    try std.testing.expect(after >= before);
+}
+
 // Direct kernel32 externs. Zig 0.16 pared `std.os.windows.kernel32` down
 // to a couple of functions (CreateProcessW etc.), so the time / Sleep
 // surfaces aren't reachable through the stdlib anymore. Declaring them
@@ -46,6 +53,7 @@ test "Mutex basic lock/unlock" {
 const win32 = if (@import("builtin").os.tag == .windows) struct {
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *std.os.windows.FILETIME) callconv(.winapi) void;
+    extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 } else struct {};
 
 /// Replacement for the removed `std.Thread.sleep`. Blocks the current thread
@@ -57,7 +65,7 @@ pub fn sleep(nanoseconds: u64) void {
         const ms_u64 = if (nanoseconds == 0)
             0
         else
-            @max(@as(u64, 1), (nanoseconds + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+            ((nanoseconds - 1) / std.time.ns_per_ms) + 1;
         const ms: u32 = @intCast(@min(ms_u64, std.math.maxInt(u32)));
         win32.Sleep(ms);
         return;
@@ -68,8 +76,11 @@ pub fn sleep(nanoseconds: u64) void {
         .nsec = @intCast(nanoseconds % ns_per_s),
     };
     var rem: std.posix.timespec = undefined;
-    while (std.c.nanosleep(&req, &rem) != 0) {
-        req = rem;
+    while (true) {
+        switch (std.posix.errno(std.posix.system.nanosleep(&req, &rem))) {
+            .INTR => req = rem,
+            else => return,
+        }
     }
 }
 
@@ -98,6 +109,18 @@ pub fn nanoTimestamp() i128 {
 /// Replacement for the removed `std.time.milliTimestamp`.
 pub fn milliTimestamp() i64 {
     return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_ms));
+}
+
+/// Monotonic milliseconds suitable for measuring elapsed time and deadlines.
+pub fn monotonicMilliTimestamp() i64 {
+    if (@import("builtin").os.tag == .windows) {
+        return @intCast(@min(win32.GetTickCount64(), std.math.maxInt(i64)));
+    }
+
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s +
+        @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
 }
 
 /// Replacement for the removed `std.time.timestamp`.

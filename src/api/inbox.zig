@@ -29,6 +29,8 @@ pub const DeadLetterNotice = messages.DeadLetterNotice;
 pub const DeadLetterSnapshot = messages.DeadLetterSnapshot;
 pub const DeadLetterReplayStatus = messages.DeadLetterReplayStatus;
 pub const DeadLetterReplayResult = messages.DeadLetterReplayResult;
+pub const QueuedMessageSnapshot = messages.QueuedMessageSnapshot;
+pub const MailboxQueueSnapshot = messages.MailboxQueueSnapshot;
 
 /// Called once when a failed delivery first crosses the poison threshold.
 pub const PoisonMessageHandler = *const fn (context: ?*anyopaque, notice: DeadLetterNotice) void;
@@ -53,6 +55,22 @@ pub const InboxError = error{
 /// flag and then spins until all in-flight operations have finished
 /// before deallocating.
 pub const Inbox = struct {
+    const closed_operation_bit: u32 = 1 << 31;
+    const operation_count_mask: u32 = closed_operation_bit - 1;
+
+    /// RAII pin for higher-level wrappers that need several mailbox operations
+    /// to share one shutdown-safe lifetime window.
+    pub const OperationGuard = struct {
+        inbox: ?*Inbox,
+
+        /// Release this operation pin. Calling release more than once is safe.
+        pub fn release(self: *OperationGuard) void {
+            const target = self.inbox orelse return;
+            self.inbox = null;
+            target.endOperation();
+        }
+    };
+
     /// Underlying mailbox. Exposed for registry and low-level API interop.
     /// The `Inbox` owns this pointer; do not deinitialize it directly.
     mailbox: *ProcessMailbox,
@@ -61,8 +79,9 @@ pub const Inbox = struct {
     allocator: std.mem.Allocator,
     /// Atomic flag indicating the inbox has been closed.
     closed: std.atomic.Value(bool),
-    /// Number of in-flight operations (send / recv / recvTimeout).
-    /// `close()` waits for this to reach zero before deallocating.
+    /// Atomic lifecycle word: the high bit closes operation admission and the
+    /// remaining bits count in-flight operations. `close()` waits for the count
+    /// to reach zero before deallocating.
     active_ops: std.atomic.Value(u32),
     /// Monotonic suffix used to make high-level message ids unique per inbox.
     next_message_id: std.atomic.Value(u64),
@@ -125,11 +144,15 @@ pub const Inbox = struct {
     pub fn close(self: *Inbox) void {
         // Set closed flag first to signal waiting threads
         self.closed.store(true, .release);
+        // Atomically close admission for new operations. An operation either
+        // increments before this bit is set (and close waits for it), or its
+        // compare/exchange observes the bit and returns InboxClosed.
+        _ = self.active_ops.fetchOr(closed_operation_bit, .acq_rel);
 
         // Spin-wait until all in-flight operations have exited.
         // Each operation increments active_ops on entry and decrements
         // on exit, so reaching zero means nothing is touching the mailbox.
-        while (self.active_ops.load(.acquire) != 0) {
+        while (self.active_ops.load(.acquire) & operation_count_mask != 0) {
             compat.sleep(1 * std.time.ns_per_ms);
         }
 
@@ -206,35 +229,20 @@ pub const Inbox = struct {
     /// The returned `Message` is owned by the caller and must be deinitialized.
     /// Returns `InboxError.InboxClosed` if the inbox closes while waiting.
     pub fn recv(self: *Inbox) !Message {
-        while (true) {
-            // Check if inbox has been closed
-            if (self.closed.load(.acquire)) {
-                return InboxError.InboxClosed;
-            }
-            // Track this operation so close() waits for us
-            _ = self.active_ops.fetchAdd(1, .acq_rel);
+        try self.beginOperation();
+        defer self.endOperation();
 
-            // Re-check after incrementing
-            if (self.closed.load(.acquire)) {
-                _ = self.active_ops.fetchSub(1, .acq_rel);
-                return InboxError.InboxClosed;
-            }
+        while (true) {
+            if (self.closed.load(.acquire)) return InboxError.InboxClosed;
 
             if (self.mailbox.receive()) |msg| {
-                _ = self.active_ops.fetchSub(1, .acq_rel);
                 return msg;
             } else |err| switch (err) {
                 error.EmptyMailbox => {
-                    // Release the op count while sleeping so close()
-                    // can make progress if this is the only thread.
-                    _ = self.active_ops.fetchSub(1, .acq_rel);
                     compat.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
-                else => {
-                    _ = self.active_ops.fetchSub(1, .acq_rel);
-                    return err;
-                },
+                else => return err,
             }
         }
     }
@@ -245,46 +253,35 @@ pub const Inbox = struct {
     /// The returned `Message`, when present, is owned by the caller and must be
     /// deinitialized.
     pub fn recvTimeout(self: *Inbox, timeout_ms: u32) !?Message {
-        const start = compat.milliTimestamp();
-        while (true) {
-            // Check if inbox has been closed
-            if (self.closed.load(.acquire)) {
-                return InboxError.InboxClosed;
-            }
-            if (timeout_ms != 0 and compat.milliTimestamp() - start >= timeout_ms) {
-                return null;
-            }
-            // Track this operation so close() waits for us
-            _ = self.active_ops.fetchAdd(1, .acq_rel);
+        const start = compat.monotonicMilliTimestamp();
+        try self.beginOperation();
+        defer self.endOperation();
 
-            // Re-check after incrementing
-            if (self.closed.load(.acquire)) {
-                _ = self.active_ops.fetchSub(1, .acq_rel);
-                return InboxError.InboxClosed;
+        while (true) {
+            if (self.closed.load(.acquire)) return InboxError.InboxClosed;
+            if (timeout_ms != 0 and compat.monotonicMilliTimestamp() - start >= timeout_ms) {
+                return null;
             }
 
             if (self.mailbox.receive()) |msg| {
-                _ = self.active_ops.fetchSub(1, .acq_rel);
                 return msg;
             } else |err| switch (err) {
                 error.EmptyMailbox => {
-                    _ = self.active_ops.fetchSub(1, .acq_rel);
-                    if (timeout_ms == 0 or compat.milliTimestamp() - start >= timeout_ms) {
+                    if (timeout_ms == 0 or compat.monotonicMilliTimestamp() - start >= timeout_ms) {
                         return null;
                     }
                     compat.sleep(1 * std.time.ns_per_ms);
                     continue;
                 },
-                else => {
-                    _ = self.active_ops.fetchSub(1, .acq_rel);
-                    return err;
-                },
+                else => return err,
             }
         }
     }
 
     /// Return a snapshot of the underlying mailbox statistics.
     pub fn stats(self: *Inbox) ProcessMailbox.MailboxStats {
+        var operation = self.acquireOperation() catch return .{};
+        defer operation.release();
         return self.mailbox.getStats();
     }
 
@@ -293,6 +290,8 @@ pub const Inbox = struct {
     /// `emitter` must outlive this inbox. `Runtime.inbox()` configures this
     /// automatically when runtime telemetry is enabled.
     pub fn setTelemetryEmitter(self: *Inbox, emitter: ?*telemetry.TelemetryEmitter) void {
+        var operation = self.acquireOperation() catch return;
+        defer operation.release();
         self.lifecycle_mutex.lock();
         defer self.lifecycle_mutex.unlock();
         self.telemetry_emitter = emitter;
@@ -304,6 +303,8 @@ pub const Inbox = struct {
         context: ?*anyopaque,
         handler: PoisonMessageHandler,
     ) void {
+        var operation = self.acquireOperation() catch return;
+        defer operation.release();
         self.lifecycle_mutex.lock();
         defer self.lifecycle_mutex.unlock();
         self.poison_context = context;
@@ -385,16 +386,68 @@ pub const Inbox = struct {
         return discarded;
     }
 
+    /// Capture an owned snapshot of queued messages without consuming them.
+    ///
+    /// Entries appear in delivery order. Payload bytes are not copied; each
+    /// entry carries scalar metadata plus copied id/sender strings. The caller
+    /// owns the snapshot and must call `deinit()`.
+    pub fn peekMessages(self: *Inbox, allocator: std.mem.Allocator) !messages.MailboxQueueSnapshot {
+        try self.beginOperation();
+        defer self.endOperation();
+        return try self.mailbox.snapshotQueue(allocator);
+    }
+
     fn queuedCount(self: *Inbox) usize {
         return self.mailbox.queuedCount();
     }
 
+    /// Return the active queue depth while participating in shutdown safety.
+    pub fn queueDepth(self: *Inbox) !usize {
+        try self.beginOperation();
+        defer self.endOperation();
+        return self.mailbox.queuedCount();
+    }
+
+    /// Drop the oldest active message while participating in shutdown safety.
+    pub fn dropOldest(self: *Inbox) !bool {
+        try self.beginOperation();
+        defer self.endOperation();
+        return self.mailbox.dropOldest();
+    }
+
+    /// Pin the inbox lifetime across a multi-step operation.
+    ///
+    /// The returned guard must be released. This is intended for wrappers that
+    /// need to inspect the raw mailbox and later delegate back to the inbox.
+    pub fn acquireOperation(self: *Inbox) !OperationGuard {
+        try self.beginOperation();
+        return .{ .inbox = self };
+    }
+
     fn beginOperation(self: *Inbox) !void {
-        if (self.closed.load(.acquire)) return InboxError.InboxClosed;
-        _ = self.active_ops.fetchAdd(1, .acq_rel);
-        if (self.closed.load(.acquire)) {
-            _ = self.active_ops.fetchSub(1, .acq_rel);
-            return InboxError.InboxClosed;
+        var lifecycle = self.active_ops.load(.acquire);
+        while (true) {
+            if (lifecycle & closed_operation_bit != 0) return InboxError.InboxClosed;
+            if (lifecycle & operation_count_mask == operation_count_mask) {
+                return error.TooManyOperations;
+            }
+            if (self.active_ops.cmpxchgWeak(
+                lifecycle,
+                lifecycle + 1,
+                .acq_rel,
+                .acquire,
+            )) |observed| {
+                lifecycle = observed;
+                continue;
+            }
+            // close() publishes the user-visible flag before closing the
+            // lifecycle word. If we won the narrow interval between those two
+            // atomics, release the admitted reference and honor shutdown.
+            if (self.closed.load(.acquire)) {
+                self.endOperation();
+                return InboxError.InboxClosed;
+            }
+            return;
         }
     }
 
@@ -457,7 +510,7 @@ pub const Inbox = struct {
             },
             .drop_newest => return false,
             .block => {
-                while (self.queuedCount() > config.low_watermark) {
+                while (self.queuedCount() >= config.low_watermark) {
                     if (self.closed.load(.acquire)) return InboxError.InboxClosed;
                     compat.sleep(10 * std.time.ns_per_ms);
                 }
@@ -569,7 +622,9 @@ pub const InboxBuilder = struct {
     /// The caller owns the returned pointer and must call `close()`.
     pub fn build(self: InboxBuilder) !*Inbox {
         if (self.backpressure_config) |config| {
-            if (config.low_watermark > config.high_watermark) {
+            if (config.low_watermark > config.high_watermark or
+                (config.strategy == .block and config.low_watermark == 0))
+            {
                 return error.InvalidConfiguration;
             }
         }
@@ -888,6 +943,19 @@ test "InboxBuilder rejects inverted backpressure watermarks" {
     );
 }
 
+test "InboxBuilder rejects blocking backpressure with zero low watermark" {
+    try std.testing.expectError(
+        error.InvalidConfiguration,
+        inboxBuilder(std.testing.allocator)
+            .withBackpressure(.{
+                .strategy = .block,
+                .high_watermark = 1,
+                .low_watermark = 0,
+            })
+            .build(),
+    );
+}
+
 test "InboxBuilder drop_newest backpressure keeps existing message" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -987,6 +1055,50 @@ test "Inbox supports concurrent producer and consumer churn" {
     try std.testing.expectEqual(@as(usize, 0), inbox_ptr.mailbox.queuedCount());
 }
 
+test "Inbox lifecycle bit atomically rejects operation admission" {
+    var inbox_ptr = try Inbox.init(std.testing.allocator);
+    defer inbox_ptr.close();
+
+    _ = inbox_ptr.active_ops.fetchOr(Inbox.closed_operation_bit, .acq_rel);
+    try std.testing.expectError(InboxError.InboxClosed, inbox_ptr.queueDepth());
+
+    // Restore the lifecycle word so the deferred close remains the sole owner
+    // of destruction in this test.
+    inbox_ptr.active_ops.store(0, .release);
+}
+
+test "Inbox close waits for a blocked receiver to observe shutdown" {
+    const Receiver = struct {
+        inbox: *Inbox,
+        observed_close: *std.atomic.Value(bool),
+
+        fn run(context: *@This()) void {
+            _ = context.inbox.recv() catch |err| {
+                if (err == InboxError.InboxClosed) {
+                    context.observed_close.store(true, .release);
+                }
+                return;
+            };
+        }
+    };
+
+    var observed_close = std.atomic.Value(bool).init(false);
+    var inbox_ptr = try Inbox.init(std.testing.allocator);
+    var receiver = Receiver{
+        .inbox = inbox_ptr,
+        .observed_close = &observed_close,
+    };
+    const thread = try std.Thread.spawn(.{}, Receiver.run, .{&receiver});
+
+    while (inbox_ptr.active_ops.load(.acquire) & Inbox.operation_count_mask == 0) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    inbox_ptr.close();
+    thread.join();
+
+    try std.testing.expect(observed_close.load(.acquire));
+}
+
 test "Inbox exposes dead-letter lifecycle telemetry and poison hook" {
     const Recorder = struct {
         var dead_lettered = std.atomic.Value(usize).init(0);
@@ -1080,4 +1192,24 @@ test "Inbox poison hook can close its inbox without deadlocking" {
     _ = try inbox_ptr.deadLetter(failed, .delivery_failed);
     // The hook closed and destroyed inbox_ptr. Reaching this line proves the
     // callback ran after the operation released its close reference.
+}
+
+test "Inbox peekMessages inspects the queue without consuming" {
+    const allocator = std.testing.allocator;
+    var target = try Inbox.init(allocator);
+    defer target.close();
+
+    try target.send("first");
+    try target.send("second");
+
+    var snapshot = try target.peekMessages(allocator);
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    try std.testing.expectEqual(@as(usize, "first".len), snapshot.entries[0].payload_len);
+    try std.testing.expectEqual(@as(usize, 2), target.mailbox.queuedCount());
+
+    var msg = try target.recv();
+    defer msg.deinit();
+    try std.testing.expectEqualStrings("first", msg.payload.?);
 }

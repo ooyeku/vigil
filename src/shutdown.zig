@@ -82,20 +82,20 @@ pub const ShutdownManager = struct {
         self.mutex.unlock();
         defer self.allocator.free(hooks_copy);
 
-        const start_ms = compat.milliTimestamp();
+        const start_ms = compat.monotonicMilliTimestamp();
 
         if (options.order == .reverse) {
             var i: usize = hooks_copy.len;
             while (i > 0) {
                 i -= 1;
-                const elapsed = compat.milliTimestamp() - start_ms;
-                if (elapsed > options.timeout_ms) break;
+                const elapsed = compat.monotonicMilliTimestamp() - start_ms;
+                if (elapsed >= options.timeout_ms) break;
                 hooks_copy[i]();
             }
         } else {
             for (hooks_copy) |hook| {
-                const elapsed = compat.milliTimestamp() - start_ms;
-                if (elapsed > options.timeout_ms) break;
+                const elapsed = compat.monotonicMilliTimestamp() - start_ms;
+                if (elapsed >= options.timeout_ms) break;
                 hook();
             }
         }
@@ -155,4 +155,22 @@ test "ShutdownManager reverse order" {
 
     manager.shutdown(.{ .order = .reverse });
     // Test passes if no panic - order verification would need different approach
+}
+
+test "ShutdownManager zero timeout executes no hooks" {
+    const Counter = struct {
+        var value = std.atomic.Value(u32).init(0);
+
+        fn hook() void {
+            _ = value.fetchAdd(1, .monotonic);
+        }
+    };
+    Counter.value.store(0, .release);
+
+    var manager = ShutdownManager.init(std.testing.allocator);
+    defer manager.deinit();
+    try manager.onShutdown(Counter.hook);
+    manager.shutdown(.{ .timeout_ms = 0 });
+
+    try std.testing.expectEqual(@as(u32, 0), Counter.value.load(.acquire));
 }

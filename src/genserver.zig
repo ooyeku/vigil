@@ -35,9 +35,6 @@ pub fn GenServer(comptime StateType: type) type {
 
         const Self = @This();
 
-        /// Thread-safe storage for passing context to supervised start functions.
-        pub var current_context: std.atomic.Value(?*anyopaque) = std.atomic.Value(?*anyopaque).init(null);
-
         /// Serialization/deserialization callbacks for state checkpointing.
         pub const CheckpointFns = struct {
             serialize: *const fn (state: *const StateType, allocator: std.mem.Allocator) anyerror![]u8,
@@ -99,7 +96,14 @@ pub fn GenServer(comptime StateType: type) type {
                 self.server_state.store(.initial, .release);
                 return err;
             };
-            self.last_checkpoint_ms = compat.milliTimestamp();
+            self.last_checkpoint_ms = compat.monotonicMilliTimestamp();
+            defer {
+                // Every successful initialization has exactly one matching
+                // termination path, including handler and mailbox failures.
+                self.saveCheckpoint();
+                self.terminate_fn(self);
+                self.server_state.store(.stopped, .release);
+            }
 
             while (self.server_state.load(.acquire) == .running) {
                 if (self.mailbox.receive()) |msg_const| {
@@ -122,15 +126,14 @@ pub fn GenServer(comptime StateType: type) type {
                     else => return err,
                 }
             }
-
-            // Save final checkpoint before terminating
-            self.saveCheckpoint();
-            self.terminate_fn(self);
-            self.server_state.store(.stopped, .release);
         }
 
         /// Send an asynchronous message to the GenServer
         pub fn cast(self: *Self, msg: vigil.Message) !void {
+            if (self.server_state.load(.acquire) == .stopped) {
+                msg.deinit();
+                return error.NotRunning;
+            }
             try self.mailbox.send(msg);
         }
 
@@ -138,6 +141,8 @@ pub fn GenServer(comptime StateType: type) type {
         /// The handler must call self.reply(msg, payload) to send a response
         /// back to the caller's dedicated reply mailbox.
         pub fn call(self: *Self, msg: *vigil.Message, timeout_ms: ?u32) !vigil.Message {
+            if (self.server_state.load(.acquire) == .stopped) return error.NotRunning;
+
             const sequence = self.next_correlation_id.fetchAdd(1, .monotonic);
             const correlation_id = try std.fmt.allocPrint(
                 self.allocator,
@@ -185,10 +190,13 @@ pub fn GenServer(comptime StateType: type) type {
             };
 
             // Wait on the dedicated reply mailbox (not the server's mailbox)
-            const start_time = compat.milliTimestamp();
+            const start_time = compat.monotonicMilliTimestamp();
+            var first_poll = true;
             while (true) {
                 if (timeout_ms) |timeout| {
-                    if (compat.milliTimestamp() - start_time >= timeout) {
+                    if ((timeout == 0 and !first_poll) or
+                        (timeout != 0 and compat.monotonicMilliTimestamp() - start_time >= timeout))
+                    {
                         self.cleanupReplyEntry(correlation_id);
                         return error.Timeout;
                     }
@@ -198,15 +206,19 @@ pub fn GenServer(comptime StateType: type) type {
                     self.cleanupReplyEntry(correlation_id);
                     return response;
                 } else |err| switch (err) {
-                    error.EmptyMailbox => {
-                        compat.sleep(1 * std.time.ns_per_ms);
-                        continue;
-                    },
+                    error.EmptyMailbox => {},
                     else => {
                         self.cleanupReplyEntry(correlation_id);
                         return err;
                     },
                 }
+
+                first_poll = false;
+                if (self.server_state.load(.acquire) == .stopped) {
+                    self.cleanupReplyEntry(correlation_id);
+                    return error.NotRunning;
+                }
+                compat.sleep(1 * std.time.ns_per_ms);
             }
         }
 
@@ -273,21 +285,27 @@ pub fn GenServer(comptime StateType: type) type {
             interval_ms: u32,
             fns: CheckpointFns,
         ) !void {
-            self.checkpointer = ckpt;
-            self.checkpoint_id = try self.allocator.dupe(u8, id);
-            self.checkpoint_interval_ms = interval_ms;
-            self.checkpoint_fns = fns;
+            const id_copy = try self.allocator.dupe(u8, id);
+            errdefer self.allocator.free(id_copy);
 
             // Try to restore from existing checkpoint
+            var restored_state: ?StateType = null;
             if (try ckpt.load(id, self.allocator)) |data| {
                 defer self.allocator.free(data);
-                self.state = try fns.deserialize(data, self.allocator);
+                restored_state = try fns.deserialize(data, self.allocator);
             }
+
+            if (self.checkpoint_id) |old_id| self.allocator.free(old_id);
+            self.checkpointer = ckpt;
+            self.checkpoint_id = id_copy;
+            self.checkpoint_interval_ms = interval_ms;
+            self.checkpoint_fns = fns;
+            if (restored_state) |state| self.state = state;
         }
 
         fn maybeCheckpoint(self: *Self) void {
             if (self.checkpointer == null or self.checkpoint_fns == null) return;
-            const now = compat.milliTimestamp();
+            const now = compat.monotonicMilliTimestamp();
             if (now - self.last_checkpoint_ms < self.checkpoint_interval_ms) return;
             self.last_checkpoint_ms = now;
             self.saveCheckpoint();
@@ -332,24 +350,23 @@ pub fn GenServer(comptime StateType: type) type {
 
         /// Register with a supervisor
         pub fn supervise(self: *Self, supervisor: *vigil.Supervisor, id: []const u8) !void {
-            self.supervisor = supervisor;
-
-            current_context.store(@ptrCast(self), .release);
-
             try supervisor.addChild(.{
                 .id = id,
-                .start_fn = startFn,
+                .start_fn = unusedStartFn,
+                .start_context_fn = startContextFn,
                 .restart_type = .permanent,
                 .shutdown_timeout_ms = 5000,
                 .priority = .normal,
+                .context = self,
             });
+            self.supervisor = supervisor;
         }
 
-        fn startFn() void {
-            if (current_context.load(.acquire)) |ctx| {
-                const self: *Self = @ptrCast(@alignCast(ctx));
-                _ = self.start() catch {};
-            }
+        fn unusedStartFn() void {}
+
+        fn startContextFn(context: ?*anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(context.?));
+            _ = self.start() catch {};
         }
     };
 }
@@ -382,6 +399,68 @@ test "GenServer initialization" {
     );
     server.stop();
     server.deinit();
+}
+
+test "GenServer handler failure still terminates and stops lifecycle" {
+    const State = struct {};
+    const ServerType = GenServer(State);
+    const Recorder = struct {
+        var terminations = std.atomic.Value(u32).init(0);
+
+        fn handle(_: *ServerType, _: vigil.Message) !void {
+            return error.HandlerFailed;
+        }
+
+        fn init(_: *ServerType) !void {}
+
+        fn terminate(_: *ServerType) void {
+            _ = terminations.fetchAdd(1, .monotonic);
+        }
+    };
+    Recorder.terminations.store(0, .release);
+
+    const server = try ServerType.init(testing.allocator, Recorder.handle, Recorder.init, Recorder.terminate, .{});
+    defer server.deinit();
+    const message = try vigil.Message.init(testing.allocator, "failure", "test", "payload", null, .normal, null);
+    try server.cast(message);
+
+    try testing.expectError(error.HandlerFailed, server.start());
+    try testing.expectEqual(GenServerState.stopped, server.server_state.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), Recorder.terminations.load(.acquire));
+}
+
+test "GenServer checkpointer reconfiguration rolls back on restore failure" {
+    const ServerType = GenServer(u32);
+    const Callbacks = struct {
+        fn handle(_: *ServerType, _: vigil.Message) !void {}
+        fn init(_: *ServerType) !void {}
+        fn terminate(_: *ServerType) void {}
+
+        fn serialize(state: *const u32, allocator: std.mem.Allocator) ![]u8 {
+            return std.fmt.allocPrint(allocator, "{d}", .{state.*});
+        }
+
+        fn deserialize(data: []const u8, _: std.mem.Allocator) !u32 {
+            return std.fmt.parseInt(u32, data, 10);
+        }
+    };
+
+    const server = try ServerType.init(testing.allocator, Callbacks.handle, Callbacks.init, Callbacks.terminate, 1);
+    defer server.deinit();
+    var memory = checkpoint_mod.MemoryCheckpointer.init(testing.allocator);
+    defer memory.deinit();
+    const ckpt = memory.toCheckpointer();
+    const fns = ServerType.CheckpointFns{
+        .serialize = Callbacks.serialize,
+        .deserialize = Callbacks.deserialize,
+    };
+
+    try server.setCheckpointer(ckpt, "old", 10, fns);
+    try ckpt.save("bad", "not-a-number");
+    try testing.expectError(error.InvalidCharacter, server.setCheckpointer(ckpt, "bad", 20, fns));
+    try testing.expectEqualStrings("old", server.checkpoint_id.?);
+    try testing.expectEqual(@as(u32, 10), server.checkpoint_interval_ms);
+    try testing.expectEqual(@as(u32, 1), server.state);
 }
 
 test "GenServer message handling" {
@@ -536,6 +615,26 @@ test "GenServer timed out call releases reply resources once" {
     try testing.expectError(error.Timeout, server.call(&request_message, 1));
 }
 
+test "GenServer rejects casts and calls after it has stopped" {
+    const ServerType = GenServer(struct {});
+    const Callbacks = struct {
+        fn handle(_: *ServerType, _: vigil.Message) !void {}
+        fn init(_: *ServerType) !void {}
+        fn terminate(_: *ServerType) void {}
+    };
+
+    const server = try ServerType.init(testing.allocator, Callbacks.handle, Callbacks.init, Callbacks.terminate, .{});
+    defer server.deinit();
+    server.stop();
+
+    const cast_message = try vigil.Message.init(testing.allocator, "cast", "test", "payload", null, .normal, null);
+    try testing.expectError(error.NotRunning, server.cast(cast_message));
+
+    var call_message = try vigil.Message.init(testing.allocator, "call", "test", "payload", null, .normal, null);
+    defer call_message.deinit();
+    try testing.expectError(error.NotRunning, server.call(&call_message, null));
+}
+
 test "GenServer supervision" {
     const allocator = testing.allocator;
 
@@ -575,6 +674,46 @@ test "GenServer supervision" {
 
     server.stop();
     server.deinit();
+}
+
+test "GenServer supervision keeps per-child context for same state type" {
+    const State = struct { starts: std.atomic.Value(u32) };
+    const ServerType = GenServer(State);
+    const Callbacks = struct {
+        fn handle(_: *ServerType, _: vigil.Message) !void {}
+        fn init(server: *ServerType) !void {
+            _ = server.state.starts.fetchAdd(1, .monotonic);
+        }
+        fn terminate(_: *ServerType) void {}
+    };
+
+    const first = try ServerType.init(testing.allocator, Callbacks.handle, Callbacks.init, Callbacks.terminate, .{ .starts = std.atomic.Value(u32).init(0) });
+    const second = try ServerType.init(testing.allocator, Callbacks.handle, Callbacks.init, Callbacks.terminate, .{ .starts = std.atomic.Value(u32).init(10) });
+    var supervisor = vigil.Supervisor.init(testing.allocator, .{
+        .strategy = .one_for_one,
+        .max_restarts = 3,
+        .max_seconds = 5,
+    });
+
+    try first.supervise(&supervisor, "first");
+    try second.supervise(&supervisor, "second");
+    try supervisor.start();
+
+    var waited: u32 = 0;
+    while ((first.state.starts.load(.acquire) != 1 or second.state.starts.load(.acquire) != 11) and waited < 100) : (waited += 1) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(GenServerState.running, first.server_state.load(.acquire));
+    try testing.expectEqual(GenServerState.running, second.server_state.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), first.state.starts.load(.acquire));
+    try testing.expectEqual(@as(u32, 11), second.state.starts.load(.acquire));
+
+    first.stop();
+    second.stop();
+    try supervisor.shutdown(1000);
+    first.deinit();
+    second.deinit();
+    supervisor.deinit();
 }
 
 test "GenServer state management" {

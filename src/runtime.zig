@@ -122,6 +122,8 @@ pub const Runtime = struct {
     shutdown_manager: shutdown_mod.ShutdownManager,
     /// Feature flags captured at initialization.
     options: RuntimeOptions,
+    /// Optional owned event timeline created by `enableTimeline()`.
+    timeline: ?*telemetry.EventTimeline,
     /// True until `shutdown()` or `deinit()` is called.
     running: std.atomic.Value(bool),
 
@@ -137,6 +139,7 @@ pub const Runtime = struct {
             .telemetry_emitter = telemetry.TelemetryEmitter.init(allocator),
             .shutdown_manager = shutdown_mod.ShutdownManager.init(allocator),
             .options = options,
+            .timeline = null,
             .running = std.atomic.Value(bool).init(true),
         };
     }
@@ -147,6 +150,12 @@ pub const Runtime = struct {
     /// methods; callers still own those returned values.
     pub fn deinit(self: *Runtime) void {
         self.running.store(false, .release);
+        if (self.timeline) |timeline| {
+            self.telemetry_emitter.detachTimeline();
+            timeline.deinit();
+            self.allocator.destroy(timeline);
+            self.timeline = null;
+        }
         self.shutdown_manager.deinit();
         self.telemetry_emitter.deinit();
         self.registry.deinit();
@@ -284,6 +293,93 @@ pub const Runtime = struct {
         }
 
         return report;
+    }
+
+    /// Create and attach a bounded event timeline that records every event
+    /// emitted through this runtime's telemetry emitter.
+    ///
+    /// The timeline is owned by the runtime and released by `deinit()`.
+    /// Calling this again while a timeline is enabled is a no-op.
+    pub fn enableTimeline(self: *Runtime, capacity: usize) !void {
+        if (self.timeline != null) return;
+
+        const timeline = try self.allocator.create(telemetry.EventTimeline);
+        errdefer self.allocator.destroy(timeline);
+        timeline.* = try telemetry.EventTimeline.init(self.allocator, capacity);
+
+        self.timeline = timeline;
+        self.telemetry_emitter.attachTimeline(timeline);
+    }
+
+    /// Capture an owned snapshot of the runtime event timeline, oldest first.
+    ///
+    /// Returns null when `enableTimeline()` has not been called. The caller
+    /// owns a returned snapshot and must call `deinit()`.
+    pub fn timelineSnapshot(self: *Runtime, allocator: std.mem.Allocator) !?telemetry.TimelineSnapshot {
+        const timeline = self.timeline orelse return null;
+        return try timeline.snapshot(allocator);
+    }
+
+    /// Render an owned, human-readable dump of runtime state.
+    ///
+    /// The dump includes health, registered mailboxes, and the tail of the
+    /// event timeline when one is enabled. The caller owns the returned slice.
+    pub fn debugDump(self: *Runtime, allocator: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        var state = try self.snapshot(allocator);
+        defer state.deinit();
+        const report = try self.health(allocator);
+
+        try out.print(allocator, "vigil runtime dump\n", .{});
+        try out.print(allocator, "  running: {}\n", .{state.running});
+        try out.print(allocator, "  health: {s} (ready: {})\n", .{ @tagName(report.status), report.ready });
+        try out.print(allocator, "  registered: {d}  overloaded: {d}  dead-lettered: {d}  poison: {d}\n", .{
+            report.registered_count,
+            report.overloaded_inboxes,
+            report.dead_lettered_messages,
+            report.poison_messages,
+        });
+        try out.print(allocator, "  telemetry handlers: {d}  shutdown hooks: {d}\n", .{
+            state.telemetry_handler_count,
+            state.shutdown_hook_count,
+        });
+
+        try out.print(allocator, "processes ({d}):\n", .{state.processes.len});
+        for (state.processes) |process| {
+            try out.print(allocator, "  {s}: queue {d}/{d}  dead-letter {d}  poison {d}\n", .{
+                process.name,
+                process.queue_depth,
+                process.capacity,
+                process.dead_letter_count,
+                process.poison_count,
+            });
+        }
+
+        if (self.timeline) |timeline| {
+            var events = try timeline.snapshot(allocator);
+            defer events.deinit();
+            try out.print(allocator, "recent events ({d} retained, {d} total):\n", .{
+                events.entries.len,
+                events.total_recorded,
+            });
+            for (events.entries) |entry| {
+                try out.print(allocator, "  #{d} {s} at {d}ms", .{
+                    entry.sequence,
+                    @tagName(entry.event_type),
+                    entry.timestamp_ms,
+                });
+                if (entry.metadata) |metadata| {
+                    try out.print(allocator, " ({s})", .{metadata});
+                }
+                try out.print(allocator, "\n", .{});
+            }
+        } else {
+            try out.print(allocator, "recent events: timeline disabled\n", .{});
+        }
+
+        return try out.toOwnedSlice(allocator);
     }
 
     /// Register a function to run during `shutdown()`.
@@ -485,4 +581,59 @@ test "Runtime health can include unhealthy circuit breakers" {
     try std.testing.expectEqual(RuntimeHealthStatus.degraded, health_report.status);
     try std.testing.expect(!health_report.ready);
     try std.testing.expectEqual(@as(usize, 1), health_report.unhealthy_circuit_breakers);
+}
+
+test "Runtime timeline records inbox lifecycle events" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    try rt.enableTimeline(16);
+    // Re-enabling is a no-op.
+    try rt.enableTimeline(16);
+
+    var ib = try rt.inbox(.{
+        .capacity = 4,
+        .dead_letter_capacity = 4,
+        .max_delivery_attempts = 1,
+    });
+    defer ib.close();
+
+    try ib.send("job");
+    const failed = try ib.recv();
+    _ = try ib.deadLetter(failed, .delivery_failed);
+
+    const maybe_snapshot = try rt.timelineSnapshot(std.testing.allocator);
+    var snapshot = maybe_snapshot.?;
+    defer snapshot.deinit();
+
+    try std.testing.expect(snapshot.entries.len >= 1);
+    var saw_dead_letter = false;
+    for (snapshot.entries) |entry| {
+        if (entry.event_type == .message_dead_lettered) saw_dead_letter = true;
+    }
+    try std.testing.expect(saw_dead_letter);
+}
+
+test "Runtime timelineSnapshot returns null when disabled" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try std.testing.expect(try rt.timelineSnapshot(std.testing.allocator) == null);
+}
+
+test "Runtime debugDump renders processes and timeline" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try rt.enableTimeline(8);
+
+    var ib = try rt.inbox(.{ .capacity = 2 });
+    defer ib.close();
+    try rt.register("orders.inbox", ib.mailbox);
+    try ib.send("queued");
+
+    const dump = try rt.debugDump(std.testing.allocator);
+    defer std.testing.allocator.free(dump);
+
+    try std.testing.expect(std.mem.indexOf(u8, dump, "vigil runtime dump") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dump, "orders.inbox: queue 1/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dump, "recent events") != null);
 }

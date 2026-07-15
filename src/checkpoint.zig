@@ -48,26 +48,34 @@ pub const Checkpointer = struct {
 
 /// File-backed checkpointer.
 ///
-/// Each checkpoint is stored as `{base_path}/{id}.checkpoint`. The id is used
-/// as a path component, so callers should pass ids that are safe for the local
-/// filesystem.
+/// Each checkpoint is stored as `{base_path}/{id}.checkpoint`. IDs must be a
+/// single non-empty path component; separators and `.`/`..` are rejected.
 pub const FileCheckpointer = struct {
     /// Allocator for copied base path and temporary file paths.
     allocator: Allocator,
     /// Base directory for checkpoint files.
     base_path: []const u8,
+    /// I/O implementation used for filesystem operations.
+    io: std.Io,
 
     /// Initialize a file checkpointer and create `base_path` if needed.
     pub fn init(allocator: Allocator, base_path: []const u8) !FileCheckpointer {
+        return initWithIo(allocator, std.Io.Threaded.global_single_threaded.io(), base_path);
+    }
+
+    /// Initialize with an application-provided Zig I/O implementation.
+    pub fn initWithIo(allocator: Allocator, io: std.Io, base_path: []const u8) !FileCheckpointer {
         const path_copy = try allocator.dupe(u8, base_path);
         errdefer allocator.free(path_copy);
 
-        // Ensure directory exists
-        std.fs.cwd().makePath(base_path) catch {};
+        // Surface invalid or inaccessible paths during initialization instead
+        // of deferring the failure until the first checkpoint write.
+        try std.Io.Dir.cwd().createDirPath(io, base_path);
 
         return .{
             .allocator = allocator,
             .base_path = path_copy,
+            .io = io,
         };
     }
 
@@ -86,40 +94,38 @@ pub const FileCheckpointer = struct {
 
     fn saveImpl(context: *anyopaque, id: []const u8, state: []const u8) !void {
         const self: *FileCheckpointer = @ptrCast(@alignCast(context));
+        if (!validFileId(id)) return error.InvalidCheckpointId;
         const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.checkpoint", .{ self.base_path, id });
         defer self.allocator.free(file_path);
 
-        const file = try std.fs.cwd().createFile(file_path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(self.io, file_path, .{});
+        defer file.close(self.io);
 
-        try file.writeAll(state);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writer(self.io, &buffer);
+        try writer.interface.writeAll(state);
+        try writer.interface.flush();
     }
 
     fn loadImpl(context: *anyopaque, id: []const u8, allocator: Allocator) !?[]u8 {
         const self: *FileCheckpointer = @ptrCast(@alignCast(context));
+        if (!validFileId(id)) return error.InvalidCheckpointId;
         const file_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.checkpoint", .{ self.base_path, id });
         defer self.allocator.free(file_path);
 
-        const file = std.fs.cwd().openFile(file_path, .{}) catch |err| switch (err) {
+        return std.Io.Dir.cwd().readFileAlloc(self.io, file_path, allocator, .unlimited) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
-        defer file.close();
-
-        const stat = try file.stat();
-        const buffer = try allocator.alloc(u8, @as(usize, @intCast(stat.size)));
-        errdefer allocator.free(buffer);
-
-        const bytes_read = try file.readAll(buffer);
-        return buffer[0..bytes_read];
     }
 
     fn deleteImpl(context: *anyopaque, id: []const u8) void {
         const self: *FileCheckpointer = @ptrCast(@alignCast(context));
+        if (!validFileId(id)) return;
         const file_path = std.fmt.allocPrint(self.allocator, "{s}/{s}.checkpoint", .{ self.base_path, id }) catch return;
         defer self.allocator.free(file_path);
 
-        std.fs.cwd().deleteFile(file_path) catch {};
+        std.Io.Dir.cwd().deleteFile(self.io, file_path) catch {};
     }
 
     const file_vtable = Checkpointer.VTable{
@@ -127,6 +133,11 @@ pub const FileCheckpointer = struct {
         .load = loadImpl,
         .delete = deleteImpl,
     };
+
+    fn validFileId(id: []const u8) bool {
+        if (id.len == 0 or std.mem.eql(u8, id, ".") or std.mem.eql(u8, id, "..")) return false;
+        return std.mem.indexOfAny(u8, id, "/\\\x00") == null;
+    }
 };
 
 /// In-memory checkpointer.
@@ -167,6 +178,10 @@ pub const MemoryCheckpointer = struct {
 
     fn saveImpl(context: *anyopaque, id: []const u8, state: []const u8) !void {
         const self: *MemoryCheckpointer = @ptrCast(@alignCast(context));
+        // Reserve map capacity before replacing an existing value so an OOM
+        // cannot erase the last good checkpoint.
+        try self.checkpoints.ensureUnusedCapacity(1);
+
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
 
@@ -179,7 +194,7 @@ pub const MemoryCheckpointer = struct {
             self.allocator.free(entry.value);
         }
 
-        try self.checkpoints.put(id_copy, state_copy);
+        self.checkpoints.putAssumeCapacityNoClobber(id_copy, state_copy);
     }
 
     fn loadImpl(context: *anyopaque, id: []const u8, allocator: Allocator) !?[]u8 {
@@ -222,4 +237,72 @@ test "MemoryCheckpointer save and load" {
     defer allocator.free(loaded.?);
 
     try std.testing.expectEqualSlices(u8, "test_state", loaded.?);
+}
+
+test "FileCheckpointer init reports a non-directory base path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const blocking_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/not-a-directory",
+        .{tmp.sub_path},
+    );
+    defer allocator.free(blocking_path);
+
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, blocking_path, .{});
+    file.close(std.testing.io);
+
+    if (FileCheckpointer.initWithIo(allocator, std.testing.io, blocking_path)) |value| {
+        var checkpointer = value;
+        checkpointer.deinit();
+        return error.ExpectedInitializationFailure;
+    } else |_| {}
+}
+
+test "FileCheckpointer saves loads replaces and deletes state" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/checkpoints", .{tmp.sub_path});
+    defer allocator.free(base_path);
+
+    var checkpointer = try FileCheckpointer.initWithIo(allocator, std.testing.io, base_path);
+    defer checkpointer.deinit();
+    const ckpt = checkpointer.toCheckpointer();
+
+    try ckpt.save("state", "first");
+    var loaded = (try ckpt.load("state", allocator)).?;
+    try std.testing.expectEqualStrings("first", loaded);
+    allocator.free(loaded);
+
+    try ckpt.save("state", "replacement");
+    loaded = (try ckpt.load("state", allocator)).?;
+    defer allocator.free(loaded);
+    try std.testing.expectEqualStrings("replacement", loaded);
+
+    ckpt.delete("state");
+    try std.testing.expectEqual(@as(?[]u8, null), try ckpt.load("state", allocator));
+
+    try std.testing.expectError(error.InvalidCheckpointId, ckpt.save("../escape", "bad"));
+    try std.testing.expectError(error.InvalidCheckpointId, ckpt.load("nested/id", allocator));
+    try std.testing.expectError(error.InvalidCheckpointId, ckpt.save("", "bad"));
+}
+
+test "MemoryCheckpointer preserves an existing value on replacement OOM" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var checkpointer = MemoryCheckpointer.init(failing.allocator());
+    defer checkpointer.deinit();
+    const ckpt = checkpointer.toCheckpointer();
+    try ckpt.save("id", "old");
+
+    // Allow the replacement id copy, then fail the state copy.
+    failing.fail_index = failing.alloc_index + 1;
+    try std.testing.expectError(error.OutOfMemory, ckpt.save("id", "new"));
+
+    const loaded = (try ckpt.load("id", std.testing.allocator)).?;
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings("old", loaded);
 }

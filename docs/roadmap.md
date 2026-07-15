@@ -20,9 +20,19 @@ Current status:
 
 - v2.1.0 shipped the measurement and first runtime-introspection foundation.
 - v2.2.0 has started with first-class reliability policies for retry, backoff,
-  timeout classification, fallback, and circuit-breaker composition.
+  timeout classification, fallback, bulkhead isolation, and circuit-breaker
+  composition.
 - v2.2.0 now includes bounded dead-letter inspection, replay, discard,
   poison-message limits, lifecycle telemetry, and runtime health integration.
+- v2.2.0 now includes the debug-layer introspection surface: structured debug
+  dumps, supervision-tree snapshots, non-consuming inbox inspection, route
+  table and subscription inspection, circuit-breaker diagnostics, and the
+  runtime event timeline.
+- v2.2.0 now includes deterministic testing support (simulated clock and
+  timers, fault injection, fake distributed registry, full-queue and
+  slow-consumer helpers) plus property/fuzz tests for routing and protocol
+  parsing, and the `examples/ops_toolkit` operational examples.
+- v2.2.0 has shipped; the next arc is the v2.3.0 Scale The Runtime work.
 
 ## Product Direction
 
@@ -129,7 +139,7 @@ later work. It should be useful even before the hot paths are rewritten.
 
 ## v2.2.0: Operate And Recover
 
-Status: in progress.
+Status: shipped.
 
 v2.2.0 should make Vigil safer to operate when things go wrong. This is the
 release where reliability patterns become first-class rather than hand-rolled in

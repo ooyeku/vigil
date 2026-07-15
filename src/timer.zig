@@ -35,6 +35,7 @@ pub const Timer = struct {
 
     const TimerContext = struct {
         cancelled: std.atomic.Value(bool),
+        completed: std.atomic.Value(bool),
         interval_ms: u32,
         callback: TimerCallback,
         repeat: bool,
@@ -71,9 +72,11 @@ pub const Timer = struct {
     /// Return a value snapshot of the timer state.
     pub fn snapshot(self: *Timer) TimerSnapshot {
         if (self.context) |ctx| {
+            const cancelled = ctx.cancelled.load(.acquire);
+            const completed = ctx.completed.load(.acquire);
             return .{
-                .active = true,
-                .cancelled = ctx.cancelled.load(.acquire),
+                .active = !cancelled and !completed,
+                .cancelled = cancelled,
                 .repeat = ctx.repeat,
                 .interval_ms = ctx.interval_ms,
             };
@@ -96,6 +99,7 @@ pub const Timer = struct {
         self.context = try self.allocator.create(TimerContext);
         self.context.?.* = .{
             .cancelled = std.atomic.Value(bool).init(false),
+            .completed = std.atomic.Value(bool).init(false),
             .interval_ms = delay_ms,
             .callback = callback,
             .repeat = false,
@@ -111,11 +115,14 @@ pub const Timer = struct {
     ///
     /// Replaces any existing timeout or interval on this timer.
     pub fn setInterval(self: *Timer, interval_ms: u32, callback: TimerCallback) !void {
+        if (interval_ms == 0) return error.InvalidInterval;
+
         self.cancel();
         self.joinExistingThread();
         self.context = try self.allocator.create(TimerContext);
         self.context.?.* = .{
             .cancelled = std.atomic.Value(bool).init(false),
+            .completed = std.atomic.Value(bool).init(false),
             .interval_ms = interval_ms,
             .callback = callback,
             .repeat = true,
@@ -139,6 +146,7 @@ pub const Timer = struct {
     }
 
     fn timerLoop(ctx: *TimerContext) void {
+        defer ctx.completed.store(true, .release);
         while (!ctx.cancelled.load(.acquire)) {
             compat.sleep(@as(u64, ctx.interval_ms) * std.time.ns_per_ms);
             if (ctx.cancelled.load(.acquire)) {
@@ -206,6 +214,31 @@ test "Timer setTimeout runs callback" {
     compat.sleep(40 * std.time.ns_per_ms);
 
     try std.testing.expectEqual(@as(u32, 1), timer_test_count.load(.acquire));
+}
+
+test "Timer snapshot becomes inactive after one-shot completion" {
+    timer_test_count.store(0, .release);
+    var timer = Timer.init(std.testing.allocator);
+    defer timer.deinit();
+
+    try timer.setTimeout(1, incrementTimerTestCount);
+    while (timer_test_count.load(.acquire) == 0) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    while (timer.snapshot().active) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+
+    const state = timer.snapshot();
+    try std.testing.expect(!state.active);
+    try std.testing.expect(!state.cancelled);
+}
+
+test "Timer rejects a zero-length repeating interval" {
+    var timer = Timer.init(std.testing.allocator);
+    defer timer.deinit();
+    try std.testing.expectError(error.InvalidInterval, timer.setInterval(0, incrementTimerTestCount));
+    try std.testing.expect(!timer.snapshot().active);
 }
 
 test "Timer cancel stops interval" {
@@ -300,7 +333,7 @@ test "Timer snapshot reports active and cancelled state" {
 
     timer.cancel();
     const cancelled = timer.snapshot();
-    try std.testing.expect(cancelled.active);
+    try std.testing.expect(!cancelled.active);
     try std.testing.expect(cancelled.cancelled);
 }
 

@@ -99,6 +99,104 @@ pub fn PolicyResult(comptime T: type) type {
     };
 }
 
+/// Configuration for a `Bulkhead` isolation pool.
+pub const BulkheadConfig = struct {
+    /// Maximum operations allowed in flight at once.
+    max_concurrent: u32 = 10,
+};
+
+/// Value snapshot of bulkhead state and lifetime counters.
+pub const BulkheadSnapshot = struct {
+    /// Operations currently holding a permit.
+    in_flight: u32,
+    /// Maximum concurrent permits.
+    max_concurrent: u32,
+    /// Total permits granted over the bulkhead lifetime.
+    total_admitted: u64,
+    /// Total operations rejected because the pool was full.
+    total_rejected: u64,
+};
+
+/// Fail-fast isolation pool that bounds concurrent access to a dependency.
+///
+/// A bulkhead prevents one slow dependency from absorbing every worker in the
+/// system: once `max_concurrent` operations are in flight, further calls fail
+/// immediately with `error.BulkheadFull` instead of queueing. Pair each
+/// successful `acquire()` with exactly one `release()`, or use `run()` which
+/// does both.
+pub const Bulkhead = struct {
+    /// Concurrency limit.
+    config: BulkheadConfig,
+    /// Operations currently holding a permit.
+    in_flight: u32,
+    /// Total permits granted.
+    total_admitted: u64,
+    /// Total rejected acquisitions.
+    total_rejected: u64,
+    /// Protects pool counters.
+    mutex: compat.Mutex,
+
+    /// Error returned when the pool has no free permits.
+    pub const Error = error{BulkheadFull};
+
+    /// Initialize an empty bulkhead.
+    pub fn init(config: BulkheadConfig) !Bulkhead {
+        if (config.max_concurrent == 0) return error.InvalidConfiguration;
+        return .{
+            .config = config,
+            .in_flight = 0,
+            .total_admitted = 0,
+            .total_rejected = 0,
+            .mutex = .{},
+        };
+    }
+
+    /// Reserve one permit, failing fast when the pool is exhausted.
+    pub fn acquire(self: *Bulkhead) Error!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.in_flight >= self.config.max_concurrent) {
+            self.total_rejected +|= 1;
+            return error.BulkheadFull;
+        }
+        self.in_flight += 1;
+        self.total_admitted +|= 1;
+    }
+
+    /// Return a permit reserved by `acquire()`.
+    pub fn release(self: *Bulkhead) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.in_flight > 0) self.in_flight -= 1;
+    }
+
+    /// Run an operation inside the pool, acquiring and releasing one permit.
+    pub fn run(
+        self: *Bulkhead,
+        comptime Context: type,
+        comptime T: type,
+        context: *Context,
+        operation: *const fn (*Context) anyerror!T,
+    ) anyerror!T {
+        try self.acquire();
+        defer self.release();
+        return operation(context);
+    }
+
+    /// Return a value snapshot of pool usage.
+    pub fn snapshot(self: *Bulkhead) BulkheadSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{
+            .in_flight = self.in_flight,
+            .max_concurrent = self.config.max_concurrent,
+            .total_admitted = self.total_admitted,
+            .total_rejected = self.total_rejected,
+        };
+    }
+};
+
 /// Exponential backoff configuration.
 pub const ExponentialBackoff = struct {
     /// Delay after the first failed attempt.
@@ -257,7 +355,7 @@ pub fn execute(
 fn defaultClock(comptime Context: type) *const fn (*Context) i64 {
     return struct {
         fn clock(_: *Context) i64 {
-            return compat.milliTimestamp();
+            return compat.monotonicMilliTimestamp();
         }
     }.clock;
 }
@@ -311,7 +409,9 @@ fn elapsedMs(
     options: PolicyOptions(Context, T),
     start_ms: i64,
 ) i64 {
-    return @max(@as(i64, 0), options.clock(context) - start_ms);
+    const now_ms = options.clock(context);
+    if (now_ms <= start_ms) return 0;
+    return std.math.sub(i64, now_ms, start_ms) catch std.math.maxInt(i64);
 }
 
 fn makeReport(
@@ -412,6 +512,32 @@ test "BackoffPolicy exponential delay saturates instead of overflowing" {
     } };
 
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), exponential.delayMs(16));
+}
+
+test "policy elapsed time saturates when a custom clock spans i64" {
+    const Clock = struct {
+        now: i64 = std.math.minInt(i64),
+
+        fn operation(ctx: *@This()) anyerror!void {
+            ctx.now = std.math.maxInt(i64);
+        }
+
+        fn clock(ctx: *@This()) i64 {
+            return ctx.now;
+        }
+
+        fn sleep(_: *@This(), _: u64) void {}
+    };
+
+    var ctx = Clock{};
+    const result = execute(Clock, void, &ctx, Clock.operation, .{
+        .clock = Clock.clock,
+        .sleeper = Clock.sleep,
+    });
+    switch (result) {
+        .success => |success| try std.testing.expectEqual(std.math.maxInt(i64), success.report.elapsed_ms),
+        else => return error.ExpectedSuccess,
+    }
 }
 
 test "execute retries failed operation and reports attempts" {
@@ -590,4 +716,53 @@ test "execute composes with circuit breaker and rejects while open" {
         else => return error.ExpectedCircuitOpen,
     }
     try std.testing.expectEqual(@as(u32, 1), ctx.attempts);
+}
+
+test "Bulkhead bounds concurrency and reports rejections" {
+    try std.testing.expectError(error.InvalidConfiguration, Bulkhead.init(.{ .max_concurrent = 0 }));
+
+    var bulkhead = try Bulkhead.init(.{ .max_concurrent = 2 });
+
+    try bulkhead.acquire();
+    try bulkhead.acquire();
+    try std.testing.expectError(error.BulkheadFull, bulkhead.acquire());
+
+    const saturated = bulkhead.snapshot();
+    try std.testing.expectEqual(@as(u32, 2), saturated.in_flight);
+    try std.testing.expectEqual(@as(u64, 2), saturated.total_admitted);
+    try std.testing.expectEqual(@as(u64, 1), saturated.total_rejected);
+
+    bulkhead.release();
+    try bulkhead.acquire();
+    bulkhead.release();
+    bulkhead.release();
+    try std.testing.expectEqual(@as(u32, 0), bulkhead.snapshot().in_flight);
+}
+
+test "Bulkhead run wraps an operation with a permit" {
+    var bulkhead = try Bulkhead.init(.{ .max_concurrent = 1 });
+
+    const Dependency = struct {
+        pool: *Bulkhead,
+        calls: u32 = 0,
+
+        fn operation(ctx: *@This()) anyerror!u32 {
+            ctx.calls += 1;
+            // The permit is held while the operation runs.
+            try std.testing.expectEqual(@as(u32, 1), ctx.pool.snapshot().in_flight);
+            return 11;
+        }
+
+        fn failing(ctx: *@This()) anyerror!u32 {
+            ctx.calls += 1;
+            return error.DependencyFailed;
+        }
+    };
+
+    var dependency = Dependency{ .pool = &bulkhead };
+    try std.testing.expectEqual(@as(u32, 11), try bulkhead.run(Dependency, u32, &dependency, Dependency.operation));
+    // Permits are released on failure too.
+    try std.testing.expectError(error.DependencyFailed, bulkhead.run(Dependency, u32, &dependency, Dependency.failing));
+    try std.testing.expectEqual(@as(u32, 0), bulkhead.snapshot().in_flight);
+    try std.testing.expectEqual(@as(u32, 2), dependency.calls);
 }

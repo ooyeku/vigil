@@ -111,6 +111,10 @@ pub const ProcessGroup = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        for (self.members.items) |member| {
+            if (std.mem.eql(u8, member.id, id)) return error.AlreadyMember;
+        }
+
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
 
@@ -131,6 +135,11 @@ pub const ProcessGroup = struct {
             if (std.mem.eql(u8, member.id, id)) {
                 self.allocator.free(member.id);
                 _ = self.members.orderedRemove(i);
+                if (self.members.items.len == 0) {
+                    self.round_robin_index = 0;
+                } else {
+                    self.round_robin_index %= self.members.items.len;
+                }
                 return true;
             }
         }
@@ -223,14 +232,16 @@ pub const ProcessGroup = struct {
     /// Returns `error.NoMembers` when the group is empty.
     pub fn roundRobin(self: *ProcessGroup, payload: []const u8) !void {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        if (self.members.items.len == 0) {
+            self.mutex.unlock();
+            return error.NoMembers;
+        }
 
-        if (self.members.items.len == 0) return error.NoMembers;
-
-        const member = &self.members.items[self.round_robin_index];
+        const inbox = self.members.items[self.round_robin_index].inbox;
         self.round_robin_index = (self.round_robin_index + 1) % self.members.items.len;
+        self.mutex.unlock();
 
-        try member.inbox.send(payload);
+        try inbox.send(payload);
     }
 
     /// Route a payload by hashing `key`.
@@ -239,20 +250,52 @@ pub const ProcessGroup = struct {
     /// unchanged. Returns `error.NoMembers` when the group is empty.
     pub fn route(self: *ProcessGroup, payload: []const u8, key: []const u8) !void {
         self.mutex.lock();
-        defer self.mutex.unlock();
-
-        if (self.members.items.len == 0) return error.NoMembers;
-
-        // Simple hash-based routing
-        var hash: u64 = 0;
-        for (key) |byte| {
-            hash = hash * 31 + byte;
+        if (self.members.items.len == 0) {
+            self.mutex.unlock();
+            return error.NoMembers;
         }
 
-        const index = @as(usize, @intCast(hash % self.members.items.len));
-        const member = &self.members.items[index];
+        const index = routeIndex(key, self.members.items.len);
+        const inbox = self.members.items[index].inbox;
+        self.mutex.unlock();
 
-        try member.inbox.send(payload);
+        try inbox.send(payload);
+    }
+
+    /// Return the member index that `route()` would pick for `key`, or null
+    /// when the group is empty.
+    ///
+    /// This is a non-mutating preview. Combined with `snapshot()`, it lets
+    /// callers inspect the effective route table for a set of keys.
+    pub fn routeIndexForKey(self: *ProcessGroup, key: []const u8) ?usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.members.items.len == 0) return null;
+        return routeIndex(key, self.members.items.len);
+    }
+
+    /// Return a copied member id that `route()` would pick for `key`, or null
+    /// when the group is empty. The caller owns the returned slice.
+    pub fn routeMemberForKey(
+        self: *ProcessGroup,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+    ) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.members.items.len == 0) return null;
+        const index = routeIndex(key, self.members.items.len);
+        return try allocator.dupe(u8, self.members.items[index].id);
+    }
+
+    fn routeIndex(key: []const u8, member_count: usize) usize {
+        var hash: u64 = 0;
+        for (key) |byte| {
+            hash = hash *% 31 +% byte;
+        }
+        return @intCast(hash % member_count);
     }
 };
 
@@ -280,6 +323,29 @@ test "ProcessGroup basic operations" {
     try std.testing.expectEqual(@as(usize, 0), result.failed);
     try std.testing.expect(group.remove("worker1"));
     try std.testing.expect(group.memberCount() == 1);
+}
+
+test "ProcessGroup rejects duplicate ids and normalizes routing after removal" {
+    const allocator = std.testing.allocator;
+    var group = try ProcessGroup.init(allocator, "workers");
+    defer group.deinit();
+    var first = try Inbox.init(allocator);
+    defer first.close();
+    var second = try Inbox.init(allocator);
+    defer second.close();
+
+    try group.add("first", first);
+    try std.testing.expectError(error.AlreadyMember, group.add("first", second));
+    try group.add("second", second);
+
+    try group.roundRobin("first-message");
+    try std.testing.expect(group.remove("second"));
+    try group.roundRobin("after-removal");
+    try std.testing.expectEqual(@as(usize, 2), first.mailbox.queuedCount());
+
+    const long_key = "a" ** 128;
+    try group.route("wrapped-hash", long_key);
+    try std.testing.expectEqual(@as(usize, 3), first.mailbox.queuedCount());
 }
 
 test "ProcessGroup round robin" {
@@ -370,5 +436,70 @@ test "ProcessGroup broadcast stress delivers to all members" {
 
     for (inboxes) |inbox| {
         try std.testing.expectEqual(iterations, inbox.mailbox.queuedCount());
+    }
+}
+
+test "ProcessGroup route preview matches actual routing" {
+    const allocator = std.testing.allocator;
+
+    var group = try ProcessGroup.init(allocator, "workers");
+    defer group.deinit();
+
+    try std.testing.expect(group.routeIndexForKey("order-1") == null);
+    try std.testing.expect(try group.routeMemberForKey(allocator, "order-1") == null);
+
+    var inbox1 = try Inbox.init(allocator);
+    defer inbox1.close();
+    var inbox2 = try Inbox.init(allocator);
+    defer inbox2.close();
+    try group.add("worker1", inbox1);
+    try group.add("worker2", inbox2);
+
+    const keys = [_][]const u8{ "order-1", "order-2", "customer-42" };
+    for (keys) |key| {
+        const index = group.routeIndexForKey(key).?;
+        const member_id = (try group.routeMemberForKey(allocator, key)).?;
+        defer allocator.free(member_id);
+
+        const target = if (index == 0) inbox1 else inbox2;
+        const expected_id = if (index == 0) "worker1" else "worker2";
+        try std.testing.expectEqualStrings(expected_id, member_id);
+
+        const before = target.mailbox.queuedCount();
+        try group.route("payload", key);
+        try std.testing.expectEqual(before + 1, target.mailbox.queuedCount());
+    }
+}
+
+test "ProcessGroup property: keyed routing is stable and in bounds" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x9047_e11a);
+    const random = prng.random();
+
+    var group = try ProcessGroup.init(allocator, "sharded");
+    defer group.deinit();
+
+    const member_count = 5;
+    var inboxes: [member_count]*Inbox = undefined;
+    for (&inboxes, 0..) |*slot, i| {
+        slot.* = try Inbox.init(allocator);
+        var id_buffer: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "member-{d}", .{i});
+        try group.add(id, slot.*);
+    }
+    defer for (inboxes) |inbox| {
+        inbox.close();
+    };
+
+    var key_buffer: [32]u8 = undefined;
+    for (0..500) |_| {
+        const key_len = 1 + random.uintLessThan(usize, key_buffer.len - 1);
+        const key = key_buffer[0..key_len];
+        random.bytes(key);
+
+        const first = group.routeIndexForKey(key).?;
+        try std.testing.expect(first < member_count);
+        // Same key, same member, as long as membership is unchanged.
+        try std.testing.expectEqual(first, group.routeIndexForKey(key).?);
     }
 }

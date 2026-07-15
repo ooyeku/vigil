@@ -5,25 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.0] - 2026-07-15
 
 ### Added
 - **Composable reliability policies**: Added typed retry policies with fixed, exponential, and deterministic jittered backoff, synchronous timeout classification, fallback handlers, circuit-breaker composition, and injectable clock/sleep hooks through `vigil.executePolicy()`.
 - **Dead-letter lifecycle APIs**: Added bounded dead-letter entries with stable ids, owned inspection snapshots, replay, single/all discard, explicit reasons, and poison-message attempt limits across `ProcessMailbox` and `Inbox`.
 - **Dead-letter observability**: Runtime snapshots and health now expose retained dead-letter and poison counts, while runtime-created inboxes emit dead-letter, replay, discard, and poison telemetry events.
 - **Poison-message hooks**: Added `Inbox.onPoisonMessage()` for application handling when a repeatedly rejected message first crosses its configured attempt threshold.
+- **Bulkhead isolation pools**: Added `vigil.Bulkhead`, a fail-fast concurrency pool with `acquire`/`release`/`run` and a usage snapshot, completing the v2.2 reliability-policy set.
+- **Debug-layer introspection**: Added non-consuming queue inspection (`Inbox.peekMessages()`, `ProcessMailbox.snapshotQueue()`), owned supervision-tree snapshots (`Supervisor.snapshot()`), process-group route previews (`routeIndexForKey()`, `routeMemberForKey()`), pub/sub subscription inspection with copied patterns, and circuit-breaker diagnostics (last transition time, open transitions, lifetime failure/success totals).
+- **Runtime event timeline and debug dumps**: Added `vigil.EventTimeline`, a bounded thread-safe buffer of recent telemetry events attachable to any emitter, plus `Runtime.enableTimeline()`, `Runtime.timelineSnapshot()`, and `Runtime.debugDump()` for one-call human-readable runtime state.
+- **Deterministic testing and simulation**: Added `SimulatedClock`, `SimulatedTimerService` (synchronous deadline-ordered timers with no threads), `FaultInjector` with scripted failure plans, `FakeDistributedRegistry` with peer partition/reconnect simulation, and `testing.fillInbox()`/`testing.drainInbox()` failure-mode helpers.
+- **Routing and protocol property tests**: Added deterministic fuzz tests for distributed protocol parsing and round-tripping, plus property tests for pub/sub wildcard matching and stable keyed process-group routing.
+- **Operations toolkit example**: Added `examples/ops_toolkit` with five runnable demos: resilient job queue, retry/backoff dependency client, dead-letter replay workflow, runtime introspection endpoint, and checkpointed state machine with crash recovery.
 
 ### Changed
-- **v2.2 development version**: Advanced `build.zig.zon` to `2.2.0`, matching the roadmap's Operate and Recover release line.
+- **v2.2 release version**: Advanced `build.zig.zon` to `2.2.0`, the roadmap's Operate and Recover release.
 - **Mailbox capacity is global**: Priority mailboxes now enforce configured capacity across all priority queues, matching `queuedCount()`, `hasCapacity()`, and runtime health semantics.
 - **Delivery attempts are tracked**: Successful mailbox receives increment `Message.metadata.attempt_count`; replay renews the message TTL window.
 - **Legacy isolation**: Current root and high-level APIs now import concrete modules directly; `vigil/legacy` is a reduced compatibility boundary instead of an internal dependency.
+- **Pub/sub broker snapshots include subscriptions**: `PubSubBrokerSnapshot` entries are now `SubscriberInspection` values carrying owned copies of each subscriber's topic patterns instead of a bare pattern count.
 
 ### Fixed
 - **Dead-letter accounting and callbacks**: Retained overflow is no longer counted as dropped, poison counts are constant-time and current, and lifecycle callbacks may safely close their inbox.
 - **Flow-control drops**: `drop_newest` now actually skips the send, `drop_oldest` updates drop statistics without pretending to deliver, and blocking backpressure observes inbox shutdown.
+- **Flow-control thresholds**: Backpressure now uses actual queue depth, blocking resumes below the low-water mark, and impossible threshold combinations are rejected instead of hanging producers.
+- **Inbox shutdown admission**: Closing an inbox and registering an operation now share one atomic lifecycle word, removing the remaining reference-count acquisition race; flow-control queue inspection participates in the same shutdown protocol.
 - **Message identity and TTL precision**: High-level messages use allocation-free monotonic ids, `MessageBuilder` no longer leaks its temporary id, and TTL timestamps now use millisecond precision.
-- **GenServer ownership and concurrency**: Correlation ids are unique, server lifecycle state is atomic, timeout/error cleanup no longer double-frees reply resources, and replies cannot race mailbox destruction.
+- **Message metadata accounting**: Replacing correlation and reply-to metadata updates recorded size, so mailbox limits cannot be bypassed after creation; long-lived counters now saturate instead of wrapping.
+- **GenServer ownership and concurrency**: Correlation ids are unique, server lifecycle state is atomic, stopped servers reject casts and calls, checkpoint replacement is transactional, timeout/error cleanup no longer double-frees reply resources, replies cannot race mailbox destruction, and supervised servers no longer share one global start context.
+- **Process and supervisor lifecycle**: Fast completion can no longer race startup state, completed thread handles are reaped, timeout-detached workers cannot access destroyed process state, terminate and reentrant callbacks avoid mutex deadlocks, partial startup rolls back, monitoring can restart, and uptime is elapsed monotonic time.
+- **Timeout and timer boundaries**: Zero-duration reply waits perform one nonblocking poll, shutdown deadlines use exact monotonic boundaries, one-shot timers report completion, and zero-length intervals are rejected instead of busy-looping.
+- **Circuit-breaker safety**: Invalid half-open configurations are rejected, counters saturate, reset deadlines use monotonic time, and telemetry callbacks run outside the breaker lock so handlers may inspect it safely.
+- **Checkpoint reliability**: File checkpoints use Zig 0.16 filesystem APIs, initialization surfaces invalid paths, checkpoint ids cannot escape the base directory, and failed in-memory replacement preserves the previous value.
+- **Distributed registry robustness**: Protocol frames validate arity and names, fragmented TCP frames are read through their newline, invalid peer/configuration values are rejected, partial failures roll back, and sync listener start/stop is race-safe.
+- **Routing correctness**: Pub/sub wildcards follow segment semantics, duplicate broker registration is idempotent, failed pattern batches roll back, process groups reject duplicate ids, removal preserves round-robin bounds, and long routing keys cannot overflow in Debug builds.
+- **Allocation failure safety**: Distributed registries, checkpoint replacement, subscriber pattern batches, and test doubles retain valid prior state when allocation fails.
 - **Builder cleanup**: Failed duplicate child registration no longer leaves freed ids in cleanup lists, and `AppBuilder.stop()` can safely be followed by `shutdown()`.
 - **Deterministic cancellation tests**: Timer cancellation now joins its worker before returning, and the supervisor lifecycle test uses an explicit worker gate instead of timing assumptions.
 - **Optimized benchmark smoke tests**: ReleaseSafe tests no longer assume every operation takes at least one nanosecond after integer averaging.

@@ -377,10 +377,12 @@ pub const Message = struct {
     /// Useful for request-response patterns and message chains.
     pub fn setCorrelationId(self: *Message, correlation_id: []const u8) !void {
         const id_copy = try self.allocator.dupe(u8, correlation_id);
+        const old_len = if (self.metadata.correlation_id) |old_id| old_id.len else 0;
         if (self.metadata.correlation_id) |old_id| {
             self.allocator.free(old_id);
         }
         self.metadata.correlation_id = id_copy;
+        self.metadata.size_bytes = (self.metadata.size_bytes -| old_len) +| id_copy.len;
     }
 
     /// Set or replace the reply-to address for responses.
@@ -389,10 +391,12 @@ pub const Message = struct {
     /// Required for createResponse() to work.
     pub fn setReplyTo(self: *Message, reply_to: []const u8) !void {
         const reply_to_copy = try self.allocator.dupe(u8, reply_to);
+        const old_len = if (self.metadata.reply_to) |old_rt| old_rt.len else 0;
         if (self.metadata.reply_to) |old_rt| {
             self.allocator.free(old_rt);
         }
         self.metadata.reply_to = reply_to_copy;
+        self.metadata.size_bytes = (self.metadata.size_bytes -| old_len) +| reply_to_copy.len;
     }
 
     /// Create a response message to this message.
@@ -416,6 +420,7 @@ pub const Message = struct {
 
         // Now create and set the response ID
         const resp_id = try std.fmt.allocPrint(allocator, "resp_{s}", .{self.id});
+        response.metadata.size_bytes = (response.metadata.size_bytes -| response.id.len) +| resp_id.len;
         allocator.free(response.id); // Free the temporary ID
         response.id = resp_id; // Transfer ownership of resp_id
 
@@ -536,6 +541,47 @@ pub const DeadLetterSnapshot = struct {
 
     pub fn deinit(self: *DeadLetterSnapshot) void {
         for (self.entries) |*entry| entry.deinit();
+        self.allocator.free(self.entries);
+    }
+};
+
+/// Non-consuming snapshot of one active queued message.
+///
+/// `id` and `sender` are copied and owned by the enclosing
+/// `MailboxQueueSnapshot`. Payload bytes are intentionally not copied; only
+/// the payload length is captured so inspection stays cheap and safe.
+pub const QueuedMessageSnapshot = struct {
+    /// Copied message id.
+    id: []const u8,
+    /// Copied sender identifier.
+    sender: []const u8,
+    /// Message priority.
+    priority: MessagePriority,
+    /// Optional process signal.
+    signal: ?Signal,
+    /// Payload size in bytes; zero when the message has no payload.
+    payload_len: usize,
+    /// Delivery attempts made so far.
+    attempt_count: u32,
+    /// Creation timestamp in Unix milliseconds.
+    timestamp_ms: i64,
+    /// Time-to-live in milliseconds, when set.
+    ttl_ms: ?u32,
+    /// Whether the message had already expired when the snapshot was taken.
+    expired: bool,
+};
+
+/// Owned snapshot of a mailbox's active queue in delivery order.
+pub const MailboxQueueSnapshot = struct {
+    allocator: Allocator,
+    entries: []QueuedMessageSnapshot,
+
+    /// Release copied identity strings and snapshot storage.
+    pub fn deinit(self: *MailboxQueueSnapshot) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.id);
+            self.allocator.free(entry.sender);
+        }
         self.allocator.free(self.entries);
     }
 };
@@ -751,27 +797,27 @@ pub const ProcessMailbox = struct {
         }
 
         if (msg_mut.isExpired()) {
-            self.stats.messages_expired += 1;
+            self.stats.messages_expired +|= 1;
             if (self.deadletter_queue != null) {
                 const notice = self.appendDeadLetterLocked(msg_mut, .expired) catch |err| {
-                    self.stats.messages_dropped += 1;
+                    self.stats.messages_dropped +|= 1;
                     return err;
                 };
                 return .{ .dead_lettered = notice };
             }
-            self.stats.messages_dropped += 1;
+            self.stats.messages_dropped +|= 1;
             return MessageError.MessageExpired;
         }
 
         if (self.activeQueuedCountLocked() >= self.config.capacity) {
             if (self.deadletter_queue != null) {
                 const notice = self.appendDeadLetterLocked(msg_mut, .mailbox_full) catch |err| {
-                    self.stats.messages_dropped += 1;
+                    self.stats.messages_dropped +|= 1;
                     return err;
                 };
                 return .{ .dead_lettered = notice };
             }
-            self.stats.messages_dropped += 1;
+            self.stats.messages_dropped +|= 1;
             return MessageError.MailboxFull;
         }
 
@@ -794,11 +840,11 @@ pub const ProcessMailbox = struct {
             msg_mut.metadata.attempt_count = 1;
         }
         if (self.deadletter_queue == null) {
-            self.stats.messages_dropped += 1;
+            self.stats.messages_dropped +|= 1;
             return MessageError.DeliveryFailed;
         }
         return self.appendDeadLetterLocked(msg_mut, reason) catch |err| {
-            self.stats.messages_dropped += 1;
+            self.stats.messages_dropped +|= 1;
             return err;
         };
     }
@@ -866,7 +912,7 @@ pub const ProcessMailbox = struct {
         entry.message.metadata.timestamp = compat.milliTimestamp();
         try self.appendActiveLocked(entry.message, false);
         _ = queue.orderedRemove(index);
-        self.stats.dead_letters_replayed += 1;
+        self.stats.dead_letters_replayed +|= 1;
         return .{ .status = .replayed, .notice = notice };
     }
 
@@ -879,9 +925,9 @@ pub const ProcessMailbox = struct {
         const index = findDeadLetterIndex(queue.items, id) orelse return null;
         var entry = queue.orderedRemove(index);
         const notice = entry.notice(false);
-        if (entry.poisoned) self.current_poison_count -= 1;
+        if (entry.poisoned) self.current_poison_count -|= 1;
         entry.deinit();
-        self.stats.dead_letters_discarded += 1;
+        self.stats.dead_letters_discarded +|= 1;
         return notice;
     }
 
@@ -895,7 +941,7 @@ pub const ProcessMailbox = struct {
         for (queue.items) |*entry| entry.deinit();
         queue.clearRetainingCapacity();
         self.current_poison_count = 0;
-        self.stats.dead_letters_discarded += discarded;
+        self.stats.dead_letters_discarded +|= discarded;
         return discarded;
     }
 
@@ -914,8 +960,8 @@ pub const ProcessMailbox = struct {
                     if (queue.items[i].isExpired()) {
                         var msg = queue.orderedRemove(i);
                         msg.deinit();
-                        self.stats.messages_expired += 1;
-                        self.stats.total_size_bytes -= msg.metadata.size_bytes;
+                        self.stats.messages_expired +|= 1;
+                        self.stats.total_size_bytes -|= msg.metadata.size_bytes;
                     } else {
                         i += 1;
                     }
@@ -928,14 +974,14 @@ pub const ProcessMailbox = struct {
                     if (queue.items[0].isExpired()) {
                         var msg = queue.orderedRemove(0);
                         msg.deinit();
-                        self.stats.messages_expired += 1;
-                        self.stats.total_size_bytes -= msg.metadata.size_bytes;
+                        self.stats.messages_expired +|= 1;
+                        self.stats.total_size_bytes -|= msg.metadata.size_bytes;
                         continue;
                     }
                     var msg = queue.orderedRemove(0);
                     msg.metadata.attempt_count +|= 1;
-                    self.stats.messages_sent += 1;
-                    self.stats.total_size_bytes -= msg.metadata.size_bytes;
+                    self.stats.messages_sent +|= 1;
+                    self.stats.total_size_bytes -|= msg.metadata.size_bytes;
                     return msg;
                 }
             }
@@ -948,8 +994,8 @@ pub const ProcessMailbox = struct {
             if (self.messages.items[i].isExpired()) {
                 var msg = self.messages.orderedRemove(i);
                 msg.deinit();
-                self.stats.messages_expired += 1;
-                self.stats.total_size_bytes -= msg.metadata.size_bytes;
+                self.stats.messages_expired +|= 1;
+                self.stats.total_size_bytes -|= msg.metadata.size_bytes;
             } else {
                 i += 1;
             }
@@ -963,15 +1009,15 @@ pub const ProcessMailbox = struct {
         if (self.messages.items[0].isExpired()) {
             var msg = self.messages.orderedRemove(0);
             msg.deinit();
-            self.stats.messages_expired += 1;
-            self.stats.total_size_bytes -= msg.metadata.size_bytes;
+            self.stats.messages_expired +|= 1;
+            self.stats.total_size_bytes -|= msg.metadata.size_bytes;
             return MessageError.EmptyMailbox;
         }
 
         var msg = self.messages.orderedRemove(0);
         msg.metadata.attempt_count +|= 1;
-        self.stats.messages_sent += 1;
-        self.stats.total_size_bytes -= msg.metadata.size_bytes;
+        self.stats.messages_sent +|= 1;
+        self.stats.total_size_bytes -|= msg.metadata.size_bytes;
         return msg;
     }
 
@@ -1000,8 +1046,8 @@ pub const ProcessMailbox = struct {
             dropped = self.messages.orderedRemove(0);
         }
 
-        self.stats.messages_dropped += 1;
-        self.stats.total_size_bytes -= dropped.metadata.size_bytes;
+        self.stats.messages_dropped +|= 1;
+        self.stats.total_size_bytes -|= dropped.metadata.size_bytes;
         dropped.deinit();
         return true;
     }
@@ -1020,10 +1066,69 @@ pub const ProcessMailbox = struct {
         return self.activeQueuedCountLocked();
     }
 
+    /// Capture an owned snapshot of active queued messages without consuming
+    /// them.
+    ///
+    /// Entries appear in delivery order: priority queues are listed highest
+    /// priority first, matching what `receive()` would return next. Payload
+    /// bytes are not copied; only scalar metadata and copied identity strings
+    /// are captured. The caller owns the snapshot and must call `deinit()`.
+    pub fn snapshotQueue(self: *ProcessMailbox, allocator: Allocator) !MailboxQueueSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const total = self.activeQueuedCountLocked();
+        const entries = try allocator.alloc(QueuedMessageSnapshot, total);
+        errdefer allocator.free(entries);
+
+        var written: usize = 0;
+        errdefer for (entries[0..written]) |entry| {
+            allocator.free(entry.id);
+            allocator.free(entry.sender);
+        };
+
+        if (self.priority_queues) |queues| {
+            for (queues) |queue| {
+                for (queue.items) |msg| {
+                    entries[written] = try snapshotQueuedMessage(allocator, msg);
+                    written += 1;
+                }
+            }
+        } else {
+            for (self.messages.items) |msg| {
+                entries[written] = try snapshotQueuedMessage(allocator, msg);
+                written += 1;
+            }
+        }
+
+        return .{
+            .allocator = allocator,
+            .entries = entries,
+        };
+    }
+
+    fn snapshotQueuedMessage(allocator: Allocator, msg: Message) !QueuedMessageSnapshot {
+        const id_copy = try allocator.dupe(u8, msg.id);
+        errdefer allocator.free(id_copy);
+        const sender_copy = try allocator.dupe(u8, msg.sender);
+
+        return .{
+            .id = id_copy,
+            .sender = sender_copy,
+            .priority = msg.priority,
+            .signal = msg.signal,
+            .payload_len = if (msg.payload) |payload| payload.len else 0,
+            .attempt_count = msg.metadata.attempt_count,
+            .timestamp_ms = msg.metadata.timestamp,
+            .ttl_ms = msg.metadata.ttl_ms,
+            .expired = msg.isExpired(),
+        };
+    }
+
     fn activeQueuedCountLocked(self: *ProcessMailbox) usize {
         if (self.priority_queues) |queues| {
             var total: usize = 0;
-            for (queues) |queue| total += queue.items.len;
+            for (queues) |queue| total +|= queue.items.len;
             return total;
         }
         return self.messages.items.len;
@@ -1035,8 +1140,8 @@ pub const ProcessMailbox = struct {
         } else {
             self.messages.append(self.allocator, msg) catch return MessageError.OutOfMemory;
         }
-        if (count_received) self.stats.messages_received += 1;
-        self.stats.total_size_bytes += msg.metadata.size_bytes;
+        if (count_received) self.stats.messages_received +|= 1;
+        self.stats.total_size_bytes +|= msg.metadata.size_bytes;
         self.stats.peak_usage = @max(self.stats.peak_usage, self.activeQueuedCountLocked());
     }
 
@@ -1064,10 +1169,10 @@ pub const ProcessMailbox = struct {
             .poisoned = poisoned,
         };
         queue.append(self.allocator, entry) catch return MessageError.OutOfMemory;
-        self.stats.messages_dead_lettered += 1;
+        self.stats.messages_dead_lettered +|= 1;
         if (poisoned) {
-            self.stats.poison_messages += 1;
-            self.current_poison_count += 1;
+            self.stats.poison_messages +|= 1;
+            self.current_poison_count +|= 1;
         }
         return entry.notice(poisoned);
     }
@@ -1240,6 +1345,43 @@ test "Message metadata replacement preserves old values on allocation failure" {
     try reply_message.setReplyTo("old-reply");
     try testing.expectError(error.OutOfMemory, reply_message.setReplyTo("new-reply"));
     try testing.expectEqualStrings("old-reply", reply_message.metadata.reply_to.?);
+}
+
+test "Message size tracks owned metadata and response id replacement" {
+    const allocator = testing.allocator;
+    var message = try Message.init(allocator, "id", "sender", "payload", null, .normal, null);
+    defer message.deinit();
+
+    try testing.expectEqual(@as(usize, 15), message.metadata.size_bytes);
+    try message.setCorrelationId("corr");
+    try testing.expectEqual(@as(usize, 19), message.metadata.size_bytes);
+    try message.setCorrelationId("c2");
+    try testing.expectEqual(@as(usize, 17), message.metadata.size_bytes);
+    try message.setReplyTo("reply");
+    try testing.expectEqual(@as(usize, 22), message.metadata.size_bytes);
+    try message.setReplyTo("r");
+    try testing.expectEqual(@as(usize, 18), message.metadata.size_bytes);
+
+    var response = try message.createResponse(allocator, "ok", .info);
+    defer response.deinit();
+    const expected_response_size = response.id.len + response.sender.len + response.payload.?.len +
+        response.metadata.correlation_id.?.len;
+    try testing.expectEqual(expected_response_size, response.metadata.size_bytes);
+}
+
+test "Mailbox message-size limit includes correlation and reply metadata" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 1,
+        .max_message_size = 16,
+        .enable_deadletter = false,
+    });
+    defer mailbox.deinit();
+
+    var message = try Message.init(allocator, "id", "sender", "payload", null, .normal, null);
+    try message.setCorrelationId("extra");
+    try testing.expect(message.metadata.size_bytes > 16);
+    try testing.expectError(MessageError.MessageTooLarge, mailbox.send(message));
 }
 
 test "Mailbox capacity and message size limits" {
@@ -1429,4 +1571,37 @@ test "ProcessMailbox serializes concurrent replay and discard" {
     } else |err| try testing.expectEqual(MessageError.EmptyMailbox, err);
     const stats = mailbox.getStats();
     try testing.expectEqual(@as(usize, 1), stats.dead_letters_replayed + stats.dead_letters_discarded);
+}
+
+test "ProcessMailbox snapshotQueue reports queued messages without consuming" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 8 });
+    defer mailbox.deinit();
+
+    const normal = try Message.init(allocator, "normal-msg", "worker", "payload", null, .normal, null);
+    try mailbox.send(normal);
+    const critical = try Message.init(allocator, "critical-msg", "worker", null, .healthCheck, .critical, 5_000);
+    try mailbox.send(critical);
+
+    var snapshot = try mailbox.snapshotQueue(allocator);
+    defer snapshot.deinit();
+
+    try testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    // Delivery order: critical priority is listed before normal.
+    try testing.expectEqualStrings("critical-msg", snapshot.entries[0].id);
+    try testing.expectEqual(MessagePriority.critical, snapshot.entries[0].priority);
+    try testing.expectEqual(Signal.healthCheck, snapshot.entries[0].signal.?);
+    try testing.expectEqual(@as(usize, 0), snapshot.entries[0].payload_len);
+    try testing.expectEqual(@as(?u32, 5_000), snapshot.entries[0].ttl_ms);
+    try testing.expect(!snapshot.entries[0].expired);
+
+    try testing.expectEqualStrings("normal-msg", snapshot.entries[1].id);
+    try testing.expectEqualStrings("worker", snapshot.entries[1].sender);
+    try testing.expectEqual(@as(usize, "payload".len), snapshot.entries[1].payload_len);
+
+    // Nothing was consumed.
+    try testing.expectEqual(@as(usize, 2), mailbox.queuedCount());
+    var received = try mailbox.receive();
+    defer received.deinit();
+    try testing.expectEqualStrings("critical-msg", received.id);
 }

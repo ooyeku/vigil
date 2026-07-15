@@ -161,16 +161,22 @@ pub const ReplyMailbox = struct {
         }
 
         // Wait for reply
-        const start_ms = compat.milliTimestamp();
+        const start_ms = compat.monotonicMilliTimestamp();
+        var first_poll = true;
         while (true) {
-            const elapsed = compat.milliTimestamp() - start_ms;
-            if (elapsed >= timeout_ms) {
+            const elapsed = compat.monotonicMilliTimestamp() - start_ms;
+            if ((timeout_ms == 0 and !first_poll) or (timeout_ms != 0 and elapsed >= timeout_ms)) {
                 self.flushStash();
                 return MessageError.DeliveryTimeout;
             }
+            const poll_timeout: u32 = if (timeout_ms == 0)
+                0
+            else
+                @intCast(@min(@as(i64, 100), @as(i64, timeout_ms) - elapsed));
+            first_poll = false;
 
             // Check inbox for reply
-            if (self.inbox.recvTimeout(100)) |msg_opt| {
+            if (self.inbox.recvTimeout(poll_timeout)) |msg_opt| {
                 if (msg_opt) |msg| {
                     if (msg.metadata.correlation_id) |msg_corr_id| {
                         if (std.mem.eql(u8, msg_corr_id, corr_id_copy)) {
@@ -194,8 +200,6 @@ pub const ReplyMailbox = struct {
                     return MessageError.ReceiverUnavailable;
                 }
             }
-
-            compat.sleep(10 * std.time.ns_per_ms);
         }
     }
 };
@@ -306,4 +310,25 @@ test "ReplyMailbox requeues non-matching messages without losing metadata" {
     try std.testing.expectEqualStrings("other-id", requeued.id);
     try std.testing.expectEqualStrings("other-correlation", requeued.metadata.correlation_id.?);
     try std.testing.expectEqual(@as(u32, 2), requeued.metadata.attempt_count);
+}
+
+test "ReplyMailbox zero timeout performs one nonblocking correlation poll" {
+    const allocator = std.testing.allocator;
+    var inbox = try Inbox.init(allocator);
+    defer inbox.close();
+    var reply_mailbox = ReplyMailbox.init(allocator, inbox);
+    defer reply_mailbox.deinit();
+
+    var response = try Message.init(allocator, "ready", "server", "response", null, .normal, null);
+    try response.setCorrelationId("ready-correlation");
+    try inbox.sendMessage(response);
+
+    const received = try reply_mailbox.waitForReply("ready-correlation", 0);
+    defer received.deinit();
+    try std.testing.expectEqualStrings("response", received.payload.?);
+
+    try std.testing.expectError(
+        MessageError.DeliveryTimeout,
+        reply_mailbox.waitForReply("missing", 0),
+    );
 }

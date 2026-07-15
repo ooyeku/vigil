@@ -83,6 +83,155 @@ pub const CircuitEvent = struct {
 /// small and non-blocking.
 pub const EventHandler = *const fn (event: Event) void;
 
+/// One retained timeline entry.
+pub const TimelineEntry = struct {
+    /// Monotonic sequence number assigned when the event was recorded.
+    sequence: u64,
+    /// Kind of event.
+    event_type: EventType,
+    /// Event timestamp in milliseconds.
+    timestamp_ms: i64,
+    /// Copied metadata when the source event carried any.
+    metadata: ?[]const u8,
+};
+
+/// Owned snapshot of retained timeline entries, oldest first.
+pub const TimelineSnapshot = struct {
+    allocator: std.mem.Allocator,
+    /// Retained entries in recording order.
+    entries: []TimelineEntry,
+    /// Total events recorded over the timeline lifetime, including evicted
+    /// entries.
+    total_recorded: u64,
+
+    /// Release copied metadata and snapshot storage.
+    pub fn deinit(self: *TimelineSnapshot) void {
+        for (self.entries) |entry| {
+            if (entry.metadata) |metadata| self.allocator.free(metadata);
+        }
+        self.allocator.free(self.entries);
+    }
+};
+
+/// Bounded, thread-safe timeline of recent notable events.
+///
+/// A timeline retains the most recent `capacity` events with copied metadata,
+/// so operators can ask "what happened recently?" without wiring a log
+/// pipeline. Attach one to a `TelemetryEmitter` with `attachTimeline()` or
+/// enable it on a `Runtime` with `enableTimeline()`.
+pub const EventTimeline = struct {
+    /// Allocator for entry storage and copied metadata.
+    allocator: std.mem.Allocator,
+    /// Retained entries in recording order.
+    entries: std.ArrayListUnmanaged(TimelineEntry),
+    /// Maximum retained entries.
+    capacity: usize,
+    /// Sequence number assigned to the next recorded event.
+    next_sequence: u64,
+    /// Total events recorded, including evicted entries.
+    total_recorded: u64,
+    /// Protects timeline state.
+    mutex: compat.Mutex,
+
+    /// Initialize an empty timeline that retains up to `capacity` events.
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) !EventTimeline {
+        if (capacity == 0) return error.InvalidCapacity;
+        return .{
+            .allocator = allocator,
+            .entries = .empty,
+            .capacity = capacity,
+            .next_sequence = 1,
+            .total_recorded = 0,
+            .mutex = .{},
+        };
+    }
+
+    /// Release retained entries and their copied metadata.
+    pub fn deinit(self: *EventTimeline) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.entries.items) |entry| {
+            if (entry.metadata) |metadata| self.allocator.free(metadata);
+        }
+        self.entries.deinit(self.allocator);
+    }
+
+    /// Record an event, evicting the oldest entry when full.
+    ///
+    /// Recording is best-effort: when metadata cannot be copied the event is
+    /// retained without metadata, and when entry storage cannot grow the event
+    /// is dropped.
+    pub fn record(self: *EventTimeline, event: Event) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const metadata_copy: ?[]const u8 = if (event.metadata) |metadata|
+            self.allocator.dupe(u8, metadata) catch null
+        else
+            null;
+
+        if (self.entries.items.len >= self.capacity) {
+            const evicted = self.entries.orderedRemove(0);
+            if (evicted.metadata) |metadata| self.allocator.free(metadata);
+        }
+
+        self.entries.append(self.allocator, .{
+            .sequence = self.next_sequence,
+            .event_type = event.event_type,
+            .timestamp_ms = event.timestamp_ms,
+            .metadata = metadata_copy,
+        }) catch {
+            if (metadata_copy) |metadata| self.allocator.free(metadata);
+            return;
+        };
+        self.next_sequence +%= 1;
+        self.total_recorded +|= 1;
+    }
+
+    /// Return the number of currently retained entries.
+    pub fn count(self: *EventTimeline) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.entries.items.len;
+    }
+
+    /// Capture an owned snapshot of retained entries, oldest first.
+    ///
+    /// The caller owns the returned snapshot and must call `deinit()`.
+    pub fn snapshot(self: *EventTimeline, allocator: std.mem.Allocator) !TimelineSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const entries = try allocator.alloc(TimelineEntry, self.entries.items.len);
+        errdefer allocator.free(entries);
+
+        var written: usize = 0;
+        errdefer for (entries[0..written]) |entry| {
+            if (entry.metadata) |metadata| allocator.free(metadata);
+        };
+
+        for (self.entries.items) |entry| {
+            entries[written] = .{
+                .sequence = entry.sequence,
+                .event_type = entry.event_type,
+                .timestamp_ms = entry.timestamp_ms,
+                .metadata = if (entry.metadata) |metadata|
+                    try allocator.dupe(u8, metadata)
+                else
+                    null,
+            };
+            written += 1;
+        }
+
+        return .{
+            .allocator = allocator,
+            .entries = entries,
+            .total_recorded = self.total_recorded,
+        };
+    }
+};
+
 /// Thread-safe event dispatcher.
 ///
 /// Handlers are grouped by exact `EventType`; there is no wildcard matching.
@@ -97,6 +246,8 @@ pub const TelemetryEmitter = struct {
     mutex: compat.Mutex,
     /// Whether `emit()` dispatches events.
     enabled: bool = true,
+    /// Optional attached timeline that records every emitted event.
+    timeline: ?*EventTimeline = null,
 
     const HandlerEntry = struct {
         event_type: EventType,
@@ -134,22 +285,48 @@ pub const TelemetryEmitter = struct {
         });
     }
 
+    /// Attach a timeline that records every event this emitter dispatches.
+    ///
+    /// The timeline is not owned by the emitter and must outlive the
+    /// attachment. Pass through `detachTimeline()` before destroying it.
+    pub fn attachTimeline(self: *TelemetryEmitter, timeline: *EventTimeline) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.timeline = timeline;
+    }
+
+    /// Detach the currently attached timeline, if any.
+    pub fn detachTimeline(self: *TelemetryEmitter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.timeline = null;
+    }
+
     /// Dispatch an event to matching handlers.
     ///
     /// Dispatch is synchronous and best-effort. If a temporary handler snapshot
-    /// cannot be allocated, the event is dropped.
+    /// cannot be allocated, the event is dropped. An attached timeline records
+    /// the event even when no handler matches.
     pub fn emit(self: *TelemetryEmitter, event: Event) void {
-        if (!self.enabled) return;
-
-        // Make a true copy of handlers to avoid use-after-free if handlers are modified
         self.mutex.lock();
+        if (!self.enabled) {
+            self.mutex.unlock();
+            return;
+        }
+
+        const timeline = self.timeline;
+
+        // Make a true copy of handlers to avoid use-after-free if handlers are modified.
         const handlers_snapshot = self.allocator.alloc(HandlerEntry, self.handlers.items.len) catch {
             self.mutex.unlock();
+            if (timeline) |t| t.record(event);
             return;
         };
         @memcpy(handlers_snapshot, self.handlers.items);
         self.mutex.unlock();
         defer self.allocator.free(handlers_snapshot);
+
+        if (timeline) |t| t.record(event);
 
         for (handlers_snapshot) |entry| {
             if (entry.event_type == event.event_type) {
@@ -357,4 +534,51 @@ test "TelemetryEmitter event filtering" {
     emitter.emit(event1);
     emitter.emit(event2);
     // Test passes if no panic
+}
+
+test "EventTimeline retains bounded events in order" {
+    var timeline = try EventTimeline.init(std.testing.allocator, 2);
+    defer timeline.deinit();
+
+    try std.testing.expectError(error.InvalidCapacity, EventTimeline.init(std.testing.allocator, 0));
+
+    timeline.record(.{ .event_type = .message_sent, .timestamp_ms = 1, .metadata = "first" });
+    timeline.record(.{ .event_type = .message_received, .timestamp_ms = 2, .metadata = null });
+    timeline.record(.{ .event_type = .message_dropped, .timestamp_ms = 3, .metadata = "third" });
+
+    try std.testing.expectEqual(@as(usize, 2), timeline.count());
+
+    var snapshot = try timeline.snapshot(std.testing.allocator);
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(@as(u64, 3), snapshot.total_recorded);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    try std.testing.expectEqual(EventType.message_received, snapshot.entries[0].event_type);
+    try std.testing.expect(snapshot.entries[0].metadata == null);
+    try std.testing.expectEqual(EventType.message_dropped, snapshot.entries[1].event_type);
+    try std.testing.expectEqualStrings("third", snapshot.entries[1].metadata.?);
+    try std.testing.expect(snapshot.entries[0].sequence < snapshot.entries[1].sequence);
+}
+
+test "TelemetryEmitter records emitted events into an attached timeline" {
+    var emitter = TelemetryEmitter.init(std.testing.allocator);
+    defer emitter.deinit();
+
+    var timeline = try EventTimeline.init(std.testing.allocator, 8);
+    defer timeline.deinit();
+    emitter.attachTimeline(&timeline);
+
+    // Recorded even with no registered handlers.
+    emitter.emit(.{ .event_type = .message_sent, .timestamp_ms = 10, .metadata = "orders" });
+    try std.testing.expectEqual(@as(usize, 1), timeline.count());
+
+    // Disabled emitters record nothing.
+    emitter.setEnabled(false);
+    emitter.emit(.{ .event_type = .message_sent, .timestamp_ms = 11, .metadata = null });
+    try std.testing.expectEqual(@as(usize, 1), timeline.count());
+
+    emitter.setEnabled(true);
+    emitter.detachTimeline();
+    emitter.emit(.{ .event_type = .message_sent, .timestamp_ms = 12, .metadata = null });
+    try std.testing.expectEqual(@as(usize, 1), timeline.count());
 }

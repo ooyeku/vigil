@@ -65,6 +65,12 @@ pub const policy = @import("policy.zig");
 
 /// Event emission and subscription primitives.
 pub const telemetry = @import("telemetry.zig");
+/// Bounded timeline of recent notable events.
+pub const EventTimeline = telemetry.EventTimeline;
+/// One retained event-timeline entry.
+pub const TimelineEntry = telemetry.TimelineEntry;
+/// Owned snapshot of retained event-timeline entries.
+pub const TimelineSnapshot = telemetry.TimelineSnapshot;
 /// Circuit breaker implementation for fail-fast dependency protection.
 pub const circuit_breaker = @import("circuit_breaker.zig");
 /// Process groups for broadcast, round-robin, and keyed routing.
@@ -139,6 +145,16 @@ pub const MockSupervisor = testing.MockSupervisor;
 pub const expectMessage = testing.expectMessage;
 /// Assert that a mock inbox contains a matching signal.
 pub const expectSignal = testing.expectSignal;
+/// Deterministic clock for tests and simulated runtimes.
+pub const SimulatedClock = testing.SimulatedClock;
+/// Deterministic timer service driven by a `SimulatedClock`.
+pub const SimulatedTimerService = testing.SimulatedTimerService;
+/// Scripted failure schedule used by `FaultInjector`.
+pub const FaultPlan = testing.FaultPlan;
+/// Deterministic fault-injection helper for dependency and policy tests.
+pub const FaultInjector = testing.FaultInjector;
+/// In-memory fake distributed registry for deterministic cluster tests.
+pub const FakeDistributedRegistry = testing.FakeDistributedRegistry;
 
 /// Token-bucket rate limiter.
 pub const RateLimiter = flow_control.RateLimiter;
@@ -182,6 +198,12 @@ pub const PolicyOptions = policy.PolicyOptions;
 pub const PolicyResult = policy.PolicyResult;
 /// Execute a fallible operation under retry, timeout, fallback, and circuit rules.
 pub const executePolicy = policy.execute;
+/// Fail-fast isolation pool bounding concurrent access to a dependency.
+pub const Bulkhead = policy.Bulkhead;
+/// Configuration for a `Bulkhead` isolation pool.
+pub const BulkheadConfig = policy.BulkheadConfig;
+/// Value snapshot of bulkhead usage.
+pub const BulkheadSnapshot = policy.BulkheadSnapshot;
 
 /// Group of inboxes that can receive broadcast or routed messages.
 pub const ProcessGroup = process_group.ProcessGroup;
@@ -202,6 +224,8 @@ pub const PublishResult = pubsub.PublishResult;
 pub const PubSubBrokerSnapshot = pubsub.PubSubBrokerSnapshot;
 /// Snapshot of one pub/sub subscriber.
 pub const SubscriberSnapshot = pubsub.SubscriberSnapshot;
+/// Owned inspection of one subscriber including its topic patterns.
+pub const SubscriberInspection = pubsub.SubscriberInspection;
 
 /// Type-erased checkpoint persistence interface.
 pub const Checkpointer = checkpoint.Checkpointer;
@@ -232,6 +256,10 @@ pub const DeadLetterNotice = messages.DeadLetterNotice;
 pub const DeadLetterEntry = messages.DeadLetterEntry;
 /// Owned dead-letter inspection snapshot.
 pub const DeadLetterSnapshot = messages.DeadLetterSnapshot;
+/// Non-consuming snapshot of one queued message.
+pub const QueuedMessageSnapshot = messages.QueuedMessageSnapshot;
+/// Owned non-consuming snapshot of a mailbox's active queue.
+pub const MailboxQueueSnapshot = messages.MailboxQueueSnapshot;
 /// Replay outcome for a retained dead-letter entry.
 pub const DeadLetterReplayResult = messages.DeadLetterReplayResult;
 /// Replay status for a retained dead-letter entry.
@@ -239,6 +267,10 @@ pub const DeadLetterReplayStatus = messages.DeadLetterReplayStatus;
 
 /// Low-level supervisor type re-exported for compatibility.
 pub const Supervisor = supervisor_builder.Supervisor;
+/// Owned snapshot of a supervisor and its supervised children.
+pub const SupervisorSnapshot = Supervisor.SupervisorSnapshot;
+/// Snapshot of one supervised child.
+pub const SupervisorChildSnapshot = Supervisor.SupervisorChildSnapshot;
 /// Restart strategy used by supervisors.
 pub const RestartStrategy = supervisor_builder.RestartStrategy;
 /// Process scheduling priority used by supervisor children.
@@ -303,6 +335,22 @@ test "v2 root module exports runtime and version" {
     try std.testing.expect(@hasDecl(@This(), "PolicyResult"));
     try std.testing.expect(@hasDecl(@This(), "executePolicy"));
     try std.testing.expect(@hasDecl(@This(), "distributed_protocol"));
+    try std.testing.expect(@hasDecl(@This(), "EventTimeline"));
+    try std.testing.expect(@hasDecl(@This(), "TimelineEntry"));
+    try std.testing.expect(@hasDecl(@This(), "TimelineSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "SupervisorSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "SupervisorChildSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "QueuedMessageSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "MailboxQueueSnapshot"));
+    try std.testing.expect(@hasDecl(@This(), "SubscriberInspection"));
+    try std.testing.expect(@hasDecl(@This(), "SimulatedClock"));
+    try std.testing.expect(@hasDecl(@This(), "SimulatedTimerService"));
+    try std.testing.expect(@hasDecl(@This(), "FaultPlan"));
+    try std.testing.expect(@hasDecl(@This(), "FaultInjector"));
+    try std.testing.expect(@hasDecl(@This(), "FakeDistributedRegistry"));
+    try std.testing.expect(@hasDecl(@This(), "Bulkhead"));
+    try std.testing.expect(@hasDecl(@This(), "BulkheadConfig"));
+    try std.testing.expect(@hasDecl(@This(), "BulkheadSnapshot"));
 
     const version = getVersion();
     try std.testing.expectEqual(@as(u32, @intCast(build_options.version.major)), version.major);

@@ -1,0 +1,16 @@
+.{
+    .name = .ops_toolkit,
+    .version = "0.0.0",
+    .fingerprint = 0x3708e86a4ce9a462,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vigil = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

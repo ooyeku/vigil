@@ -146,6 +146,8 @@ pub const Supervisor = struct {
     mutex: Mutex,
     /// Current statistics for this supervisor
     stats: SupervisorStats,
+    /// Monotonic timestamp used to compute elapsed uptime.
+    started_at_ms: i64,
     /// Handle to the monitoring thread
     monitor_thread: ?std.Thread,
     /// Flag indicating shutdown in progress
@@ -165,9 +167,8 @@ pub const Supervisor = struct {
             .restart_count = 0,
             .last_restart_time = 0,
             .mutex = Mutex{},
-            .stats = .{
-                .uptime_ms = compat.milliTimestamp(),
-            },
+            .stats = .{},
+            .started_at_ms = compat.monotonicMilliTimestamp(),
             .monitor_thread = null,
             .is_shutting_down = false,
             .state = .initial,
@@ -209,6 +210,11 @@ pub const Supervisor = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // ChildProcess values live inside an ArrayList. Growing that list while
+        // workers are running would invalidate the pointers held by their
+        // thread contexts.
+        if (self.state != .initial) return error.InvalidState;
+
         // Search for existing child without acquiring mutex again
         for (self.children.items) |*child| {
             if (std.mem.eql(u8, child.spec.id, spec.id)) {
@@ -229,8 +235,15 @@ pub const Supervisor = struct {
 
         if (self.state != .initial) return error.AlreadyRunning;
 
+        var started: usize = 0;
         for (self.children.items) |*child| {
-            try child.start();
+            child.start() catch |err| {
+                for (self.children.items[0..started]) |*started_child| {
+                    started_child.stop() catch {};
+                }
+                return err;
+            };
+            started += 1;
         }
 
         self.state = .running;
@@ -240,8 +253,21 @@ pub const Supervisor = struct {
     /// This spawns a monitoring thread that checks process states and handles failures.
     /// Returns error.AlreadyMonitoring if monitoring is already active.
     pub fn startMonitoring(self: *Supervisor) !void {
-        if (self.monitor_thread != null) return error.AlreadyMonitoring;
-        self.monitor_thread = try std.Thread.spawn(.{}, monitorChildren, .{self});
+        self.mutex.lock();
+        if (self.monitor_thread != null) {
+            self.mutex.unlock();
+            return error.AlreadyMonitoring;
+        }
+        if (self.state != .running) {
+            self.mutex.unlock();
+            return error.InvalidState;
+        }
+        self.is_shutting_down = false;
+        self.monitor_thread = std.Thread.spawn(.{}, monitorChildren, .{self}) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
     }
 
     /// Stop monitoring child processes.
@@ -266,10 +292,14 @@ pub const Supervisor = struct {
 
         var active: u32 = 0;
         for (self.children.items) |*child| {
-            if (child.getState() == .running) active += 1;
+            if (child.getState() == .running) active +|= 1;
         }
 
         self.stats.active_children = active;
+        self.stats.uptime_ms = @max(
+            0,
+            compat.monotonicMilliTimestamp() -| self.started_at_ms,
+        );
         return self.stats;
     }
 
@@ -298,7 +328,7 @@ pub const Supervisor = struct {
         }
 
         // Wait for children to stop (without holding the mutex continuously)
-        const start_time = compat.milliTimestamp();
+        const start_time = compat.monotonicMilliTimestamp();
         while (true) {
             var all_stopped = true;
 
@@ -317,8 +347,8 @@ pub const Supervisor = struct {
 
             if (all_stopped) break;
 
-            const elapsed = compat.milliTimestamp() - start_time;
-            if (elapsed > timeout_ms) return error.ShutdownTimeout;
+            const elapsed = compat.monotonicMilliTimestamp() - start_time;
+            if (elapsed >= timeout_ms) return error.ShutdownTimeout;
 
             // Sleep without holding the mutex
             compat.sleep(50 * std.time.ns_per_ms);
@@ -344,6 +374,83 @@ pub const Supervisor = struct {
             }
         }
         return null;
+    }
+
+    /// Snapshot of one supervised child.
+    pub const SupervisorChildSnapshot = struct {
+        /// Copied child id owned by the enclosing snapshot.
+        id: []const u8,
+        /// Child process state at snapshot time.
+        state: Process.ProcessState,
+        /// Restarts recorded for this child.
+        restart_count: u32,
+    };
+
+    /// Owned snapshot of a supervisor and its supervised children.
+    pub const SupervisorSnapshot = struct {
+        allocator: Allocator,
+        /// Supervisor state at snapshot time.
+        state: SupervisorState,
+        /// Configured restart strategy.
+        strategy: RestartStrategy,
+        /// Number of supervised children.
+        child_count: usize,
+        /// Number of children currently running.
+        active_children: usize,
+        /// Total restarts since supervisor start.
+        total_restarts: u32,
+        /// Elapsed supervisor uptime in milliseconds.
+        uptime_ms: i64,
+        /// Per-child snapshots in registration order.
+        children: []SupervisorChildSnapshot,
+
+        /// Release copied child ids and snapshot storage.
+        pub fn deinit(self: *SupervisorSnapshot) void {
+            for (self.children) |child| {
+                self.allocator.free(child.id);
+            }
+            self.allocator.free(self.children);
+        }
+    };
+
+    /// Capture an owned snapshot of the supervision tree.
+    ///
+    /// The caller owns the returned snapshot and must call `deinit()`.
+    pub fn snapshot(self: *Supervisor, allocator: Allocator) !SupervisorSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const children = try allocator.alloc(SupervisorChildSnapshot, self.children.items.len);
+        errdefer allocator.free(children);
+
+        var written: usize = 0;
+        errdefer for (children[0..written]) |child| {
+            allocator.free(child.id);
+        };
+
+        var active: usize = 0;
+        for (self.children.items) |*child| {
+            const child_state = child.getState();
+            if (child_state == .running) active += 1;
+            const id_copy = try allocator.dupe(u8, child.spec.id);
+            children[written] = .{
+                .id = id_copy,
+                .state = child_state,
+                .restart_count = child.stats.restart_count,
+            };
+            written += 1;
+        }
+
+        return .{
+            .allocator = allocator,
+            .state = self.state,
+            .strategy = self.options.strategy,
+            .child_count = children.len,
+            .active_children = active,
+            .total_restarts = self.stats.total_restarts,
+            .uptime_ms = @max(0, compat.monotonicMilliTimestamp() -| self.started_at_ms),
+            .children = children,
+        };
     }
 
     /// Supervisor introspection information
@@ -475,34 +582,38 @@ pub const Supervisor = struct {
                     // Handle failure according to restart strategy
                     const current_time = compat.milliTimestamp();
                     self.stats.last_failure_time = current_time;
-                    self.notifyChildCrash(child.spec.id);
+                    const child_id = child.spec.id;
+                    self.mutex.unlock();
+                    self.notifyChildCrash(child_id);
+                    self.mutex.lock();
 
-                    const time_diff = current_time - self.last_restart_time;
-                    if (time_diff > self.options.max_seconds * 1000) {
+                    const restart_time = compat.monotonicMilliTimestamp();
+                    const time_diff = restart_time - self.last_restart_time;
+                    if (time_diff > @as(i64, self.options.max_seconds) * 1000) {
                         self.restart_count = 0;
                     }
 
-                    self.restart_count += 1;
+                    self.restart_count +|= 1;
                     if (self.restart_count > self.options.max_restarts) {
                         self.mutex.unlock();
                         return error.TooManyRestarts;
                     }
 
-                    self.last_restart_time = current_time;
+                    self.last_restart_time = restart_time;
 
                     // Apply restart strategy with state verification
                     switch (self.options.strategy) {
                         .one_for_one => {
                             child.stop() catch {};
                             try child.start();
-                            self.stats.total_restarts += 1;
+                            self.stats.total_restarts +|= 1;
                         },
                         .one_for_all => {
                             for (self.children.items) |*sibling| {
                                 sibling.stop() catch {};
                                 try sibling.start();
                             }
-                            self.stats.total_restarts += 1;
+                            self.stats.total_restarts +|= 1;
                         },
                         .rest_for_one => {
                             var found_failed = false;
@@ -515,7 +626,7 @@ pub const Supervisor = struct {
                                     try sibling.start();
                                 }
                             }
-                            self.stats.total_restarts += 1;
+                            self.stats.total_restarts +|= 1;
                         },
                     }
                 }
@@ -558,9 +669,18 @@ test "supervisor basic operations" {
 
     try supervisor.start();
 
+    try std.testing.expectError(error.InvalidState, supervisor.addChild(.{
+        .id = "late-child",
+        .start_fn = WorkerGate.run,
+        .restart_type = .temporary,
+        .shutdown_timeout_ms = 100,
+    }));
+
     const stats = supervisor.getStats();
     try std.testing.expect(stats.active_children == 1);
     try std.testing.expect(stats.total_restarts == 0);
+    try std.testing.expect(stats.uptime_ms >= 0);
+    try std.testing.expect(stats.uptime_ms < 60_000);
 
     WorkerGate.stop.store(true, .release);
     try supervisor.shutdown(5000);
@@ -615,6 +735,11 @@ test "supervisor monitoring" {
     // Wait a bit for monitoring thread to fully stop
     compat.sleep(50 * std.time.ns_per_ms);
 
+    // Monitoring can be restarted after a clean stop.
+    try supervisor.startMonitoring();
+    try std.testing.expect(!supervisor.is_shutting_down);
+    supervisor.stopMonitoring();
+
     try supervisor.shutdown(5000);
 
     // Verify shutdown completed successfully
@@ -640,6 +765,16 @@ fn recordSupervisorCrashEvent(event: telemetry.Event) void {
 
 test "supervisor restart strategies" {
     const allocator = std.testing.allocator;
+    const WorkerGate = struct {
+        var stop = std.atomic.Value(bool).init(false);
+
+        fn run() void {
+            while (!stop.load(.acquire)) {
+                compat.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+    };
+    WorkerGate.stop.store(false, .release);
 
     // Test one_for_one strategy
     {
@@ -660,6 +795,7 @@ test "supervisor restart strategies" {
             .enable_telemetry = true,
         });
         defer {
+            WorkerGate.stop.store(true, .release);
             supervisor.stopMonitoring();
             compat.sleep(200 * std.time.ns_per_ms);
             supervisor.deinit();
@@ -667,13 +803,7 @@ test "supervisor restart strategies" {
 
         try supervisor.addChild(.{
             .id = "test1",
-            .start_fn = struct {
-                fn testFn() void {
-                    while (true) {
-                        compat.sleep(50 * std.time.ns_per_ms);
-                    }
-                }
-            }.testFn,
+            .start_fn = WorkerGate.run,
             .restart_type = .permanent,
             .shutdown_timeout_ms = 100,
         });
@@ -789,4 +919,52 @@ test "supervisor findChild" {
 
     const not_found = supervisor.findChild("nonexistent");
     try std.testing.expect(not_found == null);
+}
+
+test "supervisor snapshot captures children and state" {
+    const allocator = std.testing.allocator;
+    const WorkerGate = struct {
+        var stop = std.atomic.Value(bool).init(false);
+
+        fn run() void {
+            while (!stop.load(.acquire)) {
+                compat.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+    };
+    WorkerGate.stop.store(false, .release);
+
+    var supervisor = Supervisor.init(allocator, .{
+        .strategy = .one_for_one,
+        .max_restarts = 3,
+        .max_seconds = 5,
+    });
+    defer supervisor.deinit();
+    defer WorkerGate.stop.store(true, .release);
+
+    try supervisor.addChild(.{
+        .id = "snapshot-worker",
+        .start_fn = WorkerGate.run,
+        .restart_type = .permanent,
+        .shutdown_timeout_ms = 100,
+    });
+
+    var initial = try supervisor.snapshot(allocator);
+    defer initial.deinit();
+    try std.testing.expectEqual(SupervisorState.initial, initial.state);
+    try std.testing.expectEqual(@as(usize, 1), initial.child_count);
+    try std.testing.expectEqual(@as(usize, 0), initial.active_children);
+    try std.testing.expectEqualStrings("snapshot-worker", initial.children[0].id);
+
+    try supervisor.start();
+    var running = try supervisor.snapshot(allocator);
+    defer running.deinit();
+    try std.testing.expectEqual(SupervisorState.running, running.state);
+    try std.testing.expectEqual(RestartStrategy.one_for_one, running.strategy);
+    try std.testing.expectEqual(@as(usize, 1), running.active_children);
+    try std.testing.expectEqual(Process.ProcessState.running, running.children[0].state);
+    try std.testing.expect(running.uptime_ms >= 0);
+
+    WorkerGate.stop.store(true, .release);
+    try supervisor.shutdown(5000);
 }

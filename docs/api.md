@@ -16,6 +16,7 @@ A process supervision and inter-process communication library for Zig, inspired 
 - [Resilience](#resilience)
   - [Reliability Policy](#reliability-policy)
   - [Circuit Breaker](#circuit-breaker)
+  - [Bulkhead](#bulkhead)
   - [Rate Limiter](#rate-limiter)
   - [Backpressure](#backpressure)
 - [Messaging](#messaging)
@@ -127,10 +128,48 @@ report and set `ready` to false.
 Standalone runtime primitives expose focused snapshots too:
 
 - `ProcessGroup.snapshot(allocator)` reports group name, members, queue depth, and closed inbox state.
-- `PubSubBroker.snapshot(allocator)` reports subscriber count, total pattern count, queue depth, and closed inbox state.
-- `CircuitBreaker.snapshot()` reports breaker state, counters, timestamps, and thresholds.
+- `PubSubBroker.snapshot(allocator)` reports subscriber count, total pattern count, copied topic patterns per subscriber, queue depth, and closed inbox state.
+- `CircuitBreaker.snapshot()` reports breaker state, counters, timestamps, thresholds, and diagnostics: last transition time, lifetime open transitions, and lifetime failure/success totals.
+- `Supervisor.snapshot(allocator)` reports supervisor state, strategy, uptime, and per-child state and restart counts.
 - `Timer.snapshot()` reports active, cancelled, repeat, and interval state.
 - `ReplyMailbox.snapshot()` reports pending correlation ids and stashed messages.
+
+### Debug-Layer Introspection
+
+The debug layer answers "what is my runtime doing right now?" without
+consuming messages or attaching a log pipeline.
+
+```zig
+var rt = try vigil.runtime(allocator, .{});
+defer rt.deinit();
+
+// Record every event emitted through the runtime telemetry emitter into a
+// bounded timeline (runtime-owned; freed by deinit()).
+try rt.enableTimeline(64);
+
+// ... application activity ...
+
+// Recent notable events, oldest first.
+if (try rt.timelineSnapshot(allocator)) |snapshot_const| {
+    var snapshot = snapshot_const;
+    defer snapshot.deinit();
+    for (snapshot.entries) |entry| {
+        std.debug.print("#{d} {s}\n", .{ entry.sequence, @tagName(entry.event_type) });
+    }
+}
+
+// One human-readable dump with health, per-inbox stats, and the timeline —
+// ready to serve from a STATUS command or debug endpoint.
+const dump = try rt.debugDump(allocator);
+defer allocator.free(dump);
+```
+
+Non-consuming inspection is available on inboxes and routing primitives:
+
+- `Inbox.peekMessages(allocator)` / `ProcessMailbox.snapshotQueue(allocator)` return queued-message summaries (id, sender, priority, payload size, attempts, TTL) in delivery order without consuming anything.
+- `ProcessGroup.routeIndexForKey(key)` and `ProcessGroup.routeMemberForKey(allocator, key)` preview which member a keyed `route()` would pick.
+- `Subscriber.snapshotPatterns(allocator)` returns owned copies of a subscriber's topic patterns.
+- `EventTimeline` can also be used standalone: `attachTimeline()` on any `TelemetryEmitter` records emitted events into a bounded, thread-safe buffer.
 
 ### Migrating from the legacy API
 
@@ -216,6 +255,9 @@ inbox.close();
 | `sendMessage(message)` | Send an owned message without rebuilding its id or metadata |
 | `recv()` | Block until message received |
 | `recvTimeout(ms)` | Receive with timeout (returns `?Message`) |
+| `queueDepth()` | Read active queue depth with shutdown-safe operation pinning |
+| `dropOldest()` | Drop the oldest active message with shutdown-safe operation pinning |
+| `acquireOperation()` | Pin lifetime across a multi-step wrapper operation |
 | `isClosed()` | Check if inbox is closed |
 | `stats()` | Get mailbox statistics |
 | `deadLetters(allocator)` | Capture an owned, non-consuming dead-letter snapshot |
@@ -374,6 +416,9 @@ std.debug.print("Children: {d}, Active: {d}\n", .{
     info.active_children,
 });
 
+const stats = supervisor.getStats();
+// stats.uptime_ms is elapsed monotonic time since Supervisor.init().
+
 // Get specific child info
 if (supervisor.getChildInfo("worker_1")) |child| {
     std.debug.print("Child state: {s}\n", .{@tagName(child.state)});
@@ -386,9 +431,26 @@ try supervisor.resumeChild("worker_1");
 
 ```
 
+For an owned supervision-tree snapshot with copied child ids, use
+`snapshot(allocator)`:
+
+```zig
+var tree = try supervisor.snapshot(allocator);
+defer tree.deinit();
+for (tree.children) |child| {
+    std.debug.print("{s}: {s} ({d} restarts)\n", .{
+        child.id,
+        @tagName(child.state),
+        child.restart_count,
+    });
+}
+```
+
 | Method | Description |
 |--------|-------------|
 | `inspect()` | Get supervisor state snapshot |
+| `snapshot(allocator)` | Owned supervision-tree snapshot with per-child state |
+| `getStats()` | Get counters, active children, and elapsed uptime |
 | `getChildInfo(id)` | Get specific child info |
 | `restartChild(id)` | Force restart a child |
 | `suspendChild(id)` | Pause a child |
@@ -561,6 +623,42 @@ const failures = breaker.getFailureCount();
 | `forceOpen()` | Manually open circuit |
 | `forceClose()` | Manually close circuit |
 
+`snapshot()` additionally reports diagnostics: `last_transition_time_ms`,
+`open_transitions`, `total_failures`, and `total_successes`.
+
+---
+
+### Bulkhead
+
+Fail-fast isolation pool that bounds concurrent access to a dependency, so one
+slow service cannot absorb every worker in the system.
+
+```zig
+var bulkhead = try vigil.Bulkhead.init(.{ .max_concurrent = 8 });
+
+// Manual permits
+try bulkhead.acquire(); // error.BulkheadFull when the pool is exhausted
+defer bulkhead.release();
+
+// Or wrap the operation; the permit is released on success and failure.
+const value = try bulkhead.run(Client, u32, &client, Client.fetchQuote);
+
+// Usage and rejection counters for health reporting.
+const usage = bulkhead.snapshot();
+std.debug.print("{d}/{d} in flight, {d} rejected\n", .{
+    usage.in_flight,
+    usage.max_concurrent,
+    usage.total_rejected,
+});
+```
+
+| Method | Description |
+|--------|-------------|
+| `acquire()` | Reserve a permit, failing fast with `error.BulkheadFull` |
+| `release()` | Return a permit |
+| `run(Context, T, ctx, fn)` | Run an operation inside the pool |
+| `snapshot()` | Usage snapshot with lifetime admitted/rejected counters |
+
 ---
 
 ### Rate Limiter
@@ -610,6 +708,11 @@ var flow_inbox = vigil.FlowControlledInbox.init(
 try flow_inbox.send("message");
 const msg = try flow_inbox.recv();
 ```
+
+Backpressure uses the wrapped inbox's current queue depth. The low watermark
+must not exceed the high watermark, and `.block` requires a nonzero low
+watermark; `send()` returns `error.InvalidConfiguration` for invalid
+combinations.
 
 | Strategy | Description |
 |----------|-------------|
@@ -681,8 +784,11 @@ broker.unsubscribe(&subscriber);
 ```
 
 **Wildcard Patterns:**
-- `*` - Match single level (e.g., `events.*` matches `events.user`)
-- `#` - Match multiple levels (e.g., `events.#` matches `events.user.created`)
+- `*` - Match exactly one non-empty level (for example, `events.*` matches `events.user`)
+- `#` - Match zero or more levels only as the final level (`events.#` matches `events` and `events.user.created`)
+
+Calling `broker.subscribe()` more than once with the same subscriber is
+idempotent and does not duplicate deliveries.
 
 ---
 
@@ -710,6 +816,9 @@ defer reply_mailbox.deinit();
 const reply_msg = try reply_mailbox.waitForReply("corr_123", 5000);
 defer reply_msg.deinit();
 ```
+
+A timeout of zero performs one nonblocking poll, so a reply already queued is
+returned immediately rather than skipped.
 
 ---
 
@@ -796,6 +905,53 @@ try vigil.expectMessage(std.testing, mock_inbox, .{
 try vigil.expectSignal(std.testing, mock_inbox, .healthCheck);
 ```
 
+### Deterministic Simulation
+
+Simulate time, timers, faults, and cluster behavior without threads, sleeps,
+or sockets.
+
+```zig
+// Deterministic clock: time moves only when the test advances it. `now`/
+// `sleep` slot straight into PolicyOptions clock/sleeper hooks.
+var clock = vigil.SimulatedClock.init(0);
+clock.advance(250);
+clock.sleep(5 * std.time.ns_per_ms); // advances 5ms instead of blocking
+
+// Deterministic timers: callbacks fire synchronously inside advance(), in
+// deadline order. Intervals re-arm; cancel() removes pending timers.
+var timers = vigil.SimulatedTimerService.init(allocator, &clock);
+defer timers.deinit();
+_ = try timers.setTimeout(10, onDeadline);
+const interval_id = try timers.setInterval(4, onTick);
+const fired = timers.advance(12); // fires ticks at 4, 8, 12 and the timeout at 10
+_ = timers.cancel(interval_id);
+
+// Fault injection: scripted failures for retry/fallback/breaker tests.
+var injector = vigil.FaultInjector.init(.{
+    .fail_first = 2,               // fail the first two calls
+    .fail_every = 5,               // then every 5th call
+    .error_value = error.Timeout,  // with this error
+});
+try std.testing.expectError(error.Timeout, injector.call());
+
+// Fake distributed registry: in-memory peers, no sockets. disconnectPeer()
+// simulates a partition; reconnectPeer() heals it.
+var registry = vigil.FakeDistributedRegistry.init(allocator, 9100);
+defer registry.deinit();
+try registry.addPeer("node_b", "10.0.0.2", 9200);
+try registry.registerRemote("node_b", "billing_service");
+_ = registry.whereisGlobal("billing_service"); // resolves via node_b
+_ = registry.disconnectPeer("node_b");
+_ = registry.whereisGlobal("billing_service"); // null while partitioned
+
+// Failure-mode helpers for queues and consumers.
+const sent = try vigil.testing.fillInbox(inbox, "load");     // full queue
+const drained = try vigil.testing.drainInbox(inbox, 100);    // consumer catches up
+```
+
+`fired`, `sent`, and `drained` report exactly how much work happened, so tests
+assert on counts instead of sleeping and hoping.
+
 ---
 
 ## Advanced
@@ -835,6 +991,9 @@ var file_ckpt = try vigil.FileCheckpointer.init(allocator, "/tmp/checkpoints");
 defer file_ckpt.deinit();
 const ckpt = file_ckpt.toCheckpointer();
 
+// Applications that already own a std.Io value can instead call:
+// vigil.FileCheckpointer.initWithIo(allocator, io, "/tmp/checkpoints")
+
 // Save state
 try ckpt.save("server_state", state_bytes);
 
@@ -852,6 +1011,10 @@ var mem_ckpt = vigil.MemoryCheckpointer.init(allocator);
 defer mem_ckpt.deinit();
 const test_ckpt = mem_ckpt.toCheckpointer();
 ```
+
+File checkpoint ids must be a single non-empty path component. Empty ids,
+`.`/`..`, path separators, and NUL bytes are rejected with
+`error.InvalidCheckpointId`.
 
 ---
 
@@ -943,6 +1106,8 @@ try server.setCheckpointer(mem_ckpt.toCheckpointer(), "my_server", 5000, .{
 | `schedule(msg, delay_ms)` | Send a delayed message to self |
 | `supervise(supervisor, id)` | Register with a supervisor |
 
+`cast()` and `call()` return `error.NotRunning` after the server has stopped.
+
 ---
 
 ### Distributed Registry
@@ -989,6 +1154,10 @@ registry.stopSync();
 - `VIGIL/2 WHERE <name>` -> `FOUND` / `NOTFOUND` (name lookup)
 - `VIGIL/2 REG <name>` -> `OK` (registration propagation)
 - `VIGIL/2 UNREG <name>` -> `OK` (remote cache removal)
+
+Global names must be one non-empty protocol token: whitespace, control bytes,
+and extra command arguments are rejected. Frames may arrive in multiple TCP
+reads but must end in a newline and fit within the registry frame buffer.
 
 | Method | Description |
 |--------|-------------|
@@ -1040,6 +1209,10 @@ try timer.setInterval(500, periodicFn);
 // Cancel timer
 timer.cancel();
 ```
+
+Intervals must be greater than zero; `setInterval(0, ...)` returns
+`error.InvalidInterval`. After a one-shot callback finishes,
+`snapshot().active` is false.
 
 ---
 
@@ -1265,12 +1438,14 @@ pub const VigilError = error{
 | `ShutdownTimeout` | Graceful shutdown timed out |
 | `ChildNotFound` | Child ID not found |
 | `AlreadyMonitoring` | Monitoring already active |
+| `InvalidState` | Operation is invalid for the supervisor lifecycle state |
 
 ### Process Group Errors
 
 | Error | Description |
 |-------|-------------|
 | `NoMembers` | Group has no members |
+| `AlreadyMember` | A member with the same id is already registered |
 | `OutOfMemory` | Memory allocation failed |
 
 ---
@@ -1296,6 +1471,11 @@ zig build run
 cd examples/vigilant_server
 zig build run
 
+# Run the operations toolkit demos
+cd examples/ops_toolkit
+zig build run                        # all demos
+zig build run -- dead-letter-replay  # one demo
+
 # Run the benchmark harness
 cd benchmarks/vigil_bench
 zig build run -Doptimize=ReleaseSafe -- --iterations 10000
@@ -1309,6 +1489,13 @@ See `examples/vigil_showcase` for a resilient order pipeline demonstrating:
 - Runtime-owned registry, telemetry, shutdown hooks, and inboxes
 - Process groups and pub/sub event fanout
 - Inbox backpressure, rate limiting, and circuit breaker behavior
+
+See `examples/ops_toolkit` for five focused operations demos:
+- `job-queue` — resilient job queue with dead-letter replay and poison quarantine
+- `retry-client` — retry/backoff dependency client with circuit breaker, fallback, and a simulated clock
+- `dead-letter-replay` — operator workflow: inspect, replay, and discard dead letters with a timeline audit trail
+- `introspection` — runtime introspection endpoint: health, queue peeks, route tables, subscriptions, and `debugDump()`
+- `checkpoint` — checkpointed state machine with crash recovery
 
 See `examples/vigilant_server` for a complete TCP server demonstrating:
 - Circuit breaker protection

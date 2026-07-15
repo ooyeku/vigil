@@ -152,6 +152,9 @@ pub const ChildSpec = struct {
     id: []const u8,
     /// Function to execute in the process
     start_fn: *const fn () void,
+    /// Optional context-aware start function. When present it is used instead
+    /// of `start_fn` and receives `context`.
+    start_context_fn: ?*const fn (?*anyopaque) void = null,
     /// Restart behavior when process terminates
     restart_type: enum {
         /// Always restart the process when it terminates
@@ -222,6 +225,8 @@ pub const ChildProcess = struct {
     spec: ChildSpec,
     /// Handle to the OS thread
     thread: ?Thread,
+    /// Heap context shared with the active worker thread.
+    run_context: ?*RunContext,
     /// Mutex for thread-safe operations
     mutex: Mutex,
     /// Current process state
@@ -235,6 +240,14 @@ pub const ChildProcess = struct {
     /// Memory allocator for process resources
     allocator: Allocator,
 
+    const RunContext = struct {
+        func: *const fn () void,
+        context_func: ?*const fn (?*anyopaque) void,
+        user_context: ?*anyopaque,
+        process: ?*ChildProcess,
+        mutex: Mutex,
+    };
+
     /// Initialize a new child process with the given specification.
     /// The process won't start until start() is called.
     ///
@@ -247,6 +260,7 @@ pub const ChildProcess = struct {
         return .{
             .spec = spec,
             .thread = null,
+            .run_context = null,
             .mutex = Mutex{},
             .state = .initial,
             .last_error = null,
@@ -272,104 +286,143 @@ pub const ChildProcess = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.state == .running) return ProcessError.AlreadyRunning;
+        if (self.state == .running or self.state == .suspended or self.state == .stopping) {
+            return ProcessError.AlreadyRunning;
+        }
+        if (self.thread != null and self.run_context != null) {
+            return ProcessError.AlreadyRunning;
+        }
 
-        const Context = struct {
-            func: *const fn () void,
-            process: *ChildProcess,
-        };
+        // Reap a previous completed run before reusing the handle slot.
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
 
         const wrapper = struct {
-            fn wrap(ctx: *const Context) void {
-                // Set initial state with mutex protection
-                {
-                    ctx.process.mutex.lock();
-                    ctx.process.state = .running;
-                    ctx.process.updateStats(); // Update stats on start
-                    ctx.process.mutex.unlock();
-                }
-
-                // Run the function and ensure cleanup
-                {
-                    defer {
-                        // Final state change and cleanup
-                        const held = ctx.process.mutex.tryLock();
-                        if (held) {
-                            ctx.process.state = .stopped;
-                            ctx.process.thread = null;
-                            ctx.process.updateStats(); // Update stats on stop
-                            ctx.process.mutex.unlock();
-                        }
-                        std.heap.page_allocator.destroy(ctx);
-                    }
-
-                    // Run the actual function
-                    nosuspend {
+            fn wrap(ctx: *RunContext) void {
+                nosuspend {
+                    if (ctx.context_func) |context_func| {
+                        context_func(ctx.user_context);
+                    } else {
                         (ctx.func)();
                     }
                 }
+
+                // A timeout may orphan this context before detaching the
+                // thread. Synchronize the pointer handoff so a returning worker
+                // never touches a destroyed ChildProcess.
+                ctx.mutex.lock();
+                if (ctx.process) |process| {
+                    process.mutex.lock();
+                    process.state = .stopped;
+                    process.run_context = null;
+                    process.updateStats();
+                    process.mutex.unlock();
+                }
+                ctx.mutex.unlock();
+                std.heap.page_allocator.destroy(ctx);
             }
         };
 
         // Allocate context that will be freed by the wrapper
-        const context = try std.heap.page_allocator.create(Context);
+        const context = try std.heap.page_allocator.create(RunContext);
         errdefer std.heap.page_allocator.destroy(context);
 
         context.* = .{
             .func = self.spec.start_fn,
+            .context_func = self.spec.start_context_fn,
+            .user_context = self.spec.context,
             .process = self,
+            .mutex = .{},
         };
 
-        // Spawn thread with error handling
+        // Publish running state before spawning. The worker's final transition
+        // takes this mutex, so it cannot race and be overwritten by start().
+        self.state = .running;
+        self.updateStats();
         self.thread = Thread.spawn(.{}, wrapper.wrap, .{context}) catch {
-            std.heap.page_allocator.destroy(context);
             self.state = .failed;
             return ProcessError.StartFailed;
         };
-
-        self.state = .running;
-        self.updateStats(); // Update stats after successful start
+        self.run_context = context;
     }
 
     /// Gracefully stop the process.
     /// Waits up to shutdown_timeout_ms for the process to stop.
-    /// If timeout is reached, the process is forcefully terminated.
+    /// If timeout is reached, the worker is detached from process state. Zig
+    /// threads cannot be forcefully terminated, so the function may continue
+    /// running, but it can no longer access this `ChildProcess` on return.
     ///
     /// Returns: Error if shutdown fails or times out
     pub fn stop(self: *ChildProcess) ProcessError!void {
         self.mutex.lock();
-        defer self.mutex.unlock();
 
-        // Allow stopping from any state except stopped
-        if (self.state == .stopped) return;
+        if (self.state == .stopped) {
+            const thread = self.thread;
+            self.thread = null;
+            self.mutex.unlock();
+            if (thread) |handle| handle.join();
+            return;
+        }
 
-        // Handle failed state
-        if (self.state == .failed) {
-            if (self.thread) |thread| {
-                thread.detach();
-                self.thread = null;
-            }
+        // A worker clears its run context before returning but leaves the
+        // joinable handle for its owner to reap. Treat that stable combination
+        // as completed even if an observer subsequently marked the process
+        // failed (for example, a supervisor health transition).
+        if (self.thread != null and self.run_context == null) {
+            const thread = self.thread.?;
+            self.thread = null;
+            self.state = .stopped;
+            self.mutex.unlock();
+            thread.join();
+            return;
+        }
+
+        if (self.state == .failed and self.thread == null) {
+            self.state = .stopped;
+            self.mutex.unlock();
             return;
         }
 
         self.state = .stopping;
 
         if (self.thread) |thread| {
-            const start_time = compat.milliTimestamp();
+            const start_time = compat.monotonicMilliTimestamp();
 
             while (true) {
-                const elapsed = compat.milliTimestamp() - start_time;
-                if (elapsed > self.spec.shutdown_timeout_ms) {
-                    thread.detach();
-                    self.thread = null;
-                    self.state = .failed;
-                    return ProcessError.ShutdownTimeout;
+                const elapsed = compat.monotonicMilliTimestamp() - start_time;
+                if (elapsed >= self.spec.shutdown_timeout_ms) {
+                    if (self.run_context) |context| {
+                        if (context.mutex.tryLock()) {
+                            context.process = null;
+                            context.mutex.unlock();
+                            self.run_context = null;
+                            self.thread = null;
+                            self.state = .failed;
+                            self.mutex.unlock();
+                            thread.detach();
+                            return ProcessError.ShutdownTimeout;
+                        }
+
+                        // The worker is already in its final handoff and is
+                        // waiting for this mutex. Let it finish, then reap it.
+                        self.mutex.unlock();
+                        thread.join();
+                        self.mutex.lock();
+                        self.thread = null;
+                        self.run_context = null;
+                        self.state = .stopped;
+                        self.mutex.unlock();
+                        return;
+                    }
                 }
 
                 // Check if thread has finished
                 if (self.state == .stopped) {
-                    thread.detach();
                     self.thread = null;
+                    self.mutex.unlock();
+                    thread.join();
                     return;
                 }
 
@@ -382,6 +435,8 @@ pub const ChildProcess = struct {
 
         self.state = .stopped;
         self.thread = null;
+        self.run_context = null;
+        self.mutex.unlock();
     }
 
     /// Check if the process is currently running.
@@ -412,6 +467,8 @@ pub const ChildProcess = struct {
     ///
     /// Returns: Error if signal cannot be processed
     pub fn sendSignal(self: *ChildProcess, signal: ProcessSignal) ProcessError!void {
+        if (signal == .terminate) return self.stop();
+
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -429,9 +486,7 @@ pub const ChildProcess = struct {
                 }
             },
             .terminate => {
-                if (self.state != .stopped) {
-                    try self.stop();
-                }
+                unreachable;
             },
             .custom => {
                 // Handle custom signals if implemented
@@ -446,21 +501,27 @@ pub const ChildProcess = struct {
     /// Returns: true if process is healthy
     pub fn checkHealth(self: *ChildProcess) bool {
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         // Update stats before health check
         self.updateStats();
 
-        if (self.state != .running) return false;
+        if (self.state != .running) {
+            self.mutex.unlock();
+            return false;
+        }
 
         if (self.spec.health_check_fn) |health_fn| {
+            self.mutex.unlock();
             const is_healthy = health_fn();
             if (!is_healthy) {
-                self.stats.health_check_failures += 1;
+                self.mutex.lock();
+                self.stats.health_check_failures +|= 1;
+                self.mutex.unlock();
             }
             return is_healthy;
         }
 
+        self.mutex.unlock();
         return true;
     }
 
@@ -492,8 +553,11 @@ pub const ChildProcess = struct {
             self.stats.start_time = current_time;
         }
         self.stats.last_active_time = current_time;
-        if (self.state == .running) {
-            self.stats.total_runtime_ms = current_time - self.stats.start_time;
+        if (self.state != .initial) {
+            self.stats.total_runtime_ms = @max(
+                self.stats.total_runtime_ms,
+                @max(@as(i64, 0), current_time - self.stats.start_time),
+            );
         }
     }
 
@@ -549,16 +613,23 @@ test "ChildProcess basic lifecycle" {
 }
 
 test "ChildProcess timeout handling" {
+    const Worker = struct {
+        var stop = std.atomic.Value(bool).init(false);
+        var completed = std.atomic.Value(bool).init(false);
+
+        fn run() void {
+            while (!stop.load(.acquire)) {
+                compat.sleep(1 * std.time.ns_per_ms);
+            }
+            completed.store(true, .release);
+        }
+    };
+    Worker.stop.store(false, .release);
+    Worker.completed.store(false, .release);
+
     const spec = ChildSpec{
         .id = "test_timeout",
-        .start_fn = struct {
-            fn testFn() void {
-                // Function that runs longer than timeout
-                while (true) {
-                    compat.sleep(10 * std.time.ns_per_ms);
-                }
-            }
-        }.testFn,
+        .start_fn = Worker.run,
         .restart_type = .temporary,
         .shutdown_timeout_ms = 50, // Short timeout for testing
     };
@@ -572,6 +643,103 @@ test "ChildProcess timeout handling" {
     // Try to stop - should timeout
     try std.testing.expectError(ProcessError.ShutdownTimeout, process.stop());
     try std.testing.expectEqual(ProcessState.failed, process.getState());
+
+    // Let the detached worker finish so this test does not leak a live thread.
+    Worker.stop.store(true, .release);
+    var waited_ms: u32 = 0;
+    while (!Worker.completed.load(.acquire) and waited_ms < 1000) : (waited_ms += 1) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(Worker.completed.load(.acquire));
+}
+
+test "ChildProcess finite worker may safely return after timeout detaches state" {
+    const Recorder = struct {
+        var completed = std.atomic.Value(bool).init(false);
+
+        fn run() void {
+            compat.sleep(20 * std.time.ns_per_ms);
+            completed.store(true, .release);
+        }
+    };
+    Recorder.completed.store(false, .release);
+
+    var process = ChildProcess.init(std.testing.allocator, .{
+        .id = "finite-timeout",
+        .start_fn = Recorder.run,
+        .restart_type = .temporary,
+        .shutdown_timeout_ms = 1,
+    });
+    try process.start();
+    try std.testing.expectError(ProcessError.ShutdownTimeout, process.stop());
+    try std.testing.expectEqual(ProcessState.failed, process.getState());
+    try std.testing.expect(process.thread == null);
+    try std.testing.expect(process.run_context == null);
+
+    while (!Recorder.completed.load(.acquire)) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    try process.stop();
+}
+
+test "ChildProcess reaps a completed handle even after a failure transition" {
+    const Worker = struct {
+        var completed = std.atomic.Value(bool).init(false);
+
+        fn run() void {
+            completed.store(true, .release);
+        }
+    };
+    Worker.completed.store(false, .release);
+
+    var process = ChildProcess.init(std.testing.allocator, .{
+        .id = "completed_then_failed",
+        .start_fn = Worker.run,
+        .restart_type = .permanent,
+        .shutdown_timeout_ms = 10,
+    });
+    try process.start();
+
+    var waited_ms: u32 = 0;
+    while (process.getState() != .stopped and waited_ms < 1000) : (waited_ms += 1) {
+        compat.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(Worker.completed.load(.acquire));
+
+    process.mutex.lock();
+    process.state = .failed;
+    process.mutex.unlock();
+
+    try process.stop();
+    try std.testing.expectEqual(ProcessState.stopped, process.getState());
+}
+
+test "ChildProcess does not restart over a failed worker that is still running" {
+    const Worker = struct {
+        var stop = std.atomic.Value(bool).init(false);
+
+        fn run() void {
+            while (!stop.load(.acquire)) {
+                compat.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+    };
+    Worker.stop.store(false, .release);
+
+    var process = ChildProcess.init(std.testing.allocator, .{
+        .id = "failed_but_running",
+        .start_fn = Worker.run,
+        .restart_type = .permanent,
+        .shutdown_timeout_ms = 10,
+    });
+    try process.start();
+    process.mutex.lock();
+    process.state = .failed;
+    process.mutex.unlock();
+
+    try std.testing.expectError(ProcessError.AlreadyRunning, process.start());
+    Worker.stop.store(true, .release);
+    process.stop() catch |err| try std.testing.expectEqual(ProcessError.ShutdownTimeout, err);
 }
 
 test "ChildProcess error handling" {
@@ -708,6 +876,52 @@ test "Process signals" {
     // Let it run a bit to ensure state is stable
     compat.sleep(5 * std.time.ns_per_ms);
     try std.testing.expectEqual(ProcessState.running, process.getState());
+}
+
+test "Process terminate signal does not recursively lock stop" {
+    var process = ChildProcess.init(std.testing.allocator, .{
+        .id = "terminate-signal",
+        .start_fn = struct {
+            fn run() void {
+                compat.sleep(5 * std.time.ns_per_ms);
+            }
+        }.run,
+        .restart_type = .temporary,
+        .shutdown_timeout_ms = 100,
+    });
+    defer process.stop() catch {};
+
+    try process.start();
+    try process.sendSignal(.terminate);
+    try std.testing.expectEqual(ProcessState.stopped, process.getState());
+    try std.testing.expect(process.thread == null);
+}
+
+test "Process health callback may inspect the process" {
+    const Recorder = struct {
+        var target: ?*ChildProcess = null;
+
+        fn run() void {
+            compat.sleep(20 * std.time.ns_per_ms);
+        }
+
+        fn health() bool {
+            return target.?.getState() == .running;
+        }
+    };
+
+    var process = ChildProcess.init(std.testing.allocator, .{
+        .id = "health-reentrant",
+        .start_fn = Recorder.run,
+        .restart_type = .temporary,
+        .shutdown_timeout_ms = 100,
+        .health_check_fn = Recorder.health,
+    });
+    defer process.stop() catch {};
+    Recorder.target = &process;
+
+    try process.start();
+    try std.testing.expect(process.checkHealth());
 }
 
 test "Process resource limits" {

@@ -55,9 +55,22 @@ const Protocol = struct {
     }
 
     fn readLine(stream: net.Stream, buffer: []u8) ?[]const u8 {
-        const n = stream.read(buffer) catch return null;
-        if (n == 0) return null;
-        return std.mem.trim(u8, buffer[0..n], "\r\n");
+        var used: usize = 0;
+        while (used < buffer.len) {
+            const n = stream.read(buffer[used..]) catch return null;
+            if (n == 0) return null;
+
+            const chunk = buffer[used .. used + n];
+            if (std.mem.indexOfScalar(u8, chunk, '\n')) |relative_end| {
+                var line_end = used + relative_end;
+                if (line_end > 0 and buffer[line_end - 1] == '\r') line_end -= 1;
+                return buffer[0..line_end];
+            }
+            used += n;
+        }
+
+        // Frames must be newline terminated and fit in the supplied buffer.
+        return null;
     }
 };
 
@@ -90,15 +103,24 @@ pub const DistributedRegistry = struct {
     ///
     /// Each `cluster_nodes` entry must be in `host:port` format.
     pub fn init(allocator: std.mem.Allocator, config: DistributedRegistryConfig) !DistributedRegistry {
+        if (config.sync_interval_ms == 0 or config.heartbeat_timeout_ms == 0) {
+            return error.InvalidConfiguration;
+        }
+
         var nodes: std.ArrayListUnmanaged(ClusterNode) = .empty;
-        errdefer nodes.deinit(allocator);
+        errdefer {
+            for (nodes.items) |node| allocator.free(node.address);
+            nodes.deinit(allocator);
+        }
 
         // Parse cluster nodes
         for (config.cluster_nodes) |node_str| {
             const colon_pos = std.mem.indexOfScalar(u8, node_str, ':') orelse return error.InvalidNodeFormat;
             const address = node_str[0..colon_pos];
             const port_str = node_str[colon_pos + 1 ..];
+            if (address.len == 0 or port_str.len == 0) return error.InvalidNodeFormat;
             const port = try std.fmt.parseInt(u16, port_str, 10);
+            if (port == 0) return error.InvalidNodeFormat;
 
             const address_copy = try allocator.dupe(u8, address);
             errdefer allocator.free(address_copy);
@@ -106,7 +128,7 @@ pub const DistributedRegistry = struct {
             try nodes.append(allocator, .{
                 .address = address_copy,
                 .port = port,
-                .last_seen_ms = compat.milliTimestamp(),
+                .last_seen_ms = compat.monotonicMilliTimestamp(),
                 .is_alive = true,
             });
         }
@@ -176,8 +198,11 @@ pub const DistributedRegistry = struct {
         mailbox: *ProcessMailbox,
         scope: RegistrationScope,
     ) !void {
+        if (scope == .global and !protocol.isValidName(name)) return error.InvalidName;
+
         // Always register locally
         try self.local_registry.register(name, mailbox);
+        errdefer self.local_registry.unregister(name);
 
         // If global, track the name for sync
         if (scope == .global) {
@@ -220,6 +245,8 @@ pub const DistributedRegistry = struct {
     ///
     /// Updates the remote registration cache on success.
     pub fn queryPeers(self: *DistributedRegistry, name: []const u8) ?RemoteProcessInfo {
+        if (!protocol.isValidName(name)) return null;
+
         self.mutex.lock();
         const nodes_snapshot = self.allocator.dupe(ClusterNode, self.nodes.items) catch return null;
         self.mutex.unlock();
@@ -269,12 +296,9 @@ pub const DistributedRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Remove old entry if exists
-        if (self.remote_registrations.fetchRemove(name)) |old| {
-            self.allocator.free(old.key);
-            self.allocator.free(old.value.name);
-            self.allocator.free(old.value.node_address);
-        }
+        // Reserve before removing the old entry so allocation failure cannot
+        // erase a previously valid cache record.
+        try self.remote_registrations.ensureUnusedCapacity(1);
 
         const name_copy = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(name_copy);
@@ -283,7 +307,13 @@ pub const DistributedRegistry = struct {
         const info_addr = try self.allocator.dupe(u8, info.node_address);
         errdefer self.allocator.free(info_addr);
 
-        try self.remote_registrations.put(name_copy, .{
+        if (self.remote_registrations.fetchRemove(name)) |old| {
+            self.allocator.free(old.key);
+            self.allocator.free(old.value.name);
+            self.allocator.free(old.value.node_address);
+        }
+
+        self.remote_registrations.putAssumeCapacityNoClobber(name_copy, .{
             .name = info_name,
             .node_address = info_addr,
             .node_port = info.node_port,
@@ -336,7 +366,7 @@ pub const DistributedRegistry = struct {
         var buf: [64]u8 = undefined;
         if (Protocol.readLine(stream, &buf)) |line| {
             if (std.mem.eql(u8, line, "ALIVE")) {
-                node.last_seen_ms = compat.milliTimestamp();
+                node.last_seen_ms = compat.monotonicMilliTimestamp();
                 node.is_alive = true;
                 return;
             }
@@ -422,15 +452,31 @@ pub const DistributedRegistry = struct {
     /// calls it for you. Returns `error.AlreadySyncing` if sync is already
     /// active.
     pub fn startSync(self: *DistributedRegistry) !void {
-        if (self.should_sync.load(.acquire)) return error.AlreadySyncing;
+        self.mutex.lock();
+        if (self.should_sync.load(.acquire) or self.listener_thread != null or self.sync_thread != null) {
+            self.mutex.unlock();
+            return error.AlreadySyncing;
+        }
 
         self.should_sync.store(true, .release);
 
         // Start listener thread
-        self.listener_thread = try std.Thread.spawn(.{}, listenerLoop, .{self});
+        self.listener_thread = std.Thread.spawn(.{}, listenerLoop, .{self}) catch |err| {
+            self.should_sync.store(false, .release);
+            self.mutex.unlock();
+            return err;
+        };
 
         // Start sync thread
-        self.sync_thread = try std.Thread.spawn(.{}, syncLoop, .{self});
+        self.sync_thread = std.Thread.spawn(.{}, syncLoop, .{self}) catch |err| {
+            self.should_sync.store(false, .release);
+            const listener = self.listener_thread;
+            self.listener_thread = null;
+            self.mutex.unlock();
+            if (listener) |thread| thread.join();
+            return err;
+        };
+        self.mutex.unlock();
     }
 
     /// Stop synchronization and listener threads.
@@ -438,36 +484,57 @@ pub const DistributedRegistry = struct {
     /// This closes the listener socket to unblock `accept()` and then joins the
     /// background threads. It is safe to call when sync is not active.
     pub fn stopSync(self: *DistributedRegistry) void {
-        if (!self.should_sync.load(.acquire)) return;
-
         self.should_sync.store(false, .release);
 
-        // Close listener socket to unblock accept()
-        if (self.listener_fd) |fd| {
-            compat.sockets.close(fd);
-            self.listener_fd = null;
-        }
+        self.mutex.lock();
+        const listener_fd = self.listener_fd;
+        self.listener_fd = null;
+        const listener_thread = self.listener_thread;
+        self.listener_thread = null;
+        const sync_thread = self.sync_thread;
+        self.sync_thread = null;
+        self.mutex.unlock();
 
-        if (self.listener_thread) |t| {
-            t.join();
-            self.listener_thread = null;
-        }
-        if (self.sync_thread) |t| {
-            t.join();
-            self.sync_thread = null;
-        }
+        // Close listener socket to unblock accept().
+        if (listener_fd) |fd| compat.sockets.close(fd);
+
+        if (listener_thread) |thread| thread.join();
+        if (sync_thread) |thread| thread.join();
     }
 
     /// TCP listener loop - accepts incoming protocol connections
     fn listenerLoop(self: *DistributedRegistry) void {
-        const addr = net.parseIp4("0.0.0.0", self.config.listen_port) catch return;
-        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
+        const addr = net.parseIp4("0.0.0.0", self.config.listen_port) catch {
+            self.should_sync.store(false, .release);
+            return;
+        };
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
+            self.should_sync.store(false, .release);
+            return;
+        };
 
+        self.mutex.lock();
         self.listener_fd = fd;
+        self.mutex.unlock();
+        defer {
+            self.mutex.lock();
+            const still_owned = self.listener_fd != null and self.listener_fd.? == fd;
+            if (still_owned) self.listener_fd = null;
+            self.mutex.unlock();
+            if (still_owned) compat.sockets.close(fd);
+        }
+
+        if (!self.should_sync.load(.acquire)) return;
 
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
-        compat.sockets.bind(fd, &addr.any, addr.getOsSockLen()) catch return;
-        compat.sockets.listen(fd, 32) catch return;
+        compat.sockets.bind(fd, &addr.any, addr.getOsSockLen()) catch {
+            self.should_sync.store(false, .release);
+            return;
+        };
+        compat.sockets.listen(fd, 32) catch {
+            self.should_sync.store(false, .release);
+            return;
+        };
 
         var server = net.Server{
             .stream = .{ .handle = fd },
@@ -495,7 +562,7 @@ pub const DistributedRegistry = struct {
                 self.sendHeartbeat(node);
 
                 // Mark dead if heartbeat timeout exceeded
-                const now_ms = compat.milliTimestamp();
+                const now_ms = compat.monotonicMilliTimestamp();
                 if (now_ms - node.last_seen_ms > self.config.heartbeat_timeout_ms) {
                     node.is_alive = false;
                 }
@@ -537,6 +604,35 @@ test "DistributedRegistry basic operations" {
     try std.testing.expect(found != null);
 }
 
+test "DistributedRegistry init cleans up partially copied nodes" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var registry = try DistributedRegistry.init(allocator, .{
+                .cluster_nodes = &.{ "127.0.0.1:9001", "127.0.0.2:9002", "127.0.0.3:9003" },
+            });
+            defer registry.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "DistributedRegistry global registration rolls back local state on OOM" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var registry = try DistributedRegistry.init(failing.allocator(), .{ .cluster_nodes = &.{} });
+    defer registry.deinit();
+    var mailbox = ProcessMailbox.init(std.testing.allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+
+    // Pre-size the local registry so the target operation allocates its copied
+    // local name and then its copied global name.
+    try registry.register("seed", &mailbox, .local);
+    registry.local_registry.unregister("seed");
+    failing.fail_index = failing.alloc_index + 1;
+
+    try std.testing.expectError(error.OutOfMemory, registry.register("target", &mailbox, .global));
+    try std.testing.expect(registry.whereis("target") == null);
+}
+
 test "DistributedRegistry global scope tracks names" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -558,6 +654,18 @@ test "DistributedRegistry global scope tracks names" {
 
     // Should be tracked as a global name
     try std.testing.expect(registry.global_names.contains("global_proc"));
+}
+
+test "DistributedRegistry rejects names that cannot be encoded in one frame" {
+    const allocator = std.testing.allocator;
+    var registry = try DistributedRegistry.init(allocator, .{ .cluster_nodes = &.{} });
+    defer registry.deinit();
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+
+    try std.testing.expectError(error.InvalidName, registry.register("two words", &mailbox, .global));
+    try std.testing.expect(registry.whereis("two words") == null);
+    try std.testing.expect(registry.queryPeers("line\nbreak") == null);
 }
 
 test "DistributedRegistry whereisGlobal returns local" {
@@ -594,4 +702,41 @@ test "DistributedRegistry whereisGlobal returns null for unknown" {
 
     const info = registry.whereisGlobal("nonexistent");
     try std.testing.expect(info == null);
+}
+
+test "DistributedRegistry rejects invalid timing and node configuration" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidConfiguration, DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .sync_interval_ms = 0,
+    }));
+    try std.testing.expectError(error.InvalidConfiguration, DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .heartbeat_timeout_ms = 0,
+    }));
+    try std.testing.expectError(error.InvalidNodeFormat, DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{":9001"},
+    }));
+    try std.testing.expectError(error.InvalidNodeFormat, DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{"127.0.0.1:0"},
+    }));
+}
+
+test "DistributedRegistry repeatedly starts and stops background threads" {
+    const allocator = std.testing.allocator;
+    var registry = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .sync_interval_ms = 1,
+        .listen_port = 0,
+    });
+    defer registry.deinit();
+
+    for (0..4) |_| {
+        try registry.startSync();
+        registry.stopSync();
+        try std.testing.expect(!registry.should_sync.load(.acquire));
+        try std.testing.expect(registry.listener_thread == null);
+        try std.testing.expect(registry.sync_thread == null);
+        try std.testing.expect(registry.listener_fd == null);
+    }
 }
