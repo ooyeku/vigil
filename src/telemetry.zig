@@ -242,12 +242,16 @@ pub const TelemetryEmitter = struct {
     allocator: std.mem.Allocator,
     /// Registered handlers.
     handlers: std.ArrayListUnmanaged(HandlerEntry),
-    /// Protects handler registration and enabled state.
+    /// Protects handler registration.
     mutex: compat.Mutex,
-    /// Whether `emit()` dispatches events.
-    enabled: bool = true,
+    /// Whether `emit()` dispatches events. Atomic so the disabled fast path
+    /// costs one load with no lock.
+    enabled: std.atomic.Value(bool),
+    /// Registered handler count. Atomic so the no-handler fast path skips the
+    /// lock and handler snapshot entirely.
+    handler_count: std.atomic.Value(usize),
     /// Optional attached timeline that records every emitted event.
-    timeline: ?*EventTimeline = null,
+    timeline: std.atomic.Value(?*EventTimeline),
 
     const HandlerEntry = struct {
         event_type: EventType,
@@ -260,7 +264,9 @@ pub const TelemetryEmitter = struct {
             .allocator = allocator,
             .handlers = .empty,
             .mutex = .{},
-            .enabled = true,
+            .enabled = std.atomic.Value(bool).init(true),
+            .handler_count = std.atomic.Value(usize).init(0),
+            .timeline = std.atomic.Value(?*EventTimeline).init(null),
         };
     }
 
@@ -283,6 +289,7 @@ pub const TelemetryEmitter = struct {
             .event_type = event_type,
             .handler = handler,
         });
+        self.handler_count.store(self.handlers.items.len, .release);
     }
 
     /// Attach a timeline that records every event this emitter dispatches.
@@ -290,45 +297,75 @@ pub const TelemetryEmitter = struct {
     /// The timeline is not owned by the emitter and must outlive the
     /// attachment. Pass through `detachTimeline()` before destroying it.
     pub fn attachTimeline(self: *TelemetryEmitter, timeline: *EventTimeline) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.timeline = timeline;
+        self.timeline.store(timeline, .release);
     }
 
     /// Detach the currently attached timeline, if any.
     pub fn detachTimeline(self: *TelemetryEmitter) void {
+        self.timeline.store(null, .release);
+    }
+
+    /// Return whether an `emit()` for `event_type` would reach a handler or
+    /// timeline right now.
+    ///
+    /// Callers with expensive event construction (formatting metadata,
+    /// snapshotting state) can use this to skip the work entirely when nobody
+    /// is listening.
+    pub fn wouldEmit(self: *TelemetryEmitter, event_type: EventType) bool {
+        if (!self.enabled.load(.acquire)) return false;
+        if (self.timeline.load(.acquire) != null) return true;
+        if (self.handler_count.load(.acquire) == 0) return false;
+
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.timeline = null;
+        for (self.handlers.items) |entry| {
+            if (entry.event_type == event_type) return true;
+        }
+        return false;
     }
 
     /// Dispatch an event to matching handlers.
     ///
-    /// Dispatch is synchronous and best-effort. If a temporary handler snapshot
-    /// cannot be allocated, the event is dropped. An attached timeline records
-    /// the event even when no handler matches.
+    /// Dispatch is synchronous and best-effort. An attached timeline records
+    /// the event even when no handler matches. The common cases are cheap: a
+    /// disabled emitter costs one atomic load, an emitter with no handlers
+    /// never takes the lock, and dispatch to small handler sets is
+    /// allocation-free.
     pub fn emit(self: *TelemetryEmitter, event: Event) void {
-        self.mutex.lock();
-        if (!self.enabled) {
-            self.mutex.unlock();
+        if (!self.enabled.load(.acquire)) return;
+
+        const timeline = self.timeline.load(.acquire);
+        if (self.handler_count.load(.acquire) == 0) {
+            if (timeline) |t| t.record(event);
             return;
         }
 
-        const timeline = self.timeline;
+        // Copy handlers so registered callbacks may add or remove handlers
+        // without invalidating this dispatch. Small sets copy to the stack.
+        var stack_snapshot: [16]HandlerEntry = undefined;
+        var heap_snapshot: ?[]HandlerEntry = null;
 
-        // Make a true copy of handlers to avoid use-after-free if handlers are modified.
-        const handlers_snapshot = self.allocator.alloc(HandlerEntry, self.handlers.items.len) catch {
-            self.mutex.unlock();
-            if (timeline) |t| t.record(event);
-            return;
+        self.mutex.lock();
+        const count = self.handlers.items.len;
+        const snapshot: []const HandlerEntry = if (count <= stack_snapshot.len) blk: {
+            @memcpy(stack_snapshot[0..count], self.handlers.items);
+            break :blk stack_snapshot[0..count];
+        } else blk: {
+            const copy = self.allocator.alloc(HandlerEntry, count) catch {
+                self.mutex.unlock();
+                if (timeline) |t| t.record(event);
+                return;
+            };
+            @memcpy(copy, self.handlers.items);
+            heap_snapshot = copy;
+            break :blk copy;
         };
-        @memcpy(handlers_snapshot, self.handlers.items);
         self.mutex.unlock();
-        defer self.allocator.free(handlers_snapshot);
+        defer if (heap_snapshot) |copy| self.allocator.free(copy);
 
         if (timeline) |t| t.record(event);
 
-        for (handlers_snapshot) |entry| {
+        for (snapshot) |entry| {
             if (entry.event_type == event.event_type) {
                 entry.handler(event);
             }
@@ -337,9 +374,7 @@ pub const TelemetryEmitter = struct {
 
     /// Enable or disable event emission.
     pub fn setEnabled(self: *TelemetryEmitter, enabled: bool) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.enabled = enabled;
+        self.enabled.store(enabled, .release);
     }
 
     /// Remove all handlers for an event type.
@@ -355,13 +390,12 @@ pub const TelemetryEmitter = struct {
                 i += 1;
             }
         }
+        self.handler_count.store(self.handlers.items.len, .release);
     }
 
     /// Return the number of registered handlers.
     pub fn handlerCount(self: *TelemetryEmitter) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.handlers.items.len;
+        return self.handler_count.load(.acquire);
     }
 };
 
@@ -581,4 +615,36 @@ test "TelemetryEmitter records emitted events into an attached timeline" {
     emitter.detachTimeline();
     emitter.emit(.{ .event_type = .message_sent, .timestamp_ms = 12, .metadata = null });
     try std.testing.expectEqual(@as(usize, 1), timeline.count());
+}
+
+test "TelemetryEmitter wouldEmit reflects enabled state, handlers, and timeline" {
+    var emitter = TelemetryEmitter.init(std.testing.allocator);
+    defer emitter.deinit();
+
+    // Nothing listening yet.
+    try std.testing.expect(!emitter.wouldEmit(.message_sent));
+
+    const handler = struct {
+        fn handle(_: Event) void {}
+    }.handle;
+    try emitter.on(.message_sent, handler);
+    try std.testing.expect(emitter.wouldEmit(.message_sent));
+    try std.testing.expect(!emitter.wouldEmit(.message_dropped));
+
+    // Disabled emitters never emit.
+    emitter.setEnabled(false);
+    try std.testing.expect(!emitter.wouldEmit(.message_sent));
+    emitter.setEnabled(true);
+
+    // A timeline listens to every event type.
+    var timeline = try EventTimeline.init(std.testing.allocator, 4);
+    defer timeline.deinit();
+    emitter.attachTimeline(&timeline);
+    try std.testing.expect(emitter.wouldEmit(.message_dropped));
+    emitter.detachTimeline();
+    try std.testing.expect(!emitter.wouldEmit(.message_dropped));
+
+    emitter.removeHandlers(.message_sent);
+    try std.testing.expect(!emitter.wouldEmit(.message_sent));
+    try std.testing.expectEqual(@as(usize, 0), emitter.handlerCount());
 }
