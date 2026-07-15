@@ -40,6 +40,7 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const Mutex = compat.Mutex;
+const RingQueue = @import("ring_queue.zig").RingQueue;
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
@@ -681,9 +682,9 @@ pub const MailboxConfig = struct {
 /// ```
 pub const ProcessMailbox = struct {
     /// FIFO queue used when priority queues are disabled.
-    messages: std.ArrayList(Message),
+    messages: RingQueue(Message),
     /// Priority queues indexed by `MessagePriority.toInt()`.
-    priority_queues: ?[5]std.ArrayList(Message),
+    priority_queues: ?[5]RingQueue(Message),
     /// Bounded queue for undeliverable messages when enabled.
     deadletter_queue: ?std.ArrayList(DeadLetterEntry),
     /// Monotonic identifier assigned to the next dead-letter entry.
@@ -725,7 +726,7 @@ pub const ProcessMailbox = struct {
 
     /// Initialize an empty mailbox.
     pub fn init(allocator: Allocator, config: MailboxConfig) ProcessMailbox {
-        const priority_queues: ?[5]std.ArrayList(Message) = if (config.priority_queues)
+        const priority_queues: ?[5]RingQueue(Message) = if (config.priority_queues)
             .{ .empty, .empty, .empty, .empty, .empty }
         else
             null;
@@ -752,7 +753,7 @@ pub const ProcessMailbox = struct {
         defer self.mutex.unlock();
 
         // Clean up main message queue
-        for (self.messages.items) |*msg| {
+        while (self.messages.popFront()) |msg| {
             msg.deinit();
         }
         self.messages.deinit(self.allocator);
@@ -760,7 +761,7 @@ pub const ProcessMailbox = struct {
         // Clean up priority queues if enabled
         if (self.priority_queues) |*queues| {
             for (queues) |*queue| {
-                for (queue.items) |*msg| {
+                while (queue.popFront()) |msg| {
                     msg.deinit();
                 }
                 queue.deinit(self.allocator);
@@ -965,30 +966,13 @@ pub const ProcessMailbox = struct {
         // Remove all expired messages first
         if (self.priority_queues) |*queues| {
             for (queues) |*queue| {
-                var i: usize = 0;
-                while (i < queue.items.len) {
-                    if (queue.items[i].isExpiredAt(now_ms)) {
-                        var msg = queue.orderedRemove(i);
-                        msg.deinit();
-                        self.stats.messages_expired +|= 1;
-                        self.stats.total_size_bytes -|= msg.metadata.size_bytes;
-                    } else {
-                        i += 1;
-                    }
-                }
+                self.expireQueueLocked(queue, now_ms);
             }
 
-            // Now try to get a valid message from priority queues
+            // Now take the front of the highest-priority non-empty queue.
             for (queues) |*queue| {
-                if (queue.items.len > 0) {
-                    if (queue.items[0].isExpiredAt(now_ms)) {
-                        var msg = queue.orderedRemove(0);
-                        msg.deinit();
-                        self.stats.messages_expired +|= 1;
-                        self.stats.total_size_bytes -|= msg.metadata.size_bytes;
-                        continue;
-                    }
-                    var msg = queue.orderedRemove(0);
+                if (queue.popFront()) |taken| {
+                    var msg = taken;
                     msg.metadata.attempt_count +|= 1;
                     self.stats.messages_sent +|= 1;
                     self.stats.total_size_bytes -|= msg.metadata.size_bytes;
@@ -999,36 +983,27 @@ pub const ProcessMailbox = struct {
         }
 
         // Standard queue handling
-        var i: usize = 0;
-        while (i < self.messages.items.len) {
-            if (self.messages.items[i].isExpiredAt(now_ms)) {
-                var msg = self.messages.orderedRemove(i);
-                msg.deinit();
-                self.stats.messages_expired +|= 1;
-                self.stats.total_size_bytes -|= msg.metadata.size_bytes;
-            } else {
-                i += 1;
-            }
-        }
+        self.expireQueueLocked(&self.messages, now_ms);
 
-        if (self.messages.items.len == 0) {
-            return MessageError.EmptyMailbox;
-        }
-
-        // Double check expiration of the first message
-        if (self.messages.items[0].isExpiredAt(now_ms)) {
-            var msg = self.messages.orderedRemove(0);
-            msg.deinit();
-            self.stats.messages_expired +|= 1;
-            self.stats.total_size_bytes -|= msg.metadata.size_bytes;
-            return MessageError.EmptyMailbox;
-        }
-
-        var msg = self.messages.orderedRemove(0);
+        var msg = self.messages.popFront() orelse return MessageError.EmptyMailbox;
         msg.metadata.attempt_count +|= 1;
         self.stats.messages_sent +|= 1;
         self.stats.total_size_bytes -|= msg.metadata.size_bytes;
         return msg;
+    }
+
+    fn expireQueueLocked(self: *ProcessMailbox, queue: *RingQueue(Message), now_ms: i64) void {
+        var i: usize = 0;
+        while (i < queue.len()) {
+            if (queue.at(i).isExpiredAt(now_ms)) {
+                const msg = queue.removeAt(i);
+                self.stats.messages_expired +|= 1;
+                self.stats.total_size_bytes -|= msg.metadata.size_bytes;
+                msg.deinit();
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Drop and deinitialize the oldest active message without delivering it.
@@ -1043,17 +1018,18 @@ pub const ProcessMailbox = struct {
         if (self.priority_queues) |*queues| {
             var selected_queue: ?usize = null;
             var oldest_timestamp: i64 = std.math.maxInt(i64);
-            for (queues, 0..) |queue, index| {
-                if (queue.items.len > 0 and queue.items[0].metadata.timestamp < oldest_timestamp) {
-                    selected_queue = index;
-                    oldest_timestamp = queue.items[0].metadata.timestamp;
+            for (queues, 0..) |*queue, index| {
+                if (queue.peekFront()) |front| {
+                    if (front.metadata.timestamp < oldest_timestamp) {
+                        selected_queue = index;
+                        oldest_timestamp = front.metadata.timestamp;
+                    }
                 }
             }
             const index = selected_queue orelse return false;
-            dropped = queues[index].orderedRemove(0);
+            dropped = queues[index].popFront().?;
         } else {
-            if (self.messages.items.len == 0) return false;
-            dropped = self.messages.orderedRemove(0);
+            dropped = self.messages.popFront() orelse return false;
         }
 
         self.stats.messages_dropped +|= 1;
@@ -1098,16 +1074,16 @@ pub const ProcessMailbox = struct {
         };
 
         const now_ms = compat.milliTimestamp();
-        if (self.priority_queues) |queues| {
-            for (queues) |queue| {
-                for (queue.items) |msg| {
-                    entries[written] = try snapshotQueuedMessage(allocator, msg, now_ms);
+        if (self.priority_queues) |*queues| {
+            for (queues) |*queue| {
+                for (0..queue.len()) |i| {
+                    entries[written] = try snapshotQueuedMessage(allocator, queue.at(i).*, now_ms);
                     written += 1;
                 }
             }
         } else {
-            for (self.messages.items) |msg| {
-                entries[written] = try snapshotQueuedMessage(allocator, msg, now_ms);
+            for (0..self.messages.len()) |i| {
+                entries[written] = try snapshotQueuedMessage(allocator, self.messages.at(i).*, now_ms);
                 written += 1;
             }
         }
@@ -1137,19 +1113,19 @@ pub const ProcessMailbox = struct {
     }
 
     fn activeQueuedCountLocked(self: *ProcessMailbox) usize {
-        if (self.priority_queues) |queues| {
+        if (self.priority_queues) |*queues| {
             var total: usize = 0;
-            for (queues) |queue| total +|= queue.items.len;
+            for (queues) |*queue| total +|= queue.len();
             return total;
         }
-        return self.messages.items.len;
+        return self.messages.len();
     }
 
     fn appendActiveLocked(self: *ProcessMailbox, msg: Message, count_received: bool) MessageError!void {
         if (self.priority_queues) |*queues| {
-            queues[msg.priority.toInt()].append(self.allocator, msg) catch return MessageError.OutOfMemory;
+            queues[msg.priority.toInt()].pushBack(self.allocator, msg) catch return MessageError.OutOfMemory;
         } else {
-            self.messages.append(self.allocator, msg) catch return MessageError.OutOfMemory;
+            self.messages.pushBack(self.allocator, msg) catch return MessageError.OutOfMemory;
         }
         if (count_received) self.stats.messages_received +|= 1;
         self.stats.total_size_bytes +|= msg.metadata.size_bytes;
@@ -1279,7 +1255,7 @@ test "Message TTL and expiration" {
     try mailbox.send(msg);
 
     // Set timestamp in the past to force expiration on next receive
-    mailbox.messages.items[0].metadata.timestamp -= 2_000;
+    mailbox.messages.at(0).metadata.timestamp -= 2_000;
 
     // Try to receive - should get EmptyMailbox since expired messages are removed
     try testing.expectError(MessageError.EmptyMailbox, mailbox.receive());
@@ -1615,4 +1591,8 @@ test "ProcessMailbox snapshotQueue reports queued messages without consuming" {
     var received = try mailbox.receive();
     defer received.deinit();
     try testing.expectEqualStrings("critical-msg", received.id);
+}
+
+test {
+    _ = @import("ring_queue.zig");
 }
