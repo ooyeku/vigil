@@ -1,6 +1,10 @@
 //! Distributed registry for Vigil.
 //!
 //! Cross-process name resolution with TCP-based cluster communication.
+//! Peer communication uses one persistent connection per peer with
+//! exponential reconnect backoff; registration sync is batched into single
+//! writes, and the listener serves each incoming connection on its own
+//! thread so persistent peers do not block one another.
 
 const std = @import("std");
 const posix = std.posix;
@@ -11,6 +15,10 @@ const net = compat.net;
 const protocol = @import("distributed_protocol.zig");
 
 /// Peer node tracked by a distributed registry.
+///
+/// Connection state is owned by the registry: one persistent socket per
+/// peer, serialized by `io_mutex`, reconnected with exponential backoff
+/// after failures.
 pub const ClusterNode = struct {
     /// IPv4 address or host string used for TCP connections.
     address: []const u8,
@@ -20,6 +28,17 @@ pub const ClusterNode = struct {
     last_seen_ms: i64,
     /// Whether the node is currently considered reachable.
     is_alive: bool,
+    /// Serializes request/response exchanges on the persistent connection
+    /// and guards the connection fields below.
+    io_mutex: compat.Mutex = .{},
+    /// Open persistent connection, when one exists.
+    conn_fd: ?posix.socket_t = null,
+    /// Consecutive failed exchanges since the last success.
+    consecutive_failures: u32 = 0,
+    /// Monotonic time before which reconnect attempts are skipped.
+    next_attempt_ms: i64 = 0,
+    /// Lifetime count of connections established to this peer.
+    reconnects: u64 = 0,
 };
 
 /// Information about a process registered on a remote node.
@@ -42,6 +61,51 @@ pub const DistributedRegistryConfig = struct {
     heartbeat_timeout_ms: u32 = 5000,
     /// Local TCP listen port for registry protocol requests.
     listen_port: u16 = 9100,
+};
+
+/// Snapshot of one peer's health and connection state.
+pub const PeerSnapshot = struct {
+    /// Copied peer address.
+    address: []const u8,
+    /// Peer listen port.
+    port: u16,
+    /// Whether the peer is currently considered reachable.
+    is_alive: bool,
+    /// Last successful contact time in milliseconds.
+    last_seen_ms: i64,
+    /// Consecutive failed exchanges since the last success.
+    consecutive_failures: u32,
+    /// Lifetime count of connections established.
+    reconnects: u64,
+};
+
+/// Owned snapshot of distributed registry health and counters.
+pub const DistributedRegistrySnapshot = struct {
+    allocator: std.mem.Allocator,
+    /// Per-peer health with copied addresses.
+    peers: []PeerSnapshot,
+    /// Names registered locally.
+    local_names: usize,
+    /// Names cached from remote peers.
+    cached_remote_names: usize,
+    /// `whereisGlobal` answers served from local or cached state.
+    cache_hits: u64,
+    /// `whereisGlobal` misses that found nothing cached.
+    cache_misses: u64,
+    /// WHERE queries sent to peers.
+    peer_queries: u64,
+    /// Heartbeats sent to peers.
+    heartbeats: u64,
+    /// Registration frames synced to peers.
+    sync_frames: u64,
+
+    /// Release copied addresses and snapshot storage.
+    pub fn deinit(self: *DistributedRegistrySnapshot) void {
+        for (self.peers) |peer| {
+            self.allocator.free(peer.address);
+        }
+        self.allocator.free(self.peers);
+    }
 };
 
 /// Text-based v2 protocol opcodes (newline-delimited)
@@ -72,7 +136,23 @@ const Protocol = struct {
         // Frames must be newline terminated and fit in the supplied buffer.
         return null;
     }
+
+    /// Consume `expected` newline-terminated replies, discarding content.
+    fn drainReplies(stream: net.Stream, expected: usize) bool {
+        var buffer: [512]u8 = undefined;
+        var seen: usize = 0;
+        while (seen < expected) {
+            const n = stream.read(&buffer) catch return false;
+            if (n == 0) return false;
+            seen += std.mem.count(u8, buffer[0..n], "\n");
+        }
+        return true;
+    }
 };
+
+/// Reconnect backoff bounds for failed peers.
+const initial_backoff_ms: i64 = 250;
+const max_backoff_ms: i64 = 30_000;
 
 /// Local registry extended with cluster name resolution.
 ///
@@ -86,8 +166,8 @@ pub const DistributedRegistry = struct {
     allocator: std.mem.Allocator,
     /// Static cluster configuration.
     config: DistributedRegistryConfig,
-    /// Known peer nodes.
-    nodes: std.ArrayListUnmanaged(ClusterNode),
+    /// Known peer nodes at stable addresses.
+    nodes: std.ArrayListUnmanaged(*ClusterNode),
     /// Names that were registered locally with global scope
     global_names: std.StringArrayHashMapUnmanaged(void),
     /// Cache of names known to exist on remote nodes
@@ -98,6 +178,16 @@ pub const DistributedRegistry = struct {
     should_sync: std.atomic.Value(bool),
     /// Listening socket fd, stored so stopSync() can close it to unblock accept()
     listener_fd: ?posix.socket_t = null,
+    /// Per-connection handler threads spawned by the listener.
+    conn_threads: std.ArrayListUnmanaged(std.Thread),
+    /// Fds currently owned by connection handlers.
+    conn_fds: std.ArrayListUnmanaged(posix.socket_t),
+    /// Lifetime counters for metrics snapshots.
+    cache_hits: std.atomic.Value(u64),
+    cache_misses: std.atomic.Value(u64),
+    peer_queries: std.atomic.Value(u64),
+    heartbeats: std.atomic.Value(u64),
+    sync_frames: std.atomic.Value(u64),
 
     /// Initialize a distributed registry from `config`.
     ///
@@ -107,9 +197,12 @@ pub const DistributedRegistry = struct {
             return error.InvalidConfiguration;
         }
 
-        var nodes: std.ArrayListUnmanaged(ClusterNode) = .empty;
+        var nodes: std.ArrayListUnmanaged(*ClusterNode) = .empty;
         errdefer {
-            for (nodes.items) |node| allocator.free(node.address);
+            for (nodes.items) |node| {
+                allocator.free(node.address);
+                allocator.destroy(node);
+            }
             nodes.deinit(allocator);
         }
 
@@ -122,15 +215,19 @@ pub const DistributedRegistry = struct {
             const port = try std.fmt.parseInt(u16, port_str, 10);
             if (port == 0) return error.InvalidNodeFormat;
 
+            const node = try allocator.create(ClusterNode);
+            errdefer allocator.destroy(node);
+
             const address_copy = try allocator.dupe(u8, address);
             errdefer allocator.free(address_copy);
 
-            try nodes.append(allocator, .{
+            node.* = .{
                 .address = address_copy,
                 .port = port,
                 .last_seen_ms = compat.monotonicMilliTimestamp(),
                 .is_alive = true,
-            });
+            };
+            try nodes.append(allocator, node);
         }
 
         return .{
@@ -145,6 +242,13 @@ pub const DistributedRegistry = struct {
             .listener_thread = null,
             .should_sync = std.atomic.Value(bool).init(false),
             .listener_fd = null,
+            .conn_threads = .empty,
+            .conn_fds = .empty,
+            .cache_hits = std.atomic.Value(u64).init(0),
+            .cache_misses = std.atomic.Value(u64).init(0),
+            .peer_queries = std.atomic.Value(u64).init(0),
+            .heartbeats = std.atomic.Value(u64).init(0),
+            .sync_frames = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -152,10 +256,14 @@ pub const DistributedRegistry = struct {
     pub fn deinit(self: *DistributedRegistry) void {
         self.stopSync();
 
-        for (self.nodes.items) |*node| {
+        for (self.nodes.items) |node| {
+            if (node.conn_fd) |fd| compat.sockets.close(fd);
             self.allocator.free(node.address);
+            self.allocator.destroy(node);
         }
         self.nodes.deinit(self.allocator);
+        self.conn_threads.deinit(self.allocator);
+        self.conn_fds.deinit(self.allocator);
 
         // Free global_names keys
         {
@@ -228,6 +336,7 @@ pub const DistributedRegistry = struct {
     pub fn whereisGlobal(self: *DistributedRegistry, name: []const u8) ?RemoteProcessInfo {
         // Check local first
         if (self.local_registry.whereis(name) != null) {
+            _ = self.cache_hits.fetchAdd(1, .monotonic);
             return RemoteProcessInfo{
                 .name = name,
                 .node_address = "local",
@@ -238,22 +347,26 @@ pub const DistributedRegistry = struct {
         // Check remote cache
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.remote_registrations.get(name);
+        if (self.remote_registrations.get(name)) |info| {
+            _ = self.cache_hits.fetchAdd(1, .monotonic);
+            return info;
+        }
+        _ = self.cache_misses.fetchAdd(1, .monotonic);
+        return null;
     }
 
     /// Actively query all peer nodes for a name.
     ///
-    /// Updates the remote registration cache on success.
+    /// Updates the remote registration cache on success. Queries reuse each
+    /// peer's persistent connection; unreachable peers are skipped while
+    /// their reconnect backoff is pending.
     pub fn queryPeers(self: *DistributedRegistry, name: []const u8) ?RemoteProcessInfo {
         if (!protocol.isValidName(name)) return null;
 
-        self.mutex.lock();
-        const nodes_snapshot = self.allocator.dupe(ClusterNode, self.nodes.items) catch return null;
-        self.mutex.unlock();
-        defer self.allocator.free(nodes_snapshot);
+        const peers = self.snapshotPeers() orelse return null;
+        defer self.allocator.free(peers);
 
-        for (nodes_snapshot) |node| {
-            if (!node.is_alive) continue;
+        for (peers) |node| {
             if (self.queryNode(node, name)) {
                 const info = RemoteProcessInfo{
                     .name = name,
@@ -268,28 +381,159 @@ pub const DistributedRegistry = struct {
         return null;
     }
 
-    /// Query a single node for a name via TCP
-    fn queryNode(self: *DistributedRegistry, node: ClusterNode, name: []const u8) bool {
-        _ = self;
-        const addr = net.parseIp4(node.address, node.port) catch return false;
-        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return false;
-        defer compat.sockets.close(fd);
+    /// Capture an owned snapshot of peer health and lifetime counters.
+    ///
+    /// The caller owns the returned snapshot and must call `deinit()`.
+    pub fn snapshot(self: *DistributedRegistry, allocator: std.mem.Allocator) !DistributedRegistrySnapshot {
+        self.mutex.lock();
+        const node_count = self.nodes.items.len;
+        const cached_remote = self.remote_registrations.count();
 
-        // Set connect timeout via SO_SNDTIMEO
+        const peers = allocator.alloc(PeerSnapshot, node_count) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        var written: usize = 0;
+        errdefer {
+            for (peers[0..written]) |peer| allocator.free(peer.address);
+            allocator.free(peers);
+        }
+
+        for (self.nodes.items) |node| {
+            const address_copy = allocator.dupe(u8, node.address) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            node.io_mutex.lock();
+            peers[written] = .{
+                .address = address_copy,
+                .port = node.port,
+                .is_alive = node.is_alive,
+                .last_seen_ms = node.last_seen_ms,
+                .consecutive_failures = node.consecutive_failures,
+                .reconnects = node.reconnects,
+            };
+            node.io_mutex.unlock();
+            written += 1;
+        }
+        self.mutex.unlock();
+
+        return .{
+            .allocator = allocator,
+            .peers = peers,
+            .local_names = self.local_registry.count(),
+            .cached_remote_names = cached_remote,
+            .cache_hits = self.cache_hits.load(.monotonic),
+            .cache_misses = self.cache_misses.load(.monotonic),
+            .peer_queries = self.peer_queries.load(.monotonic),
+            .heartbeats = self.heartbeats.load(.monotonic),
+            .sync_frames = self.sync_frames.load(.monotonic),
+        };
+    }
+
+    /// Copy the stable peer pointers so network work happens without the
+    /// registry mutex held.
+    fn snapshotPeers(self: *DistributedRegistry) ?[]*ClusterNode {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.allocator.dupe(*ClusterNode, self.nodes.items) catch null;
+    }
+
+    fn openPeerSocket(node: *ClusterNode) ?posix.socket_t {
+        const addr = net.parseIp4(node.address, node.port) catch return null;
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return null;
+
         const timeout = posix.timeval{ .sec = 1, .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
-        compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
-        const stream = net.Stream{ .handle = fd };
+        compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch {
+            compat.sockets.close(fd);
+            return null;
+        };
+        return fd;
+    }
 
-        var buf: [256]u8 = undefined;
-        const cmd = protocol.writeFrame(&buf, "WHERE {s}", .{name}) catch return false;
-        _ = stream.write(cmd) catch return false;
+    fn recordPeerFailureLocked(node: *ClusterNode) void {
+        if (node.conn_fd) |fd| {
+            compat.sockets.close(fd);
+            node.conn_fd = null;
+        }
+        node.consecutive_failures +|= 1;
+        node.is_alive = false;
 
-        var resp_buf: [256]u8 = undefined;
-        const line = Protocol.readLine(stream, &resp_buf) orelse return false;
-        return std.mem.eql(u8, line, "FOUND");
+        const shift: u6 = @intCast(@min(node.consecutive_failures - 1, 7));
+        const backoff = @min(initial_backoff_ms << shift, max_backoff_ms);
+        node.next_attempt_ms = compat.monotonicMilliTimestamp() +| backoff;
+    }
+
+    const Exchange = struct {
+        request: []const u8,
+        /// Number of newline-terminated replies to consume. When
+        /// `reply_buffer` is set, the first reply line is returned instead.
+        expected_replies: usize,
+        reply_buffer: ?[]u8 = null,
+    };
+
+    /// Perform one request/response exchange on the peer's persistent
+    /// connection, reconnecting once when the connection has gone stale.
+    ///
+    /// Returns the first reply line when a reply buffer is provided, an
+    /// empty slice for successful reply-draining exchanges, or null on
+    /// failure (which records reconnect backoff on the peer).
+    fn peerExchange(node: *ClusterNode, exchange: Exchange) ?[]const u8 {
+        node.io_mutex.lock();
+        defer node.io_mutex.unlock();
+
+        const now_ms = compat.monotonicMilliTimestamp();
+        if (node.conn_fd == null and now_ms < node.next_attempt_ms) return null;
+
+        var attempt: u2 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            const fd = node.conn_fd orelse blk: {
+                const new_fd = openPeerSocket(node) orelse break;
+                node.conn_fd = new_fd;
+                node.reconnects +|= 1;
+                break :blk new_fd;
+            };
+            const stream = net.Stream{ .handle = fd };
+
+            const wrote = stream.write(exchange.request) catch 0;
+            if (wrote == exchange.request.len) {
+                if (exchange.reply_buffer) |buffer| {
+                    if (Protocol.readLine(stream, buffer)) |line| {
+                        node.consecutive_failures = 0;
+                        return line;
+                    }
+                } else if (Protocol.drainReplies(stream, exchange.expected_replies)) {
+                    node.consecutive_failures = 0;
+                    return "";
+                }
+            }
+
+            // Stale or broken connection: drop it and retry once with a
+            // fresh connect before declaring the peer unreachable.
+            compat.sockets.close(fd);
+            node.conn_fd = null;
+        }
+
+        recordPeerFailureLocked(node);
+        return null;
+    }
+
+    /// Query a single node for a name over its persistent connection.
+    fn queryNode(self: *DistributedRegistry, node: *ClusterNode, name: []const u8) bool {
+        var frame_buf: [256]u8 = undefined;
+        const frame = protocol.writeFrame(&frame_buf, "WHERE {s}", .{name}) catch return false;
+
+        _ = self.peer_queries.fetchAdd(1, .monotonic);
+        var reply_buf: [256]u8 = undefined;
+        const reply = peerExchange(node, .{
+            .request = frame,
+            .expected_replies = 1,
+            .reply_buffer = &reply_buf,
+        }) orelse return false;
+        return std.mem.eql(u8, reply, "FOUND");
     }
 
     fn cacheRemoteRegistration(self: *DistributedRegistry, name: []const u8, info: RemoteProcessInfo) !void {
@@ -331,74 +575,91 @@ pub const DistributedRegistry = struct {
         }
     }
 
-    /// Send heartbeat to a node and update liveness
-    fn sendHeartbeat(_: *DistributedRegistry, node: *ClusterNode) void {
-        const addr = net.parseIp4(node.address, node.port) catch {
-            node.is_alive = false;
-            return;
-        };
-        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
-            node.is_alive = false;
-            return;
-        };
-        defer compat.sockets.close(fd);
+    /// Send heartbeat to a node over its persistent connection.
+    fn sendHeartbeat(self: *DistributedRegistry, node: *ClusterNode) void {
+        var frame_buf: [128]u8 = undefined;
+        const frame = protocol.writeFrame(&frame_buf, "HEART", .{}) catch return;
 
+        _ = self.heartbeats.fetchAdd(1, .monotonic);
+        var reply_buf: [64]u8 = undefined;
+        const reply = peerExchange(node, .{
+            .request = frame,
+            .expected_replies = 1,
+            .reply_buffer = &reply_buf,
+        }) orelse return;
+
+        if (std.mem.eql(u8, reply, "ALIVE")) {
+            node.io_mutex.lock();
+            node.last_seen_ms = compat.monotonicMilliTimestamp();
+            node.is_alive = true;
+            node.io_mutex.unlock();
+        }
+    }
+
+    /// Sync all global registrations to one peer as a single batched write.
+    fn syncRegistrations(self: *DistributedRegistry, node: *ClusterNode, names: []const []const u8) void {
+        if (names.len == 0) return;
+
+        var batch: std.ArrayListUnmanaged(u8) = .empty;
+        defer batch.deinit(self.allocator);
+
+        var frame_buf: [256]u8 = undefined;
+        var frames: usize = 0;
+        for (names) |name| {
+            const frame = protocol.writeFrame(&frame_buf, "REG {s}", .{name}) catch continue;
+            batch.appendSlice(self.allocator, frame) catch return;
+            frames += 1;
+        }
+        if (frames == 0) return;
+
+        _ = self.sync_frames.fetchAdd(frames, .monotonic);
+        _ = peerExchange(node, .{
+            .request = batch.items,
+            .expected_replies = frames,
+        });
+    }
+
+    /// Handle one incoming connection until it closes or sync stops.
+    ///
+    /// Lines are processed as they arrive, so a peer may pipeline several
+    /// frames in one write (batched REG sync does exactly that).
+    fn handleConnection(self: *DistributedRegistry, fd: posix.socket_t, peer_addr: net.Ip4Address) void {
+        const stream = net.Stream{ .handle = fd };
         const timeout = posix.timeval{ .sec = 1, .usec = 0 };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
-        compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch {
-            node.is_alive = false;
-            return;
-        };
-        const stream = net.Stream{ .handle = fd };
+        var buffer: [2048]u8 = undefined;
+        var used: usize = 0;
 
-        var frame_buf: [128]u8 = undefined;
-        const frame = protocol.writeFrame(&frame_buf, "HEART", .{}) catch {
-            node.is_alive = false;
-            return;
-        };
-        _ = stream.write(frame) catch {
-            node.is_alive = false;
-            return;
-        };
+        while (self.should_sync.load(.acquire)) {
+            const n = stream.read(buffer[used..]) catch |err| switch (err) {
+                error.TimedOut => continue, // idle persistent connection
+                else => break,
+            };
+            if (n == 0) break;
+            used += n;
 
-        var buf: [64]u8 = undefined;
-        if (Protocol.readLine(stream, &buf)) |line| {
-            if (std.mem.eql(u8, line, "ALIVE")) {
-                node.last_seen_ms = compat.monotonicMilliTimestamp();
-                node.is_alive = true;
-                return;
+            // Process every complete line in the buffer.
+            var consumed: usize = 0;
+            while (std.mem.indexOfScalarPos(u8, buffer[0..used], consumed, '\n')) |line_end| {
+                var end = line_end;
+                if (end > consumed and buffer[end - 1] == '\r') end -= 1;
+                self.handleFrame(stream, buffer[consumed..end], peer_addr);
+                consumed = line_end + 1;
+            }
+
+            // Keep any partial trailing line for the next read.
+            if (consumed > 0) {
+                std.mem.copyForwards(u8, buffer[0 .. used - consumed], buffer[consumed..used]);
+                used -= consumed;
+            } else if (used == buffer.len) {
+                break; // oversized frame without a newline
             }
         }
-        node.is_alive = false;
+        compat.sockets.close(fd);
     }
 
-    /// Sync a global registration to a single peer node
-    fn syncRegistration(self: *DistributedRegistry, node: ClusterNode, name: []const u8) void {
-        _ = self;
-        const addr = net.parseIp4(node.address, node.port) catch return;
-        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return;
-        defer compat.sockets.close(fd);
-
-        const timeout = posix.timeval{ .sec = 1, .usec = 0 };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
-
-        compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch return;
-        const stream = net.Stream{ .handle = fd };
-
-        var buf: [256]u8 = undefined;
-        const cmd = protocol.writeFrame(&buf, "REG {s}", .{name}) catch return;
-        _ = stream.write(cmd) catch {};
-    }
-
-    /// Handle a single incoming connection on the listener
-    fn handleIncoming(self: *DistributedRegistry, stream: net.Stream, peer_addr: net.Ip4Address) void {
-        defer stream.close();
-
-        var buffer: [1024]u8 = undefined;
-        const line = Protocol.readLine(stream, &buffer) orelse return;
-
+    fn handleFrame(self: *DistributedRegistry, stream: net.Stream, line: []const u8, peer_addr: net.Ip4Address) void {
         const command = protocol.parse(line) catch {
             Protocol.sendFrame(stream, "ERR unsupported protocol\n");
             return;
@@ -481,8 +742,9 @@ pub const DistributedRegistry = struct {
 
     /// Stop synchronization and listener threads.
     ///
-    /// This closes the listener socket to unblock `accept()` and then joins the
-    /// background threads. It is safe to call when sync is not active.
+    /// This closes the listener socket to unblock `accept()`, joins the
+    /// background and per-connection threads, and drops persistent peer
+    /// connections. It is safe to call when sync is not active.
     pub fn stopSync(self: *DistributedRegistry) void {
         self.should_sync.store(false, .release);
 
@@ -500,6 +762,26 @@ pub const DistributedRegistry = struct {
 
         if (listener_thread) |thread| thread.join();
         if (sync_thread) |thread| thread.join();
+
+        // Join per-connection handlers. Each handler observes should_sync
+        // within its 1s receive timeout, closes its own fd, and exits.
+        self.mutex.lock();
+        var threads = self.conn_threads;
+        self.conn_threads = .empty;
+        self.conn_fds.clearRetainingCapacity();
+        self.mutex.unlock();
+        for (threads.items) |thread| thread.join();
+        threads.deinit(self.allocator);
+
+        // Drop persistent peer connections.
+        for (self.nodes.items) |node| {
+            node.io_mutex.lock();
+            if (node.conn_fd) |fd| {
+                compat.sockets.close(fd);
+                node.conn_fd = null;
+            }
+            node.io_mutex.unlock();
+        }
     }
 
     /// TCP listener loop - accepts incoming protocol connections
@@ -549,37 +831,71 @@ pub const DistributedRegistry = struct {
                     continue;
                 },
             };
-            self.handleIncoming(conn.stream, conn.address);
+
+            // Serve each connection on its own thread so a persistent peer
+            // cannot block other peers' requests.
+            self.mutex.lock();
+            const spawned = blk: {
+                const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn.stream.handle, conn.address }) catch break :blk false;
+                self.conn_threads.append(self.allocator, thread) catch {
+                    // Track failure: the handler owns the fd and exits once
+                    // should_sync clears, but we cannot join it later.
+                    thread.detach();
+                    break :blk true;
+                };
+                break :blk true;
+            };
+            self.mutex.unlock();
+
+            if (!spawned) {
+                // Could not spawn a handler: serve the connection inline so
+                // the peer still gets an answer.
+                self.handleConnection(conn.stream.handle, conn.address);
+            }
         }
     }
 
-    /// Synchronization loop - heartbeats and registration sync
+    /// Synchronization loop - heartbeats and batched registration sync
     fn syncLoop(self: *DistributedRegistry) void {
         while (self.should_sync.load(.acquire)) {
-            // Heartbeat all nodes
-            self.mutex.lock();
-            for (self.nodes.items) |*node| {
-                self.sendHeartbeat(node);
+            const peers = self.snapshotPeers() orelse {
+                compat.sleep(@as(u64, self.config.sync_interval_ms) * std.time.ns_per_ms);
+                continue;
+            };
+            defer self.allocator.free(peers);
 
-                // Mark dead if heartbeat timeout exceeded
-                const now_ms = compat.monotonicMilliTimestamp();
-                if (now_ms - node.last_seen_ms > self.config.heartbeat_timeout_ms) {
-                    node.is_alive = false;
-                }
+            // Copy global names so network writes happen without the mutex.
+            var names: std.ArrayListUnmanaged([]const u8) = .empty;
+            defer {
+                for (names.items) |name| self.allocator.free(name);
+                names.deinit(self.allocator);
             }
-            self.mutex.unlock();
-
-            // Sync global registrations to live peers
             self.mutex.lock();
             var name_it = self.global_names.iterator();
             while (name_it.next()) |entry| {
-                for (self.nodes.items) |node| {
-                    if (node.is_alive) {
-                        self.syncRegistration(node, entry.key_ptr.*);
-                    }
-                }
+                const copy = self.allocator.dupe(u8, entry.key_ptr.*) catch break;
+                names.append(self.allocator, copy) catch {
+                    self.allocator.free(copy);
+                    break;
+                };
             }
             self.mutex.unlock();
+
+            const now_ms = compat.monotonicMilliTimestamp();
+            for (peers) |node| {
+                self.sendHeartbeat(node);
+
+                node.io_mutex.lock();
+                if (now_ms - node.last_seen_ms > self.config.heartbeat_timeout_ms) {
+                    node.is_alive = false;
+                }
+                const alive = node.is_alive;
+                node.io_mutex.unlock();
+
+                if (alive) {
+                    self.syncRegistrations(node, names.items);
+                }
+            }
 
             compat.sleep(@as(u64, self.config.sync_interval_ms) * std.time.ns_per_ms);
         }
@@ -739,4 +1055,93 @@ test "DistributedRegistry repeatedly starts and stops background threads" {
         try std.testing.expect(registry.sync_thread == null);
         try std.testing.expect(registry.listener_fd == null);
     }
+}
+
+test "DistributedRegistry snapshot reports peer health and counters" {
+    const allocator = std.testing.allocator;
+    var registry = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{"10.0.0.9:9450"},
+    });
+    defer registry.deinit();
+
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+    try registry.register("local_only", &mailbox, .local);
+    _ = registry.whereisGlobal("local_only"); // hit
+    _ = registry.whereisGlobal("missing"); // miss
+
+    var state = try registry.snapshot(allocator);
+    defer state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), state.peers.len);
+    try std.testing.expectEqualStrings("10.0.0.9", state.peers[0].address);
+    try std.testing.expectEqual(@as(u16, 9450), state.peers[0].port);
+    try std.testing.expectEqual(@as(usize, 1), state.local_names);
+    try std.testing.expectEqual(@as(u64, 1), state.cache_hits);
+    try std.testing.expectEqual(@as(u64, 1), state.cache_misses);
+    try std.testing.expectEqual(@as(u64, 0), state.peer_queries);
+}
+
+test "DistributedRegistry resolves peers over persistent connections" {
+    const allocator = std.testing.allocator;
+
+    // Node A: listens and owns the target name.
+    var node_a = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .listen_port = 39417,
+        .sync_interval_ms = 10,
+    });
+    defer node_a.deinit();
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+    try node_a.register("billing_service", &mailbox, .global);
+    try node_a.startSync();
+    defer node_a.stopSync();
+
+    // Node B: knows A as a peer; queries actively without its own listener.
+    var node_b = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{"127.0.0.1:39417"},
+        .listen_port = 39418,
+        .sync_interval_ms = 10,
+    });
+    defer node_b.deinit();
+
+    // A's listener needs a moment to bind; poll until the query resolves.
+    var found: ?RemoteProcessInfo = null;
+    var waited_ms: u32 = 0;
+    while (found == null and waited_ms < 3_000) : (waited_ms += 20) {
+        found = node_b.queryPeers("billing_service");
+        if (found == null) compat.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("127.0.0.1", found.?.node_address);
+
+    // Repeat queries reuse the same persistent connection.
+    try std.testing.expect(node_b.queryPeers("billing_service") != null);
+    try std.testing.expect(node_b.queryPeers("unknown_service") == null);
+
+    var state = try node_b.snapshot(allocator);
+    defer state.deinit();
+    try std.testing.expect(state.peer_queries >= 3);
+    try std.testing.expectEqual(@as(u64, 1), state.peers[0].reconnects);
+    try std.testing.expectEqual(@as(u32, 0), state.peers[0].consecutive_failures);
+
+    // The resolved name is cached for whereisGlobal.
+    try std.testing.expect(node_b.whereisGlobal("billing_service") != null);
+
+    // Partition: stop A; B's queries fail and the peer records failures
+    // with reconnect backoff.
+    node_a.stopSync();
+    var failed = node_b.queryPeers("billing_service_2");
+    var retries: u32 = 0;
+    while (failed != null and retries < 10) : (retries += 1) {
+        compat.sleep(10 * std.time.ns_per_ms);
+        failed = node_b.queryPeers("billing_service_2");
+    }
+    try std.testing.expect(failed == null);
+
+    var partitioned = try node_b.snapshot(allocator);
+    defer partitioned.deinit();
+    try std.testing.expect(partitioned.peers[0].consecutive_failures >= 1);
+    try std.testing.expect(!partitioned.peers[0].is_alive);
 }

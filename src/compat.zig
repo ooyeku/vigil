@@ -332,8 +332,21 @@ pub const sockets = struct {
     pub const AcceptError = error{AcceptFailed} || posix.UnexpectedError;
 
     pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
-        const rc = std.c.socket(domain, sock_type, protocol);
+        // Darwin has no kernel-level SOCK_CLOEXEC; Zig defines it as an
+        // artificial flag that its own wrappers emulate. Strip it before the
+        // raw call and apply FD_CLOEXEC afterwards, otherwise socket()
+        // fails with EINVAL on macOS.
+        const wants_cloexec = (sock_type & posix.SOCK.CLOEXEC) != 0;
+        const raw_type = if (@import("builtin").os.tag.isDarwin())
+            sock_type & ~@as(u32, posix.SOCK.CLOEXEC)
+        else
+            sock_type;
+
+        const rc = std.c.socket(domain, raw_type, protocol);
         if (rc < 0) return error.SocketFailed;
+        if (@import("builtin").os.tag.isDarwin() and wants_cloexec) {
+            _ = std.c.fcntl(rc, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+        }
         return rc;
     }
 
@@ -417,7 +430,7 @@ pub const net = struct {
     pub const Stream = struct {
         handle: posix.socket_t,
 
-        pub const IoError = error{ReadFailed} || error{WriteFailed};
+        pub const IoError = error{ ReadFailed, WriteFailed, TimedOut };
 
         pub fn write(self: Stream, data: []const u8) IoError!usize {
             const rc = std.c.write(self.handle, data.ptr, data.len);
@@ -425,9 +438,17 @@ pub const net = struct {
             return @intCast(rc);
         }
 
+        /// Read available bytes. Returns `error.TimedOut` when a receive
+        /// timeout configured with `SO_RCVTIMEO` elapses, so callers can
+        /// distinguish an idle connection from a broken one.
         pub fn read(self: Stream, buffer: []u8) IoError!usize {
             const rc = std.c.read(self.handle, buffer.ptr, buffer.len);
-            if (rc < 0) return error.ReadFailed;
+            if (rc < 0) {
+                return switch (std.posix.errno(rc)) {
+                    .AGAIN => error.TimedOut,
+                    else => error.ReadFailed,
+                };
+            }
             return @intCast(rc);
         }
 

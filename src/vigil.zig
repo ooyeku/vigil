@@ -240,6 +240,10 @@ pub const MemoryCheckpointer = checkpoint.MemoryCheckpointer;
 pub const DistributedRegistry = distributed_registry.DistributedRegistry;
 /// Remote process resolution result.
 pub const RemoteProcessInfo = distributed_registry.RemoteProcessInfo;
+/// Owned snapshot of distributed-registry peer health and counters.
+pub const DistributedRegistrySnapshot = distributed_registry.DistributedRegistrySnapshot;
+/// Snapshot of one peer's health and connection state.
+pub const PeerSnapshot = distributed_registry.PeerSnapshot;
 
 /// Shared error set for high-level Vigil operations.
 pub const VigilError = errors.VigilError;
