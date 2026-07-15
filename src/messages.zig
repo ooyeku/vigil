@@ -296,13 +296,19 @@ pub const Message = struct {
     priority: MessagePriority,
     /// Lifecycle and routing metadata.
     metadata: MessageMetadata,
+    /// Single owned buffer backing `id`, `sender`, and `payload`.
+    ///
+    /// Packing the copied strings into one allocation keeps message
+    /// construction at one allocator call on the send hot path. Do not free
+    /// `id`/`sender`/`payload` individually; they are slices into this buffer.
+    storage: []const u8,
     /// Allocator used for owned fields.
     allocator: Allocator,
 
     /// Initialize a new owned message.
     ///
-    /// `id`, `sender`, and `payload` are copied. The caller owns the returned
-    /// message and must call `deinit()`.
+    /// `id`, `sender`, and `payload` are copied into one owned buffer. The
+    /// caller owns the returned message and must call `deinit()`.
     pub fn init(
         allocator: Allocator,
         id: []const u8,
@@ -312,22 +318,20 @@ pub const Message = struct {
         priority: MessagePriority,
         ttl_ms: ?u32,
     ) !Message {
-        const id_copy = try allocator.dupe(u8, id);
-        errdefer allocator.free(id_copy);
+        const payload_len = if (payload) |p| p.len else 0;
+        const storage = try allocator.alloc(u8, id.len + sender.len + payload_len);
 
-        const sender_copy = try allocator.dupe(u8, sender);
-        errdefer allocator.free(sender_copy);
-
-        const payload_copy = if (payload) |p| try allocator.dupe(u8, p) else null;
-        errdefer if (payload_copy) |p| allocator.free(p);
-
-        // Calculate message size
-        var total_size: usize = id_copy.len + sender_copy.len;
-        if (payload_copy) |p| total_size += p.len;
+        @memcpy(storage[0..id.len], id);
+        @memcpy(storage[id.len..][0..sender.len], sender);
+        const payload_copy: ?[]const u8 = if (payload) |p| blk: {
+            const dest = storage[id.len + sender.len ..][0..p.len];
+            @memcpy(dest, p);
+            break :blk dest;
+        } else null;
 
         return Message{
-            .id = id_copy,
-            .sender = sender_copy,
+            .id = storage[0..id.len],
+            .sender = storage[id.len..][0..sender.len],
             .payload = payload_copy,
             .signal = signal,
             .priority = priority,
@@ -338,8 +342,9 @@ pub const Message = struct {
                 .reply_to = null,
                 .attempt_count = 0,
                 .trace_id = null,
-                .size_bytes = total_size,
+                .size_bytes = storage.len,
             },
+            .storage = storage,
             .allocator = allocator,
         };
     }
@@ -348,12 +353,8 @@ pub const Message = struct {
     /// Must be called when message is no longer needed.
     /// Takes a const pointer to allow calling on const captures from recv/recvTimeout.
     pub fn deinit(self: *const Message) void {
-        self.allocator.free(self.id);
-        self.allocator.free(self.sender);
+        self.allocator.free(self.storage);
 
-        if (self.payload) |p| {
-            self.allocator.free(p);
-        }
         if (self.metadata.reply_to) |rt| {
             self.allocator.free(rt);
         }
@@ -413,10 +414,14 @@ pub const Message = struct {
     pub fn createResponse(self: Message, allocator: Allocator, payload: ?[]const u8, signal: ?Signal) !Message {
         if (self.metadata.reply_to == null) return MessageError.InvalidMessage;
 
-        // Create a new message first
+        // Build the response id up front; id/sender/payload share one owned
+        // buffer, so the id cannot be replaced after construction.
+        const resp_id = try std.fmt.allocPrint(allocator, "resp_{s}", .{self.id});
+        defer allocator.free(resp_id);
+
         var response = try Message.init(
             allocator,
-            self.id, // Temporary ID, will be replaced
+            resp_id,
             self.metadata.reply_to.?,
             payload,
             signal,
@@ -424,12 +429,6 @@ pub const Message = struct {
             self.metadata.ttl_ms,
         );
         errdefer response.deinit();
-
-        // Now create and set the response ID
-        const resp_id = try std.fmt.allocPrint(allocator, "resp_{s}", .{self.id});
-        response.metadata.size_bytes = (response.metadata.size_bytes -| response.id.len) +| resp_id.len;
-        allocator.free(response.id); // Free the temporary ID
-        response.id = resp_id; // Transfer ownership of resp_id
 
         // Set correlation ID if present
         if (self.metadata.correlation_id) |cid| {
@@ -448,14 +447,17 @@ pub const Message = struct {
 
     /// Deep-copy this message using `allocator` for the returned ownership.
     pub fn cloneWithAllocator(self: *const Message, allocator: Allocator) !Message {
-        const new_id = try allocator.dupe(u8, self.id);
-        errdefer allocator.free(new_id);
+        const payload_len = if (self.payload) |p| p.len else 0;
+        const storage = try allocator.alloc(u8, self.id.len + self.sender.len + payload_len);
+        errdefer allocator.free(storage);
 
-        const new_sender = try allocator.dupe(u8, self.sender);
-        errdefer allocator.free(new_sender);
-
-        const new_payload = if (self.payload) |p| try allocator.dupe(u8, p) else null;
-        errdefer if (new_payload) |p| allocator.free(p);
+        @memcpy(storage[0..self.id.len], self.id);
+        @memcpy(storage[self.id.len..][0..self.sender.len], self.sender);
+        const new_payload: ?[]const u8 = if (self.payload) |p| blk: {
+            const dest = storage[self.id.len + self.sender.len ..][0..p.len];
+            @memcpy(dest, p);
+            break :blk dest;
+        } else null;
 
         // Duplicate metadata strings
         var new_reply_to: ?[]const u8 = null;
@@ -471,8 +473,8 @@ pub const Message = struct {
         }
 
         return Message{
-            .id = new_id,
-            .sender = new_sender,
+            .id = storage[0..self.id.len],
+            .sender = storage[self.id.len..][0..self.sender.len],
             .payload = new_payload,
             .signal = self.signal,
             .priority = self.priority,
@@ -485,6 +487,7 @@ pub const Message = struct {
                 .trace_id = self.metadata.trace_id,
                 .size_bytes = self.metadata.size_bytes,
             },
+            .storage = storage,
             .allocator = allocator,
         };
     }
@@ -1350,7 +1353,7 @@ test "Message correlation and response" {
 }
 
 test "Message metadata replacement preserves old values on allocation failure" {
-    var correlation_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
+    var correlation_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
     var correlation_message = try Message.init(
         correlation_allocator.allocator(),
         "id",
@@ -1365,7 +1368,7 @@ test "Message metadata replacement preserves old values on allocation failure" {
     try testing.expectError(error.OutOfMemory, correlation_message.setCorrelationId("new-correlation"));
     try testing.expectEqualStrings("old-correlation", correlation_message.metadata.correlation_id.?);
 
-    var reply_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 4 });
+    var reply_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
     var reply_message = try Message.init(
         reply_allocator.allocator(),
         "id",
