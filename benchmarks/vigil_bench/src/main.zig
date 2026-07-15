@@ -260,6 +260,57 @@ pub fn benchTelemetry(allocator: std.mem.Allocator, iterations: usize) !Benchmar
     };
 }
 
+const RegistryLookupContext = struct {
+    registry: *vigil.Registry,
+    iterations: usize,
+    name_index_offset: usize,
+};
+
+fn registryLookupThread(ctx: *RegistryLookupContext) void {
+    var name_buffer: [32]u8 = undefined;
+    for (0..ctx.iterations) |i| {
+        const name = std.fmt.bufPrint(&name_buffer, "svc-{d}", .{(i + ctx.name_index_offset) % 64}) catch return;
+        _ = ctx.registry.whereis(name);
+    }
+}
+
+pub fn benchRegistryContention(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
+    var registry = vigil.Registry.init(allocator);
+    defer registry.deinit();
+
+    var mailbox = vigil.ProcessMailbox.init(allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+
+    var name_buffer: [32]u8 = undefined;
+    for (0..64) |i| {
+        const name = try std.fmt.bufPrint(&name_buffer, "svc-{d}", .{i});
+        try registry.register(name, &mailbox);
+    }
+
+    const thread_count = 8;
+    var contexts: [thread_count]RegistryLookupContext = undefined;
+    for (&contexts, 0..) |*ctx, i| {
+        ctx.* = .{
+            .registry = &registry,
+            .iterations = iterations,
+            .name_index_offset = i * 8,
+        };
+    }
+
+    const start = nowNs();
+    var threads: [thread_count]std.Thread = undefined;
+    for (&threads, &contexts) |*thread, *ctx| {
+        thread.* = try std.Thread.spawn(.{}, registryLookupThread, .{ctx});
+    }
+    for (threads) |thread| thread.join();
+
+    return .{
+        .name = "registry contention",
+        .operations = iterations * thread_count,
+        .elapsed_ns = elapsedSince(start),
+    };
+}
+
 pub fn benchTimerScheduling(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
     const start = nowNs();
     for (0..iterations) |_| {
@@ -525,6 +576,7 @@ pub fn main(init: std.process.Init) !void {
     printResult(try runBenchmark(benchInbox, iterations));
     printResult(try runBenchmark(benchRegistryLookup, iterations));
     printResult(try runBenchmark(benchRegistryRegister, iterations));
+    printResult(try runBenchmark(benchRegistryContention, iterations));
     printResult(try runBenchmark(benchTelemetry, iterations));
     printResult(try runBenchmark(benchTimerScheduling, iterations));
     printResult(try runBenchmark(benchTimerService, iterations));
