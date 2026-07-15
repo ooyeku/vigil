@@ -1476,6 +1476,10 @@ cd examples/ops_toolkit
 zig build run                        # all demos
 zig build run -- dead-letter-replay  # one demo
 
+# Run the webhook relay example
+cd examples/webhook_relay
+zig build run
+
 # Run the benchmark harness
 cd benchmarks/vigil_bench
 zig build run -Doptimize=ReleaseSafe -- --iterations 10000
@@ -1489,6 +1493,13 @@ See `examples/vigil_showcase` for a resilient order pipeline demonstrating:
 - Runtime-owned registry, telemetry, shutdown hooks, and inboxes
 - Process groups and pub/sub event fanout
 - Inbox backpressure, rate limiting, and circuit breaker behavior
+
+See `examples/webhook_relay` for one cohesive service that puts the v2.2
+"Operate and Recover" toolkit together end to end:
+- Policy-guarded webhook delivery: retries with exponential backoff, deadlines, per-endpoint circuit breakers, and bulkhead-limited concurrency
+- Dead-letter quarantine, operator inspection, replay after recovery, and poison discard
+- Endpoint diagnostics, `Runtime.debugDump()` status reporting, and a timeline audit trail
+- Fully deterministic: backoff runs on a `SimulatedClock`, and the same dispatch logic is unit-tested with `FaultInjector` — no real sleeps anywhere
 
 See `examples/ops_toolkit` for five focused operations demos:
 - `job-queue` — resilient job queue with dead-letter replay and poison quarantine
