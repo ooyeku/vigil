@@ -152,7 +152,10 @@ pub const Inbox = struct {
         // Spin-wait until all in-flight operations have exited.
         // Each operation increments active_ops on entry and decrements
         // on exit, so reaching zero means nothing is touching the mailbox.
+        // Receivers may be parked in receiveWait(); broadcast on every
+        // iteration so they wake, observe the closed flag, and exit.
         while (self.active_ops.load(.acquire) & operation_count_mask != 0) {
+            self.mailbox.wakeWaiters();
             compat.sleep(1 * std.time.ns_per_ms);
         }
 
@@ -235,13 +238,13 @@ pub const Inbox = struct {
         while (true) {
             if (self.closed.load(.acquire)) return InboxError.InboxClosed;
 
-            if (self.mailbox.receive()) |msg| {
+            // Park on the mailbox condition instead of polling. `close()`
+            // broadcasts while draining operations, so a blocked receiver
+            // re-checks the closed flag promptly during shutdown.
+            if (self.mailbox.receiveWait(1000)) |msg| {
                 return msg;
             } else |err| switch (err) {
-                error.EmptyMailbox => {
-                    compat.sleep(1 * std.time.ns_per_ms);
-                    continue;
-                },
+                error.EmptyMailbox => continue,
                 else => return err,
             }
         }
@@ -259,20 +262,25 @@ pub const Inbox = struct {
 
         while (true) {
             if (self.closed.load(.acquire)) return InboxError.InboxClosed;
-            if (timeout_ms != 0 and compat.monotonicMilliTimestamp() - start >= timeout_ms) {
-                return null;
+
+            if (timeout_ms == 0) {
+                // Non-blocking poll.
+                if (self.mailbox.receive()) |msg| {
+                    return msg;
+                } else |err| switch (err) {
+                    error.EmptyMailbox => return null,
+                    else => return err,
+                }
             }
 
-            if (self.mailbox.receive()) |msg| {
+            const elapsed = compat.monotonicMilliTimestamp() - start;
+            if (elapsed >= timeout_ms) return null;
+            const remaining: u32 = @intCast(@as(i64, timeout_ms) - elapsed);
+
+            if (self.mailbox.receiveWait(remaining)) |msg| {
                 return msg;
             } else |err| switch (err) {
-                error.EmptyMailbox => {
-                    if (timeout_ms == 0 or compat.monotonicMilliTimestamp() - start >= timeout_ms) {
-                        return null;
-                    }
-                    compat.sleep(1 * std.time.ns_per_ms);
-                    continue;
-                },
+                error.EmptyMailbox => continue,
                 else => return err,
             }
         }

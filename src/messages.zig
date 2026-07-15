@@ -693,6 +693,9 @@ pub const ProcessMailbox = struct {
     current_poison_count: usize,
     /// Protects queue state.
     mutex: Mutex,
+    /// Signaled when a message enters the active queue; used by blocking
+    /// receives instead of polling.
+    not_empty: compat.Condition,
     /// Mailbox behavior settings.
     config: MailboxConfig,
     /// Usage statistics.
@@ -741,6 +744,7 @@ pub const ProcessMailbox = struct {
             .next_dead_letter_id = 1,
             .current_poison_count = 0,
             .mutex = .{},
+            .not_empty = .{},
             .config = config,
             .stats = .{},
             .allocator = allocator,
@@ -958,7 +962,49 @@ pub const ProcessMailbox = struct {
     pub fn receive(self: *ProcessMailbox) MessageError!Message {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.receiveLocked();
+    }
 
+    /// Receive the next message, sleeping until one arrives or `timeout_ms`
+    /// elapses.
+    ///
+    /// Unlike polling `receive()` in a loop, the calling thread parks on a
+    /// condition that senders signal, so an idle receiver wakes as soon as a
+    /// message is enqueued. Returns `error.EmptyMailbox` on timeout. External
+    /// wrappers that close over this mailbox must call `wakeWaiters()` during
+    /// their shutdown sequence to release parked receivers promptly.
+    pub fn receiveWait(self: *ProcessMailbox, timeout_ms: u32) MessageError!Message {
+        const deadline_ms = compat.monotonicMilliTimestamp() +| @as(i64, timeout_ms);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        while (true) {
+            if (self.receiveLocked()) |msg| {
+                return msg;
+            } else |err| switch (err) {
+                MessageError.EmptyMailbox => {},
+                else => return err,
+            }
+
+            const remaining_ms = deadline_ms - compat.monotonicMilliTimestamp();
+            if (remaining_ms <= 0) return MessageError.EmptyMailbox;
+            self.not_empty.timedWait(
+                &self.mutex,
+                @as(u64, @intCast(remaining_ms)) * std.time.ns_per_ms,
+            ) catch return MessageError.EmptyMailbox;
+        }
+    }
+
+    /// Wake every receiver parked in `receiveWait()`.
+    ///
+    /// Used by owners during shutdown so blocked receivers re-check their
+    /// closed state instead of sleeping out their timeout.
+    pub fn wakeWaiters(self: *ProcessMailbox) void {
+        self.not_empty.broadcast();
+    }
+
+    fn receiveLocked(self: *ProcessMailbox) MessageError!Message {
         // One clock read per receive; expiry sweeps over deep queues compare
         // against it instead of reading the clock per message.
         const now_ms = compat.milliTimestamp();
@@ -1130,6 +1176,7 @@ pub const ProcessMailbox = struct {
         if (count_received) self.stats.messages_received +|= 1;
         self.stats.total_size_bytes +|= msg.metadata.size_bytes;
         self.stats.peak_usage = @max(self.stats.peak_usage, self.activeQueuedCountLocked());
+        self.not_empty.signal();
     }
 
     fn appendDeadLetterLocked(
