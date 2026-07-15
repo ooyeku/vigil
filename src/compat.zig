@@ -30,6 +30,196 @@ pub const Mutex = struct {
     }
 };
 
+/// Minimal futex-style wait/wake on a 32-bit word.
+///
+/// Zig 0.16 moved futex access behind `std.Io`; this exposes the same
+/// primitive directly on the OS so synchronization types here do not need an
+/// `Io` instance. Waits may return spuriously — callers must re-check their
+/// condition in a loop.
+pub const futex = struct {
+    /// Block until `ptr` no longer holds `expect`, a wake arrives, the
+    /// optional timeout elapses, or a spurious wakeup occurs.
+    pub fn wait(ptr: *const std.atomic.Value(u32), expect: u32, timeout_ns: ?u64) void {
+        switch (@import("builtin").os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos => {
+                const flags: std.c.UL = .{ .op = .COMPARE_AND_WAIT, .NO_ERRNO = true };
+                const timeout_us: u32 = if (timeout_ns) |ns|
+                    @intCast(@min(@max((ns + std.time.ns_per_us - 1) / std.time.ns_per_us, 1), std.math.maxInt(u32)))
+                else
+                    0; // zero means wait forever
+                _ = std.c.__ulock_wait(flags, &ptr.raw, expect, timeout_us);
+            },
+            .linux => {
+                const linux = std.os.linux;
+                var ts_buffer: linux.timespec = undefined;
+                const ts: ?*const linux.timespec = if (timeout_ns) |ns| blk: {
+                    ts_buffer = .{
+                        .sec = @intCast(ns / std.time.ns_per_s),
+                        .nsec = @intCast(ns % std.time.ns_per_s),
+                    };
+                    break :blk &ts_buffer;
+                } else null;
+                _ = linux.futex_4arg(&ptr.raw, .{ .cmd = .WAIT, .private = true }, expect, ts);
+            },
+            else => {
+                // Portable fallback: bounded sleep-poll. Correct (callers
+                // re-check in a loop) but not as responsive as a real futex.
+                if (ptr.load(.acquire) != expect) return;
+                const step_ns: u64 = 1 * std.time.ns_per_ms;
+                sleep(if (timeout_ns) |ns| @min(ns, step_ns) else step_ns);
+            },
+        }
+    }
+
+    /// Wake up to `max_waiters` threads blocked in `wait()` on `ptr`.
+    pub fn wake(ptr: *const std.atomic.Value(u32), max_waiters: u32) void {
+        if (max_waiters == 0) return;
+        switch (@import("builtin").os.tag) {
+            .macos, .ios, .tvos, .watchos, .visionos => {
+                const flags: std.c.UL = .{
+                    .op = .COMPARE_AND_WAIT,
+                    .NO_ERRNO = true,
+                    .WAKE_ALL = max_waiters > 1,
+                };
+                while (true) {
+                    const status = std.c.__ulock_wake(flags, &ptr.raw, 0);
+                    if (status >= 0) return;
+                    switch (@as(std.c.E, @enumFromInt(-status))) {
+                        .INTR, .CANCELED => continue,
+                        else => return,
+                    }
+                }
+            },
+            .linux => {
+                const linux = std.os.linux;
+                _ = linux.futex_3arg(
+                    &ptr.raw,
+                    .{ .cmd = .WAKE, .private = true },
+                    @min(max_waiters, std.math.maxInt(i32)),
+                );
+            },
+            else => {},
+        }
+    }
+};
+
+/// Drop-in replacement for the pre-0.16 `std.Thread.Condition`, integrated
+/// with `compat.Mutex`.
+///
+/// The algorithm mirrors the standard library's futex-based condition
+/// variable: a packed waiters/signals word plus an epoch word that waiters
+/// sleep on. `timedWait` returns `error.Timeout` when no signal arrived
+/// within the given duration.
+pub const Condition = struct {
+    /// Low 16 bits: waiter count. High 16 bits: undelivered signal count.
+    state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Bumped on every signal/broadcast; waiters sleep on this word.
+    epoch: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    const one_waiter: u32 = 1;
+    const one_signal: u32 = 1 << 16;
+
+    fn waiters(state: u32) u32 {
+        return state & 0xffff;
+    }
+
+    fn signals(state: u32) u32 {
+        return state >> 16;
+    }
+
+    /// Atomically release `mutex` and wait for a signal. The mutex is
+    /// re-acquired before returning.
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        self.waitInner(mutex, null) catch unreachable;
+    }
+
+    /// Like `wait`, but gives up after `timeout_ns` nanoseconds.
+    pub fn timedWait(self: *Condition, mutex: *Mutex, timeout_ns: u64) error{Timeout}!void {
+        return self.waitInner(mutex, timeout_ns);
+    }
+
+    fn waitInner(self: *Condition, mutex: *Mutex, timeout_ns: ?u64) error{Timeout}!void {
+        const deadline_ms: ?i64 = if (timeout_ns) |ns|
+            monotonicMilliTimestamp() +| @as(i64, @intCast(@min(ns / std.time.ns_per_ms + 1, std.math.maxInt(i64))))
+        else
+            null;
+
+        var epoch = self.epoch.load(.acquire);
+        const prev_state = self.state.fetchAdd(one_waiter, .monotonic);
+        std.debug.assert(waiters(prev_state) < 0xffff);
+
+        mutex.unlock();
+        defer mutex.lock();
+
+        while (true) {
+            const remaining_ns: ?u64 = if (deadline_ms) |deadline| blk: {
+                const remaining_ms = deadline - monotonicMilliTimestamp();
+                if (remaining_ms <= 0) break :blk 0;
+                break :blk @as(u64, @intCast(remaining_ms)) * std.time.ns_per_ms;
+            } else null;
+
+            if (remaining_ns == null or remaining_ns.? > 0) {
+                futex.wait(&self.epoch, epoch, remaining_ns);
+            }
+            epoch = self.epoch.load(.acquire);
+
+            // Consume a pending signal if one is available, even after a
+            // timeout, so no delivered signal is lost.
+            var state = self.state.load(.monotonic);
+            while (signals(state) > 0) {
+                state = self.state.cmpxchgWeak(
+                    state,
+                    state - (one_waiter + one_signal),
+                    .acquire,
+                    .monotonic,
+                ) orelse return;
+            }
+
+            if (deadline_ms) |deadline| {
+                if (monotonicMilliTimestamp() >= deadline) {
+                    _ = self.state.fetchSub(one_waiter, .monotonic);
+                    return error.Timeout;
+                }
+            }
+        }
+    }
+
+    /// Wake one waiting thread, if any.
+    pub fn signal(self: *Condition) void {
+        var state = self.state.load(.monotonic);
+        while (waiters(state) > signals(state)) {
+            state = self.state.cmpxchgWeak(
+                state,
+                state + one_signal,
+                .release,
+                .monotonic,
+            ) orelse {
+                _ = self.epoch.fetchAdd(1, .release);
+                futex.wake(&self.epoch, 1);
+                return;
+            };
+        }
+    }
+
+    /// Wake every waiting thread.
+    pub fn broadcast(self: *Condition) void {
+        var state = self.state.load(.monotonic);
+        while (waiters(state) > signals(state)) {
+            const wake_count = waiters(state) - signals(state);
+            state = self.state.cmpxchgWeak(
+                state,
+                (waiters(state) << 16) | waiters(state),
+                .release,
+                .monotonic,
+            ) orelse {
+                _ = self.epoch.fetchAdd(1, .release);
+                futex.wake(&self.epoch, wake_count);
+                return;
+            };
+        }
+    }
+};
+
 test "Mutex basic lock/unlock" {
     var m: Mutex = .{};
     m.lock();
@@ -273,3 +463,106 @@ pub const net = struct {
         }
     };
 };
+
+test "Condition timedWait returns Timeout when nothing signals" {
+    var mutex: Mutex = .{};
+    var cond: Condition = .{};
+
+    mutex.lock();
+    defer mutex.unlock();
+
+    const start = monotonicMilliTimestamp();
+    try std.testing.expectError(error.Timeout, cond.timedWait(&mutex, 10 * std.time.ns_per_ms));
+    try std.testing.expect(monotonicMilliTimestamp() - start >= 5);
+}
+
+test "Condition signal wakes a waiting thread" {
+    const Shared = struct {
+        mutex: Mutex = .{},
+        cond: Condition = .{},
+        ready: bool = false,
+        observed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn waiter(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.ready) {
+                self.cond.wait(&self.mutex);
+            }
+            self.observed.store(true, .release);
+        }
+    };
+
+    var shared = Shared{};
+    const thread = try std.Thread.spawn(.{}, Shared.waiter, .{&shared});
+
+    shared.mutex.lock();
+    shared.ready = true;
+    shared.mutex.unlock();
+    shared.cond.signal();
+
+    thread.join();
+    try std.testing.expect(shared.observed.load(.acquire));
+}
+
+test "Condition broadcast wakes every waiting thread" {
+    const Shared = struct {
+        mutex: Mutex = .{},
+        cond: Condition = .{},
+        ready: bool = false,
+        woken: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+        fn waiter(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.ready) {
+                self.cond.wait(&self.mutex);
+            }
+            _ = self.woken.fetchAdd(1, .monotonic);
+        }
+    };
+
+    var shared = Shared{};
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*slot| {
+        slot.* = try std.Thread.spawn(.{}, Shared.waiter, .{&shared});
+    }
+
+    shared.mutex.lock();
+    shared.ready = true;
+    shared.mutex.unlock();
+    shared.cond.broadcast();
+
+    for (threads) |thread| thread.join();
+    try std.testing.expectEqual(@as(u32, 4), shared.woken.load(.acquire));
+}
+
+test "Condition timedWait consumes a signal that arrives in time" {
+    const Shared = struct {
+        mutex: Mutex = .{},
+        cond: Condition = .{},
+        ready: bool = false,
+        succeeded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn waiter(self: *@This()) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.ready) {
+                self.cond.timedWait(&self.mutex, 2 * std.time.ns_per_s) catch return;
+            }
+            self.succeeded.store(true, .release);
+        }
+    };
+
+    var shared = Shared{};
+    const thread = try std.Thread.spawn(.{}, Shared.waiter, .{&shared});
+
+    sleep(5 * std.time.ns_per_ms);
+    shared.mutex.lock();
+    shared.ready = true;
+    shared.mutex.unlock();
+    shared.cond.signal();
+
+    thread.join();
+    try std.testing.expect(shared.succeeded.load(.acquire));
+}
