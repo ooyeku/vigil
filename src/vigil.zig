@@ -162,6 +162,8 @@ pub const RateLimiter = flow_control.RateLimiter;
 pub const BackpressureStrategy = flow_control.BackpressureStrategy;
 /// Wrapper that applies rate limiting/backpressure around an inbox.
 pub const FlowControlledInbox = flow_control.FlowControlledInbox;
+/// Lifetime counters for flow-control outcomes.
+pub const FlowControlStats = flow_control.FlowControlStats;
 
 /// Build a reply message that preserves the request correlation id.
 pub const reply = request_reply.reply;

@@ -566,14 +566,28 @@ pub const Inbox = struct {
         }
 
         const config = self.backpressure_config orelse return true;
-        if (self.queuedCount() < config.high_watermark) return true;
+        const depth = self.queuedCount();
+
+        // Adaptive pressure band: slow the sender proportionally to queue
+        // growth before the hard high-watermark reaction kicks in.
+        if (config.strategy == .adaptive and
+            depth >= config.low_watermark and
+            depth < config.high_watermark)
+        {
+            const band = config.high_watermark - config.low_watermark;
+            const fill = depth - config.low_watermark + 1;
+            const delay_ms = @max(1, config.max_delay_ms * fill / band);
+            compat.sleep(@as(u64, delay_ms) * std.time.ns_per_ms);
+        }
+
+        if (depth < config.high_watermark) return true;
 
         switch (config.strategy) {
             .drop_oldest => {
                 _ = self.mailbox.dropOldest();
             },
             .drop_newest => return false,
-            .block => {
+            .block, .adaptive => {
                 while (self.queuedCount() >= config.low_watermark) {
                     if (self.closed.load(.acquire)) return InboxError.InboxClosed;
                     compat.sleep(10 * std.time.ns_per_ms);
@@ -714,7 +728,7 @@ pub const InboxBuilder = struct {
             .closed = std.atomic.Value(bool).init(false),
             .active_ops = std.atomic.Value(u32).init(0),
             .next_message_id = std.atomic.Value(u64).init(1),
-            .rate_limiter = if (self.rate_limit_config) |config| flow_control.RateLimiter.init(config.max_per_second) else null,
+            .rate_limiter = if (self.rate_limit_config) |config| config.limiter() else null,
             .backpressure_config = self.backpressure_config,
             .telemetry_emitter = null,
             .lifecycle_mutex = .{},
