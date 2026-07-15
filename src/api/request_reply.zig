@@ -164,15 +164,17 @@ pub const ReplyMailbox = struct {
         const start_ms = compat.monotonicMilliTimestamp();
         var first_poll = true;
         while (true) {
+            // Always poll at least once, even when the deadline has already
+            // passed, so short timeouts still observe queued replies.
             const elapsed = compat.monotonicMilliTimestamp() - start_ms;
-            if ((timeout_ms == 0 and !first_poll) or (timeout_ms != 0 and elapsed >= timeout_ms)) {
+            if (!first_poll and (timeout_ms == 0 or elapsed >= timeout_ms)) {
                 self.flushStash();
                 return MessageError.DeliveryTimeout;
             }
             const poll_timeout: u32 = if (timeout_ms == 0)
                 0
             else
-                @intCast(@min(@as(i64, 100), @as(i64, timeout_ms) - elapsed));
+                @intCast(@max(0, @min(@as(i64, 100), @as(i64, timeout_ms) - elapsed)));
             first_poll = false;
 
             // Check inbox for reply

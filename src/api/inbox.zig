@@ -260,6 +260,7 @@ pub const Inbox = struct {
         try self.beginOperation();
         defer self.endOperation();
 
+        var first_poll = true;
         while (true) {
             if (self.closed.load(.acquire)) return InboxError.InboxClosed;
 
@@ -273,9 +274,16 @@ pub const Inbox = struct {
                 }
             }
 
+            // Always poll at least once so short timeouts still observe
+            // already-queued messages even when the thread was descheduled
+            // past the deadline before the first attempt.
             const elapsed = compat.monotonicMilliTimestamp() - start;
-            if (elapsed >= timeout_ms) return null;
-            const remaining: u32 = @intCast(@as(i64, timeout_ms) - elapsed);
+            if (elapsed >= timeout_ms and !first_poll) return null;
+            const remaining: u32 = if (elapsed >= timeout_ms)
+                0
+            else
+                @intCast(@as(i64, timeout_ms) - elapsed);
+            first_poll = false;
 
             if (self.mailbox.receiveWait(remaining)) |msg| {
                 return msg;
