@@ -46,6 +46,10 @@ pub const ProcessGroupSnapshot = struct {
     member_count: usize,
     /// Next member index used for round-robin routing.
     round_robin_index: usize,
+    /// Lifetime successful broadcast deliveries.
+    total_delivered: u64,
+    /// Lifetime failed broadcast deliveries.
+    total_failed: u64,
     /// Per-member snapshots.
     members: []ProcessGroupMemberSnapshot,
 
@@ -74,6 +78,10 @@ pub const ProcessGroup = struct {
     round_robin_index: usize,
     /// Protects membership and round-robin state.
     mutex: compat.Mutex,
+    /// Lifetime successful deliveries across all broadcasts.
+    total_delivered: std.atomic.Value(u64),
+    /// Lifetime failed deliveries across all broadcasts.
+    total_failed: std.atomic.Value(u64),
 
     /// Initialize an empty process group with a copied name.
     pub fn init(allocator: std.mem.Allocator, name: []const u8) !ProcessGroup {
@@ -86,6 +94,8 @@ pub const ProcessGroup = struct {
             .members = .empty,
             .round_robin_index = 0,
             .mutex = .{},
+            .total_delivered = std.atomic.Value(u64).init(0),
+            .total_failed = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -189,6 +199,8 @@ pub const ProcessGroup = struct {
             .name = name_copy,
             .member_count = members.len,
             .round_robin_index = self.round_robin_index,
+            .total_delivered = self.total_delivered.load(.monotonic),
+            .total_failed = self.total_failed.load(.monotonic),
             .members = members,
         };
     }
@@ -199,31 +211,57 @@ pub const ProcessGroup = struct {
     /// Emits `message_dropped` telemetry events for each failed delivery.
     /// Delivery is best-effort: one failed inbox does not stop the broadcast.
     pub fn broadcast(self: *ProcessGroup, payload: []const u8) !BroadcastResult {
+        return self.broadcastBatch(&.{payload});
+    }
+
+    /// Broadcast several payloads to all members with one membership
+    /// snapshot.
+    ///
+    /// Delivery semantics match `broadcast()` per payload. For typical group
+    /// sizes the membership snapshot lives on the stack, so batched
+    /// broadcasts avoid per-call allocation entirely.
+    pub fn broadcastBatch(self: *ProcessGroup, payloads: []const []const u8) !BroadcastResult {
+        var stack_snapshot: [32]GroupMember = undefined;
+        var heap_snapshot: ?[]GroupMember = null;
+
         self.mutex.lock();
-        const members_copy = self.allocator.alloc(GroupMember, self.members.items.len) catch {
-            self.mutex.unlock();
-            return error.OutOfMemory;
+        const count = self.members.items.len;
+        const members_copy: []const GroupMember = if (count <= stack_snapshot.len) blk: {
+            @memcpy(stack_snapshot[0..count], self.members.items);
+            break :blk stack_snapshot[0..count];
+        } else blk: {
+            const copy = self.allocator.alloc(GroupMember, count) catch {
+                self.mutex.unlock();
+                return error.OutOfMemory;
+            };
+            @memcpy(copy, self.members.items);
+            heap_snapshot = copy;
+            break :blk copy;
         };
-        @memcpy(members_copy, self.members.items);
         self.mutex.unlock();
-        defer self.allocator.free(members_copy);
+        defer if (heap_snapshot) |copy| self.allocator.free(copy);
 
         var result = BroadcastResult{};
         for (members_copy) |member| {
-            member.inbox.send(payload) catch {
-                result.failed += 1;
-                // Emit telemetry for failed delivery
-                if (telemetry.getGlobal()) |t| {
-                    t.emit(.{
-                        .event_type = .message_dropped,
-                        .timestamp_ms = compat.milliTimestamp(),
-                        .metadata = self.name,
-                    });
-                }
-                continue;
-            };
-            result.delivered += 1;
+            for (payloads) |payload| {
+                member.inbox.send(payload) catch {
+                    result.failed += 1;
+                    // Emit telemetry for failed delivery
+                    if (telemetry.getGlobal()) |t| {
+                        t.emit(.{
+                            .event_type = .message_dropped,
+                            .timestamp_ms = compat.milliTimestamp(),
+                            .metadata = self.name,
+                        });
+                    }
+                    continue;
+                };
+                result.delivered += 1;
+            }
         }
+
+        _ = self.total_delivered.fetchAdd(result.delivered, .monotonic);
+        _ = self.total_failed.fetchAdd(result.failed, .monotonic);
         return result;
     }
 
@@ -502,4 +540,30 @@ test "ProcessGroup property: keyed routing is stable and in bounds" {
         // Same key, same member, as long as membership is unchanged.
         try std.testing.expectEqual(first, group.routeIndexForKey(key).?);
     }
+}
+
+test "ProcessGroup broadcastBatch delivers all payloads and tracks counters" {
+    const allocator = std.testing.allocator;
+
+    var group = try ProcessGroup.init(allocator, "workers");
+    defer group.deinit();
+
+    var inbox1 = try Inbox.init(allocator);
+    defer inbox1.close();
+    var inbox2 = try Inbox.init(allocator);
+    defer inbox2.close();
+    try group.add("worker1", inbox1);
+    try group.add("worker2", inbox2);
+
+    const payloads = [_][]const u8{ "tick", "tock" };
+    const result = try group.broadcastBatch(&payloads);
+    try std.testing.expectEqual(@as(usize, 4), result.delivered);
+    try std.testing.expectEqual(@as(usize, 0), result.failed);
+    try std.testing.expectEqual(@as(usize, 2), inbox1.mailbox.queuedCount());
+    try std.testing.expectEqual(@as(usize, 2), inbox2.mailbox.queuedCount());
+
+    var snapshot = try group.snapshot(allocator);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 4), snapshot.total_delivered);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.total_failed);
 }
