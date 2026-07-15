@@ -810,7 +810,8 @@ pub const ProcessMailbox = struct {
             msg_mut.metadata.ttl_ms = self.config.default_ttl_ms;
         }
 
-        if (msg_mut.isExpired()) {
+        const now_ms = compat.milliTimestamp();
+        if (msg_mut.isExpiredAt(now_ms)) {
             self.stats.messages_expired +|= 1;
             if (self.deadletter_queue != null) {
                 const notice = self.appendDeadLetterLocked(msg_mut, .expired) catch |err| {
@@ -821,6 +822,13 @@ pub const ProcessMailbox = struct {
             }
             self.stats.messages_dropped +|= 1;
             return MessageError.MessageExpired;
+        }
+
+        if (self.activeQueuedCountLocked() >= self.config.capacity) {
+            // Expiry is lazy on the receive path, so an apparently full
+            // mailbox may hold expired messages. Reclaim them in one sweep
+            // before treating the send as overflow.
+            self.expireAllLocked(now_ms);
         }
 
         if (self.activeQueuedCountLocked() >= self.config.capacity) {
@@ -1024,11 +1032,8 @@ pub const ProcessMailbox = struct {
 
         if (self.priority_queues) |*queues| {
             for (queues) |*queue| {
-                self.expireQueueLocked(queue, now_ms);
-            }
-            for (queues) |*queue| {
                 while (written < buffer.len) {
-                    const taken = queue.popFront() orelse break;
+                    const taken = self.takeFreshFrontLocked(queue, now_ms) orelse break;
                     buffer[written] = self.markDeliveredLocked(taken);
                     written += 1;
                 }
@@ -1037,9 +1042,8 @@ pub const ProcessMailbox = struct {
             return written;
         }
 
-        self.expireQueueLocked(&self.messages, now_ms);
         while (written < buffer.len) {
-            const taken = self.messages.popFront() orelse break;
+            const taken = self.takeFreshFrontLocked(&self.messages, now_ms) orelse break;
             buffer[written] = self.markDeliveredLocked(taken);
             written += 1;
         }
@@ -1055,30 +1059,50 @@ pub const ProcessMailbox = struct {
     }
 
     fn receiveLocked(self: *ProcessMailbox) MessageError!Message {
-        // One clock read per receive; expiry sweeps over deep queues compare
-        // against it instead of reading the clock per message.
+        // Expiry is lazy: only queue heads are checked here, so a receive
+        // costs O(1) regardless of queue depth. Expired messages deeper in
+        // the queue are reaped when they reach the head, or in bulk when a
+        // send finds the mailbox at capacity.
         const now_ms = compat.milliTimestamp();
 
-        // Remove all expired messages first
         if (self.priority_queues) |*queues| {
             for (queues) |*queue| {
-                self.expireQueueLocked(queue, now_ms);
-            }
-
-            // Now take the front of the highest-priority non-empty queue.
-            for (queues) |*queue| {
-                if (queue.popFront()) |taken| {
+                if (self.takeFreshFrontLocked(queue, now_ms)) |taken| {
                     return self.markDeliveredLocked(taken);
                 }
             }
             return MessageError.EmptyMailbox;
         }
 
-        // Standard queue handling
-        self.expireQueueLocked(&self.messages, now_ms);
-
-        const taken = self.messages.popFront() orelse return MessageError.EmptyMailbox;
+        const taken = self.takeFreshFrontLocked(&self.messages, now_ms) orelse
+            return MessageError.EmptyMailbox;
         return self.markDeliveredLocked(taken);
+    }
+
+    /// Pop the first non-expired message from `queue`, reaping any expired
+    /// messages encountered at the head. Returns null when the queue has no
+    /// fresh message.
+    fn takeFreshFrontLocked(self: *ProcessMailbox, queue: *RingQueue(Message), now_ms: i64) ?Message {
+        while (queue.peekFront()) |front| {
+            if (!front.isExpiredAt(now_ms)) {
+                return queue.popFront().?;
+            }
+            const expired = queue.popFront().?;
+            self.stats.messages_expired +|= 1;
+            self.stats.total_size_bytes -|= expired.metadata.size_bytes;
+            expired.deinit();
+        }
+        return null;
+    }
+
+    fn expireAllLocked(self: *ProcessMailbox, now_ms: i64) void {
+        if (self.priority_queues) |*queues| {
+            for (queues) |*queue| {
+                self.expireQueueLocked(queue, now_ms);
+            }
+        } else {
+            self.expireQueueLocked(&self.messages, now_ms);
+        }
     }
 
     fn expireQueueLocked(self: *ProcessMailbox, queue: *RingQueue(Message), now_ms: i64) void {
@@ -1135,6 +1159,9 @@ pub const ProcessMailbox = struct {
     }
 
     /// Return the current number of queued messages.
+    ///
+    /// Expiry is lazy, so the count may include expired messages that have
+    /// not yet been reaped by a receive or an at-capacity send.
     pub fn queuedCount(self: *ProcessMailbox) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1685,4 +1712,61 @@ test "ProcessMailbox snapshotQueue reports queued messages without consuming" {
 
 test {
     _ = @import("ring_queue.zig");
+}
+
+test "ProcessMailbox lazy expiry skips stale messages at delivery time" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 8,
+        .priority_queues = false,
+        .default_ttl_ms = null,
+    });
+    defer mailbox.deinit();
+
+    const stale = try Message.init(allocator, "stale", "sender", "old", null, .normal, 1_000);
+    try mailbox.send(stale);
+    const fresh = try Message.init(allocator, "fresh", "sender", "new", null, .normal, null);
+    try mailbox.send(fresh);
+
+    // Expire the queued head in place; it is reaped when it reaches the head.
+    mailbox.messages.at(0).metadata.timestamp -= 10_000;
+    try testing.expectEqual(@as(usize, 2), mailbox.queuedCount());
+
+    var received = try mailbox.receive();
+    defer received.deinit();
+    try testing.expectEqualStrings("fresh", received.id);
+    try testing.expectEqual(@as(usize, 1), mailbox.getStats().messages_expired);
+    try testing.expectEqual(@as(usize, 0), mailbox.queuedCount());
+}
+
+test "ProcessMailbox reclaims expired messages when a send finds it full" {
+    const allocator = testing.allocator;
+    var mailbox = ProcessMailbox.init(allocator, .{
+        .capacity = 2,
+        .priority_queues = false,
+        .enable_deadletter = false,
+        .default_ttl_ms = null,
+    });
+    defer mailbox.deinit();
+
+    const first = try Message.init(allocator, "first", "sender", "a", null, .normal, 1_000);
+    try mailbox.send(first);
+    const second = try Message.init(allocator, "second", "sender", "b", null, .normal, 1_000);
+    try mailbox.send(second);
+    try testing.expectEqual(@as(usize, 2), mailbox.queuedCount());
+
+    // Both queued messages expire; the mailbox looks full until a send
+    // triggers the reclaim sweep.
+    mailbox.messages.at(0).metadata.timestamp -= 10_000;
+    mailbox.messages.at(1).metadata.timestamp -= 10_000;
+
+    const fresh = try Message.init(allocator, "fresh", "sender", "c", null, .normal, null);
+    try mailbox.send(fresh);
+
+    try testing.expectEqual(@as(usize, 1), mailbox.queuedCount());
+    try testing.expectEqual(@as(usize, 2), mailbox.getStats().messages_expired);
+
+    var received = try mailbox.receive();
+    defer received.deinit();
+    try testing.expectEqualStrings("fresh", received.id);
 }
