@@ -19,7 +19,35 @@ registration, telemetry emission, timer scheduling, process-group routing,
 process-group broadcast, pub/sub fanout, request/reply correlation, and
 concurrent inbox producer/consumer contention.
 
-## Baseline (v2.2.0)
+## Baseline (v2.2.1)
+
+Captured on 2026-07-15 with Zig 0.16.0 on Darwin arm64 using:
+
+```bash
+zig build run -Doptimize=ReleaseSafe -- --iterations 10000
+```
+
+| Benchmark | Ops | Avg | Throughput | Allocs/Op |
+| --- | ---: | ---: | ---: | ---: |
+| inbox send+recv | 20,000 | 8,845 ns | 113,053/s | 1.501 |
+| registry lookup | 10,000 | 5 ns | 196,078,431/s | 0.000 |
+| registry register | 10,000 | 62 ns | 16,025,641/s | 1.001 |
+| telemetry emit | 10,000 | 11 ns | 84,033,613/s | 1.000 |
+| timer schedule+join | 10,000 | 17,366 ns | 57,583/s | 1.000 |
+| process group route | 10,000 | 127 ns | 7,843,137/s | 3.008 |
+| process group broadcast | 40,000 | 134 ns | 7,437,709/s | 3.252 |
+| pubsub fanout | 40,000 | 137 ns | 7,249,003/s | 3.252 |
+| request/reply correlate | 10,000 | 304 ns | 3,286,230/s | 12.000 |
+| inbox contention | 20,000 | 2,614 ns | 382,467/s | 1.501 |
+
+v2.2.1 fixes the v2.2.0 regression below by reading the clock once per
+`receive()` instead of once per queued message during expiry sweeps. Inbox
+send+recv is back at the v2.1.0 profile (the remaining per-op cost is the
+O(n) `orderedRemove(0)` sweep targeted by the v2.3.0 ring-buffer work), and
+inbox contention is now ~1.5x faster than v2.1.0. This is the comparison
+baseline for v2.3.0.
+
+## Baseline (v2.2.0, regressed)
 
 Captured on 2026-07-15 with Zig 0.16.0 on Darwin arm64 using:
 

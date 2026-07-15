@@ -363,10 +363,16 @@ pub const Message = struct {
 
     /// Return true if the message has a TTL and that TTL has elapsed.
     pub fn isExpired(self: Message) bool {
+        return self.isExpiredAt(compat.milliTimestamp());
+    }
+
+    /// Return whether the message would be expired at `now_ms` (Unix
+    /// milliseconds). Batch operations read the clock once and reuse it so
+    /// sweeping a deep queue does not pay one clock read per message.
+    pub fn isExpiredAt(self: Message, now_ms: i64) bool {
         if (self.metadata.ttl_ms) |ttl| {
-            const current_time_ms = compat.milliTimestamp();
-            if (current_time_ms <= self.metadata.timestamp) return false;
-            return current_time_ms - self.metadata.timestamp >= @as(i64, ttl);
+            if (now_ms <= self.metadata.timestamp) return false;
+            return now_ms - self.metadata.timestamp >= @as(i64, ttl);
         }
         return false;
     }
@@ -952,12 +958,16 @@ pub const ProcessMailbox = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // One clock read per receive; expiry sweeps over deep queues compare
+        // against it instead of reading the clock per message.
+        const now_ms = compat.milliTimestamp();
+
         // Remove all expired messages first
         if (self.priority_queues) |*queues| {
             for (queues) |*queue| {
                 var i: usize = 0;
                 while (i < queue.items.len) {
-                    if (queue.items[i].isExpired()) {
+                    if (queue.items[i].isExpiredAt(now_ms)) {
                         var msg = queue.orderedRemove(i);
                         msg.deinit();
                         self.stats.messages_expired +|= 1;
@@ -971,7 +981,7 @@ pub const ProcessMailbox = struct {
             // Now try to get a valid message from priority queues
             for (queues) |*queue| {
                 if (queue.items.len > 0) {
-                    if (queue.items[0].isExpired()) {
+                    if (queue.items[0].isExpiredAt(now_ms)) {
                         var msg = queue.orderedRemove(0);
                         msg.deinit();
                         self.stats.messages_expired +|= 1;
@@ -991,7 +1001,7 @@ pub const ProcessMailbox = struct {
         // Standard queue handling
         var i: usize = 0;
         while (i < self.messages.items.len) {
-            if (self.messages.items[i].isExpired()) {
+            if (self.messages.items[i].isExpiredAt(now_ms)) {
                 var msg = self.messages.orderedRemove(i);
                 msg.deinit();
                 self.stats.messages_expired +|= 1;
@@ -1006,7 +1016,7 @@ pub const ProcessMailbox = struct {
         }
 
         // Double check expiration of the first message
-        if (self.messages.items[0].isExpired()) {
+        if (self.messages.items[0].isExpiredAt(now_ms)) {
             var msg = self.messages.orderedRemove(0);
             msg.deinit();
             self.stats.messages_expired +|= 1;
@@ -1087,16 +1097,17 @@ pub const ProcessMailbox = struct {
             allocator.free(entry.sender);
         };
 
+        const now_ms = compat.milliTimestamp();
         if (self.priority_queues) |queues| {
             for (queues) |queue| {
                 for (queue.items) |msg| {
-                    entries[written] = try snapshotQueuedMessage(allocator, msg);
+                    entries[written] = try snapshotQueuedMessage(allocator, msg, now_ms);
                     written += 1;
                 }
             }
         } else {
             for (self.messages.items) |msg| {
-                entries[written] = try snapshotQueuedMessage(allocator, msg);
+                entries[written] = try snapshotQueuedMessage(allocator, msg, now_ms);
                 written += 1;
             }
         }
@@ -1107,7 +1118,7 @@ pub const ProcessMailbox = struct {
         };
     }
 
-    fn snapshotQueuedMessage(allocator: Allocator, msg: Message) !QueuedMessageSnapshot {
+    fn snapshotQueuedMessage(allocator: Allocator, msg: Message, now_ms: i64) !QueuedMessageSnapshot {
         const id_copy = try allocator.dupe(u8, msg.id);
         errdefer allocator.free(id_copy);
         const sender_copy = try allocator.dupe(u8, msg.sender);
@@ -1121,7 +1132,7 @@ pub const ProcessMailbox = struct {
             .attempt_count = msg.metadata.attempt_count,
             .timestamp_ms = msg.metadata.timestamp,
             .ttl_ms = msg.metadata.ttl_ms,
-            .expired = msg.isExpired(),
+            .expired = msg.isExpiredAt(now_ms),
         };
     }
 
