@@ -235,6 +235,12 @@ pub const Checkpointer = checkpoint.Checkpointer;
 pub const FileCheckpointer = checkpoint.FileCheckpointer;
 /// In-memory checkpoint persistence implementation, useful in tests.
 pub const MemoryCheckpointer = checkpoint.MemoryCheckpointer;
+/// Versioned, metered checkpoint pipeline with async writes.
+pub const CheckpointService = checkpoint.CheckpointService;
+/// Options for `CheckpointService`.
+pub const CheckpointServiceOptions = checkpoint.CheckpointServiceOptions;
+/// Lifetime counters for a `CheckpointService`.
+pub const CheckpointMetrics = checkpoint.CheckpointMetrics;
 
 /// Registry that can resolve local and remote process names.
 pub const DistributedRegistry = distributed_registry.DistributedRegistry;
