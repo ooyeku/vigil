@@ -282,9 +282,18 @@ pub const ProcessMailbox = messages.ProcessMailbox;
 /// Thread-safe local process registry.
 pub const Registry = @import("registry.zig").Registry;
 /// Timer helper for delayed and periodic callbacks.
+///
+/// Spawns one thread per timer; prefer `TimerService` for new code.
 pub const Timer = @import("timer.zig").Timer;
 /// Value snapshot of timer state.
 pub const TimerSnapshot = @import("timer.zig").TimerSnapshot;
+/// Runtime-owned timer scheduler module.
+pub const timer_service = @import("timer_service.zig");
+/// Min-heap timer scheduler: timeouts, intervals, and delayed sends on one
+/// thread. Prefer `Runtime.timers()` which owns the service lifecycle.
+pub const TimerService = timer_service.TimerService;
+/// Value snapshot of timer-service state.
+pub const TimerServiceSnapshot = timer_service.TimerServiceSnapshot;
 
 /// Return the semantic version of the public root API.
 pub fn getVersion() struct { major: u32, minor: u32, patch: u32 } {

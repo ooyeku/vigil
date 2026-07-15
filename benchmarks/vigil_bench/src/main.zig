@@ -275,6 +275,26 @@ pub fn benchTimerScheduling(allocator: std.mem.Allocator, iterations: usize) !Be
     };
 }
 
+pub fn benchTimerService(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
+    var service = vigil.TimerService.init(allocator);
+    defer service.deinit();
+    try service.start();
+
+    const start = nowNs();
+    for (0..iterations) |_| {
+        _ = try service.setTimeout(0, noopTimerCallback);
+    }
+    while (service.pendingCount() != 0) {
+        std.Thread.yield() catch {};
+    }
+
+    return .{
+        .name = "timer service schedule",
+        .operations = iterations,
+        .elapsed_ns = elapsedSince(start),
+    };
+}
+
 pub fn benchProcessGroupRoute(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
     const member_count = 4;
     var group = try vigil.ProcessGroup.init(allocator, "bench.group");
@@ -507,6 +527,7 @@ pub fn main(init: std.process.Init) !void {
     printResult(try runBenchmark(benchRegistryRegister, iterations));
     printResult(try runBenchmark(benchTelemetry, iterations));
     printResult(try runBenchmark(benchTimerScheduling, iterations));
+    printResult(try runBenchmark(benchTimerService, iterations));
     printResult(try runBenchmark(benchProcessGroupRoute, iterations));
     printResult(try runBenchmark(benchProcessGroupBroadcast, iterations));
     printResult(try runBenchmark(benchPubSub, iterations));

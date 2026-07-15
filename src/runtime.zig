@@ -6,6 +6,7 @@ const inbox_api = @import("api/inbox.zig");
 const supervisor_builder = @import("api/supervisor_builder.zig");
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 const circuit_breaker = @import("circuit_breaker.zig");
+const timer_service = @import("timer_service.zig");
 
 /// Feature flags for an owned Vigil runtime.
 ///
@@ -124,6 +125,8 @@ pub const Runtime = struct {
     options: RuntimeOptions,
     /// Optional owned event timeline created by `enableTimeline()`.
     timeline: ?*telemetry.EventTimeline,
+    /// Optional owned timer service created lazily by `timers()`.
+    timer_svc: ?*timer_service.TimerService,
     /// True until `shutdown()` or `deinit()` is called.
     running: std.atomic.Value(bool),
 
@@ -140,6 +143,7 @@ pub const Runtime = struct {
             .shutdown_manager = shutdown_mod.ShutdownManager.init(allocator),
             .options = options,
             .timeline = null,
+            .timer_svc = null,
             .running = std.atomic.Value(bool).init(true),
         };
     }
@@ -150,6 +154,11 @@ pub const Runtime = struct {
     /// methods; callers still own those returned values.
     pub fn deinit(self: *Runtime) void {
         self.running.store(false, .release);
+        if (self.timer_svc) |service| {
+            service.deinit();
+            self.allocator.destroy(service);
+            self.timer_svc = null;
+        }
         if (self.timeline) |timeline| {
             self.telemetry_emitter.detachTimeline();
             timeline.deinit();
@@ -390,12 +399,33 @@ pub const Runtime = struct {
         try self.shutdown_manager.onShutdown(hook);
     }
 
+    /// Return the runtime-owned timer service, creating and starting it on
+    /// first use.
+    ///
+    /// All timeouts, intervals, and delayed sends scheduled through the
+    /// service share one scheduler thread. The runtime owns the service; it
+    /// stops during `shutdown()` and is released by `deinit()`.
+    pub fn timers(self: *Runtime) !*timer_service.TimerService {
+        if (self.timer_svc) |service| return service;
+
+        const service = try self.allocator.create(timer_service.TimerService);
+        errdefer self.allocator.destroy(service);
+        service.* = timer_service.TimerService.init(self.allocator);
+        try service.start();
+
+        self.timer_svc = service;
+        return service;
+    }
+
     /// Mark the runtime as stopped and run shutdown hooks when enabled.
     ///
     /// This is intentionally separate from `deinit()`: call `shutdown()` to
     /// notify the application, then `deinit()` to release runtime resources.
     pub fn shutdown(self: *Runtime) void {
         self.running.store(false, .release);
+        if (self.timer_svc) |service| {
+            service.stop();
+        }
         if (self.options.shutdown_enabled) {
             self.shutdown_manager.shutdown(.{});
         }
@@ -636,4 +666,49 @@ test "Runtime debugDump renders processes and timeline" {
     try std.testing.expect(std.mem.indexOf(u8, dump, "vigil runtime dump") != null);
     try std.testing.expect(std.mem.indexOf(u8, dump, "orders.inbox: queue 1/2") != null);
     try std.testing.expect(std.mem.indexOf(u8, dump, "recent events") != null);
+}
+
+var runtime_timer_hits = std.atomic.Value(u32).init(0);
+
+fn recordRuntimeTimerHit() void {
+    _ = runtime_timer_hits.fetchAdd(1, .monotonic);
+}
+
+test "Runtime owns a lazily created timer service" {
+    runtime_timer_hits.store(0, .release);
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const service = try rt.timers();
+    try std.testing.expect(service == try rt.timers());
+
+    var ib = try rt.inbox(.{ .capacity = 4 });
+    defer ib.close();
+
+    _ = try service.setTimeout(2, recordRuntimeTimerHit);
+    const msg = try @import("messages.zig").Message.init(
+        std.testing.allocator,
+        "runtime-delayed",
+        "timer",
+        "payload",
+        null,
+        .normal,
+        null,
+    );
+    _ = try service.sendAfter(2, ib.mailbox, msg);
+
+    var delivered = (try ib.recvTimeout(500)) orelse return error.ExpectedDelivery;
+    defer delivered.deinit();
+    try std.testing.expectEqualStrings("runtime-delayed", delivered.id);
+
+    var waited_ms: u32 = 0;
+    while (runtime_timer_hits.load(.acquire) == 0 and waited_ms < 500) : (waited_ms += 5) {
+        @import("compat.zig").sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(u32, 1), runtime_timer_hits.load(.acquire));
+
+    // Shutdown stops the scheduler; deinit releases it.
+    rt.shutdown();
+    try std.testing.expect(!service.snapshot().running);
 }
