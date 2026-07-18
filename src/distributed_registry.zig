@@ -1145,3 +1145,101 @@ test "DistributedRegistry resolves peers over persistent connections" {
     try std.testing.expect(partitioned.peers[0].consecutive_failures >= 1);
     try std.testing.expect(!partitioned.peers[0].is_alive);
 }
+
+test "DistributedRegistry heals after a partition and reconnects" {
+    const allocator = std.testing.allocator;
+
+    var node_a = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .listen_port = 39421,
+        .sync_interval_ms = 10,
+    });
+    defer node_a.deinit();
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+    try node_a.register("healing_service", &mailbox, .global);
+    try node_a.startSync();
+    defer node_a.stopSync();
+
+    var node_b = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{"127.0.0.1:39421"},
+        .listen_port = 39422,
+        .sync_interval_ms = 10,
+    });
+    defer node_b.deinit();
+
+    // Resolve once so a persistent connection exists.
+    var found: ?RemoteProcessInfo = null;
+    var waited_ms: u32 = 0;
+    while (found == null and waited_ms < 3_000) : (waited_ms += 20) {
+        found = node_b.queryPeers("healing_service");
+        if (found == null) compat.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(found != null);
+
+    // Partition: stop A entirely; B's queries fail and the peer goes dead.
+    node_a.stopSync();
+    var lost = node_b.queryPeers("healing_service");
+    var retries: u32 = 0;
+    while (lost != null and retries < 20) : (retries += 1) {
+        compat.sleep(10 * std.time.ns_per_ms);
+        lost = node_b.queryPeers("healing_service");
+    }
+    try std.testing.expect(lost == null);
+
+    // Heal: restart A's listener; B reconnects once its backoff expires.
+    try node_a.startSync();
+    var healed: ?RemoteProcessInfo = null;
+    waited_ms = 0;
+    while (healed == null and waited_ms < 5_000) : (waited_ms += 50) {
+        compat.sleep(50 * std.time.ns_per_ms);
+        healed = node_b.queryPeers("healing_service");
+    }
+    try std.testing.expect(healed != null);
+
+    var state = try node_b.snapshot(allocator);
+    defer state.deinit();
+    try std.testing.expectEqual(@as(u32, 0), state.peers[0].consecutive_failures);
+    try std.testing.expect(state.peers[0].reconnects >= 2);
+}
+
+test "DistributedRegistry syncs global names to peers in the background" {
+    const allocator = std.testing.allocator;
+
+    // A listens and receives sync; B pushes its global registrations to A.
+    var node_a = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .listen_port = 39423,
+        .sync_interval_ms = 10,
+    });
+    defer node_a.deinit();
+    try node_a.startSync();
+    defer node_a.stopSync();
+
+    var node_b = try DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{"127.0.0.1:39423"},
+        .listen_port = 39424,
+        .sync_interval_ms = 10,
+    });
+    defer node_b.deinit();
+    var mailbox = ProcessMailbox.init(allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+    try node_b.register("synced_service", &mailbox, .global);
+    try node_b.startSync();
+    defer node_b.stopSync();
+
+    // B's sync loop batches REG frames to A; A caches the remote name and
+    // can then resolve it without an active query.
+    var resolved: ?RemoteProcessInfo = null;
+    var waited_ms: u32 = 0;
+    while (resolved == null and waited_ms < 5_000) : (waited_ms += 50) {
+        compat.sleep(50 * std.time.ns_per_ms);
+        resolved = node_a.whereisGlobal("synced_service");
+    }
+    try std.testing.expect(resolved != null);
+
+    var state = try node_b.snapshot(allocator);
+    defer state.deinit();
+    try std.testing.expect(state.sync_frames >= 1);
+    try std.testing.expect(state.heartbeats >= 1);
+}

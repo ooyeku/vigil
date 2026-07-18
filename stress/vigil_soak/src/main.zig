@@ -323,6 +323,67 @@ fn runRegistryChurn(allocator: std.mem.Allocator, seconds: u64) !void {
     std.debug.print("registry churn: final count {d}\n", .{registry.count()});
 }
 
+// --- distributed chaos ------------------------------------------------------
+
+fn runDistributedChaos(allocator: std.mem.Allocator, seconds: u64) !void {
+    var node_a = try vigil.DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .listen_port = 39431,
+        .sync_interval_ms = 10,
+    });
+    defer node_a.deinit();
+    var mailbox = vigil.ProcessMailbox.init(allocator, .{ .capacity = 1 });
+    defer mailbox.deinit();
+    try node_a.register("chaos_service", &mailbox, .global);
+
+    var node_b = try vigil.DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{"127.0.0.1:39431"},
+        .listen_port = 39432,
+        .sync_interval_ms = 10,
+    });
+    defer node_b.deinit();
+
+    const deadline = Deadline.init(seconds);
+    var cycles: u64 = 0;
+    var heals: u64 = 0;
+
+    // Repeated partition/heal cycles: resolution must succeed while the
+    // listener is up and fail closed while it is down.
+    while (!deadline.expired()) : (cycles += 1) {
+        try node_a.startSync();
+        var resolved: ?vigil.RemoteProcessInfo = null;
+        var waited_ms: u32 = 0;
+        while (resolved == null and waited_ms < 3_000) : (waited_ms += 20) {
+            vigil.compat.sleep(20 * std.time.ns_per_ms);
+            resolved = node_b.queryPeers("chaos_service");
+        }
+        if (resolved == null) {
+            fail("distributed resolution never healed");
+            node_a.stopSync();
+            break;
+        }
+        heals += 1;
+
+        node_a.stopSync();
+        var lost = node_b.queryPeers("chaos_service");
+        var retries: u32 = 0;
+        while (lost != null and retries < 50) : (retries += 1) {
+            vigil.compat.sleep(10 * std.time.ns_per_ms);
+            lost = node_b.queryPeers("chaos_service");
+        }
+        if (lost != null) fail("distributed resolution survived a partition");
+    }
+
+    var state = try node_b.snapshot(allocator);
+    defer state.deinit();
+    std.debug.print("distributed chaos: {d} cycles, {d} heals, {d} reconnects, {d} queries\n", .{
+        cycles,
+        heals,
+        state.peers[0].reconnects,
+        state.peer_queries,
+    });
+}
+
 // --- main ------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) !void {
@@ -345,7 +406,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const per_scenario = @max(seconds / 5, 1);
+    const per_scenario = @max(seconds / 6, 1);
     std.debug.print("vigil soak: {d}s total, {d}s per scenario\n\n", .{ seconds, per_scenario });
 
     try runInboxChurn(allocator, per_scenario);
@@ -353,6 +414,7 @@ pub fn main(init: std.process.Init) !void {
     try runFanoutChurn(allocator, per_scenario);
     try runTimerChurn(allocator, per_scenario);
     try runRegistryChurn(allocator, per_scenario);
+    try runDistributedChaos(allocator, per_scenario);
 
     const failed = failures.load(.monotonic);
     if (failed > 0) {
