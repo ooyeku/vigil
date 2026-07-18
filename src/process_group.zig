@@ -76,6 +76,8 @@ pub const ProcessGroup = struct {
     members: std.ArrayListUnmanaged(GroupMember),
     /// Next member index for round-robin routing.
     round_robin_index: usize,
+    /// Optional emitter for delivery-failure events. Not owned.
+    telemetry_emitter: ?*telemetry.TelemetryEmitter,
     /// Protects membership and round-robin state.
     mutex: compat.Mutex,
     /// Lifetime successful deliveries across all broadcasts.
@@ -93,10 +95,18 @@ pub const ProcessGroup = struct {
             .name = name_copy,
             .members = .empty,
             .round_robin_index = 0,
+            .telemetry_emitter = null,
             .mutex = .{},
             .total_delivered = std.atomic.Value(u64).init(0),
             .total_failed = std.atomic.Value(u64).init(0),
         };
+    }
+
+    /// Attach an emitter for delivery-failure events. Not owned.
+    pub fn setTelemetryEmitter(self: *ProcessGroup, emitter: ?*telemetry.TelemetryEmitter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.telemetry_emitter = emitter;
     }
 
     /// Release group-owned names and member storage.
@@ -247,7 +257,7 @@ pub const ProcessGroup = struct {
                 member.inbox.send(payload) catch {
                     result.failed += 1;
                     // Emit telemetry for failed delivery
-                    if (telemetry.getGlobal()) |t| {
+                    if (self.telemetry_emitter) |t| {
                         t.emit(.{
                             .event_type = .message_dropped,
                             .timestamp_ms = compat.milliTimestamp(),

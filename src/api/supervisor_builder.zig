@@ -14,6 +14,7 @@
 //! ```
 
 const std = @import("std");
+const telemetry = @import("../telemetry.zig");
 const compat = @import("../compat.zig");
 const supervisor_mod = @import("../supervisor.zig");
 const process = @import("../process.zig");
@@ -72,6 +73,8 @@ pub const SupervisorBuilder = struct {
     crash_handler: ?CrashHandler = null,
     /// Whether built supervisors emit telemetry.
     enable_telemetry: bool = false,
+    /// Optional emitter applied to built supervisors. Not owned.
+    telemetry_emitter: ?*telemetry.TelemetryEmitter = null,
 
     /// Create a builder with default supervisor options.
     pub fn init(allocator: std.mem.Allocator) SupervisorBuilder {
@@ -179,6 +182,18 @@ pub const SupervisorBuilder = struct {
         return result;
     }
 
+    /// Attach an emitter that built supervisors use for crash telemetry.
+    ///
+    /// The emitter is not owned and must outlive the built supervisor.
+    pub fn withTelemetryEmitter(self: *SupervisorBuilder, emitter: ?*telemetry.TelemetryEmitter) SupervisorBuilder {
+        var result = self.*;
+        result.telemetry_emitter = emitter;
+        if (result.supervisor) |*sup| {
+            sup.telemetry_emitter = emitter;
+        }
+        return result;
+    }
+
     /// Build the supervisor value.
     ///
     /// The returned supervisor is owned by the caller and should be
@@ -189,15 +204,18 @@ pub const SupervisorBuilder = struct {
             self.supervisor = null;
             result.options.crash_handler = self.crash_handler;
             result.options.enable_telemetry = self.enable_telemetry;
+            result.telemetry_emitter = self.telemetry_emitter;
             return result;
         }
-        return Supervisor.init(self.allocator, .{
+        var built = Supervisor.init(self.allocator, .{
             .strategy = self.strategy_val,
             .max_restarts = self.max_restarts_val,
             .max_seconds = self.max_seconds_val,
             .crash_handler = self.crash_handler,
             .enable_telemetry = self.enable_telemetry,
         });
+        built.telemetry_emitter = self.telemetry_emitter;
+        return built;
     }
 };
 

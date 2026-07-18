@@ -2,9 +2,9 @@
 //!
 //! Telemetry is intentionally lightweight: handlers are plain function
 //! pointers, event dispatch is synchronous, and events carry optional metadata
-//! as borrowed slices. New v2 applications should prefer
-//! `Runtime.telemetry_emitter`; the global helpers remain available for modules
-//! that still publish through process-wide telemetry.
+//! as borrowed slices. There is no process-wide emitter: every component that
+//! emits (inboxes, supervisors, circuit breakers, groups, brokers) takes an
+//! injected `TelemetryEmitter`, normally `Runtime.telemetry_emitter`.
 
 const std = @import("std");
 const compat = @import("compat.zig");
@@ -398,65 +398,6 @@ pub const TelemetryEmitter = struct {
         return self.handler_count.load(.acquire);
     }
 };
-
-/// Optional process-wide telemetry emitter.
-///
-/// Prefer `Runtime.telemetry_emitter` in new v2 code unless a process-wide
-/// integration point is explicitly desired.
-var global_telemetry: ?TelemetryEmitter = null;
-var telemetry_mutex: compat.Mutex = .{};
-
-/// Initialize the optional global telemetry emitter if needed.
-pub fn initGlobal(allocator: std.mem.Allocator) !void {
-    telemetry_mutex.lock();
-    defer telemetry_mutex.unlock();
-
-    if (global_telemetry == null) {
-        global_telemetry = TelemetryEmitter.init(allocator);
-    }
-}
-
-/// Deinitialize and release the global telemetry emitter.
-/// Must only be called during shutdown when no other threads are
-/// emitting events or registering handlers.
-pub fn deinitGlobal() void {
-    telemetry_mutex.lock();
-    defer telemetry_mutex.unlock();
-
-    if (global_telemetry) |*t| {
-        t.deinit();
-        global_telemetry = null;
-    }
-}
-
-/// Get global telemetry instance.
-///
-/// SAFETY: The returned pointer is valid as long as `deinitGlobal()` has
-/// not been called.  Callers must ensure `deinitGlobal()` is only invoked
-/// during shutdown after all event emission has completed.
-pub fn getGlobal() ?*TelemetryEmitter {
-    telemetry_mutex.lock();
-    defer telemetry_mutex.unlock();
-    return if (global_telemetry) |*t| t else null;
-}
-
-/// Register a handler on the optional global telemetry emitter.
-///
-/// Does nothing when global telemetry has not been initialized.
-pub fn on(event_type: EventType, handler: EventHandler) !void {
-    if (getGlobal()) |telemetry| {
-        try telemetry.on(event_type, handler);
-    }
-}
-
-/// Emit an event through the optional global telemetry emitter.
-///
-/// Does nothing when global telemetry has not been initialized.
-pub fn emit(event: Event) void {
-    if (getGlobal()) |telemetry| {
-        telemetry.emit(event);
-    }
-}
 
 /// Allocate a detailed circuit breaker event.
 ///

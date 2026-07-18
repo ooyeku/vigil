@@ -90,6 +90,8 @@ pub const CircuitBreaker = struct {
     mutex: compat.Mutex,
     /// Stable id used in telemetry events.
     circuit_id: []const u8,
+    /// Optional emitter for state-transition events.
+    telemetry_emitter: ?*telemetry.TelemetryEmitter,
     /// Allocator for copied id and telemetry helpers.
     allocator: std.mem.Allocator,
 
@@ -120,8 +122,18 @@ pub const CircuitBreaker = struct {
             .total_successes = 0,
             .mutex = .{},
             .circuit_id = id_copy,
+            .telemetry_emitter = null,
             .allocator = allocator,
         };
+    }
+
+    /// Attach an emitter for circuit state-transition events.
+    ///
+    /// The emitter is not owned and must outlive the attachment.
+    pub fn setTelemetryEmitter(self: *CircuitBreaker, emitter: ?*telemetry.TelemetryEmitter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.telemetry_emitter = emitter;
     }
 
     /// Release the copied circuit id.
@@ -328,7 +340,7 @@ pub const CircuitBreaker = struct {
     /// Emit telemetry after releasing the breaker mutex so handlers may safely
     /// inspect or update this breaker.
     fn emitEvent(self: *CircuitBreaker, transition: TelemetryTransition) void {
-        if (telemetry.getGlobal()) |t| {
+        if (self.telemetry_emitter) |t| {
             const event = telemetry.createCircuitEvent(
                 self.allocator,
                 transition.event_type,
@@ -488,14 +500,14 @@ test "CircuitBreaker rejects configurations that cannot recover" {
 
 test "CircuitBreaker telemetry handlers may inspect the emitting breaker" {
     const allocator = std.testing.allocator;
-    telemetry.deinitGlobal();
-    try telemetry.initGlobal(allocator);
-    defer telemetry.deinitGlobal();
+    var emitter = telemetry.TelemetryEmitter.init(allocator);
+    defer emitter.deinit();
 
     var breaker = try CircuitBreaker.init(allocator, "reentrant", .{
         .failure_threshold = 1,
     });
     defer breaker.deinit();
+    breaker.setTelemetryEmitter(&emitter);
 
     const Recorder = struct {
         var target: ?*CircuitBreaker = null;
@@ -508,7 +520,7 @@ test "CircuitBreaker telemetry handlers may inspect the emitting breaker" {
     };
     Recorder.target = &breaker;
     Recorder.calls.store(0, .release);
-    try telemetry.on(.circuit_opened, Recorder.handle);
+    try emitter.on(.circuit_opened, Recorder.handle);
 
     breaker.recordFailure();
     try std.testing.expectEqual(CircuitState.open, breaker.getState());

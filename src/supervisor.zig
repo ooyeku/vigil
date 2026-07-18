@@ -188,6 +188,8 @@ pub const Supervisor = struct {
     is_shutting_down: bool,
     /// Current state of the supervisor
     state: SupervisorState,
+    /// Optional emitter for crash telemetry. Not owned.
+    telemetry_emitter: ?*telemetry.TelemetryEmitter,
     /// List of child IDs allocated by the builder that need to be freed
     allocated_child_ids: std.ArrayList([]const u8),
 
@@ -206,6 +208,7 @@ pub const Supervisor = struct {
             .monitor_thread = null,
             .is_shutting_down = false,
             .state = .initial,
+            .telemetry_emitter = null,
             .allocated_child_ids = .empty,
         };
     }
@@ -224,6 +227,13 @@ pub const Supervisor = struct {
         }
         self.allocated_child_ids.deinit(self.allocator);
         self.children.deinit(self.allocator);
+    }
+
+    /// Attach an emitter for child-crash telemetry. Not owned.
+    pub fn setTelemetryEmitter(self: *Supervisor, emitter: ?*telemetry.TelemetryEmitter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.telemetry_emitter = emitter;
     }
 
     /// Convenience method to stop the supervisor with a default timeout.
@@ -479,11 +489,13 @@ pub const Supervisor = struct {
         }
 
         if (self.options.enable_telemetry) {
-            telemetry.emit(.{
-                .event_type = .process_crashed,
-                .timestamp_ms = compat.milliTimestamp(),
-                .metadata = child_id,
-            });
+            if (self.telemetry_emitter) |emitter| {
+                emitter.emit(.{
+                    .event_type = .process_crashed,
+                    .timestamp_ms = compat.milliTimestamp(),
+                    .metadata = child_id,
+                });
+            }
         }
     }
 
@@ -710,12 +722,9 @@ test "supervisor restart strategies" {
     {
         supervisor_crash_count.store(0, .release);
         supervisor_crash_event_count.store(0, .release);
-        telemetry.deinitGlobal();
-        try telemetry.initGlobal(allocator);
-        defer telemetry.deinitGlobal();
-        if (telemetry.getGlobal()) |emitter| {
-            try emitter.on(.process_crashed, recordSupervisorCrashEvent);
-        }
+        var emitter = telemetry.TelemetryEmitter.init(allocator);
+        defer emitter.deinit();
+        try emitter.on(.process_crashed, recordSupervisorCrashEvent);
 
         var supervisor = Supervisor.init(allocator, .{
             .strategy = .one_for_one,
@@ -731,6 +740,7 @@ test "supervisor restart strategies" {
             supervisor.deinit();
         }
 
+        supervisor.setTelemetryEmitter(&emitter);
         try supervisor.addChild(.{
             .id = "test1",
             .start_fn = WorkerGate.run,

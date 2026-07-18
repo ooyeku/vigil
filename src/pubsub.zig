@@ -293,6 +293,8 @@ pub const PubSubBroker = struct {
     allocator: std.mem.Allocator,
     /// Registered subscriber pointers.
     subscribers: std.ArrayListUnmanaged(*Subscriber),
+    /// Optional emitter for delivery-failure events. Not owned.
+    telemetry_emitter: ?*telemetry.TelemetryEmitter,
     /// Protects subscriber registration.
     mutex: compat.Mutex,
     /// Lifetime publish operations.
@@ -307,11 +309,19 @@ pub const PubSubBroker = struct {
         return .{
             .allocator = allocator,
             .subscribers = .empty,
+            .telemetry_emitter = null,
             .mutex = .{},
             .total_publishes = std.atomic.Value(u64).init(0),
             .total_delivered = std.atomic.Value(u64).init(0),
             .total_failed = std.atomic.Value(u64).init(0),
         };
+    }
+
+    /// Attach an emitter for delivery-failure events. Not owned.
+    pub fn setTelemetryEmitter(self: *PubSubBroker, emitter: ?*telemetry.TelemetryEmitter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.telemetry_emitter = emitter;
     }
 
     /// Release broker-owned subscriber pointer storage.
@@ -401,7 +411,7 @@ pub const PubSubBroker = struct {
                 subscriber.inbox.send(payload) catch {
                     result.failed += 1;
                     // Emit telemetry for failed delivery
-                    if (telemetry.getGlobal()) |t| {
+                    if (self.telemetry_emitter) |t| {
                         t.emit(.{
                             .event_type = .message_dropped,
                             .timestamp_ms = compat.milliTimestamp(),

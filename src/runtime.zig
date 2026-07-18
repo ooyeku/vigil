@@ -253,7 +253,8 @@ pub const Runtime = struct {
     /// supervisor according to the supervisor API.
     pub fn supervisor(self: *Runtime) supervisor_builder.SupervisorBuilder {
         var builder = supervisor_builder.supervisor(self.allocator);
-        return builder.withTelemetry(self.options.telemetry_enabled);
+        var configured = builder.withTelemetry(self.options.telemetry_enabled);
+        return configured.withTelemetryEmitter(if (self.options.telemetry_enabled) &self.telemetry_emitter else null);
     }
 
     /// Register a raw mailbox under a local name.
