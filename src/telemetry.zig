@@ -40,6 +40,13 @@ pub const EventType = enum {
     circuit_closed,
     circuit_half_open,
 
+    // Reliability policy events
+    policy_retry,
+    policy_timeout,
+    policy_fallback,
+    policy_circuit_open,
+    policy_failure,
+
     // GenServer events
     genserver_started,
     genserver_stopped,

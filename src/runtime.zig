@@ -88,6 +88,10 @@ pub const RuntimeSnapshot = struct {
     telemetry_handler_count: usize,
     /// Number of shutdown hooks registered on this runtime.
     shutdown_hook_count: usize,
+    /// Timer service state, when `timers()` has been used.
+    timer_service: ?@import("timer_service.zig").TimerServiceSnapshot,
+    /// Retained event-timeline entries, when `enableTimeline()` was called.
+    timeline_entries: ?usize,
     /// Registered mailbox snapshots.
     processes: []RuntimeProcessSnapshot,
 
@@ -284,6 +288,8 @@ pub const Runtime = struct {
             .registered_count = processes.len,
             .telemetry_handler_count = self.telemetry_emitter.handlerCount(),
             .shutdown_hook_count = self.shutdown_manager.hookCount(),
+            .timer_service = if (self.timer_svc) |service| service.snapshot() else null,
+            .timeline_entries = if (self.timeline) |timeline| timeline.count() else null,
             .processes = processes,
         };
     }
@@ -402,6 +408,14 @@ pub const Runtime = struct {
             state.telemetry_handler_count,
             state.shutdown_hook_count,
         });
+        if (state.timer_service) |timer_state| {
+            try out.print(allocator, "  timers: {d} pending, {d} fired, {d} cancelled (running: {})\n", .{
+                timer_state.pending,
+                timer_state.fired,
+                timer_state.cancelled,
+                timer_state.running,
+            });
+        }
 
         try out.print(allocator, "processes ({d}):\n", .{state.processes.len});
         for (state.processes) |process| {
@@ -463,6 +477,37 @@ pub const Runtime = struct {
 
         self.timer_svc = service;
         return service;
+    }
+
+    /// Gracefully drain the runtime.
+    ///
+    /// Marks the runtime stopped (so `isRunning()`-gated producers stop
+    /// accepting work), stops the timer service so no delayed sends arrive,
+    /// waits up to `timeout_ms` for every registered inbox to empty, then
+    /// runs shutdown hooks when enabled. Returns true when all registered
+    /// queues drained before the deadline.
+    pub fn drain(self: *Runtime, timeout_ms: u32) !bool {
+        self.running.store(false, .release);
+        if (self.timer_svc) |service| service.stop();
+
+        const deadline_ms = @import("compat.zig").monotonicMilliTimestamp() +| @as(i64, timeout_ms);
+        var drained = false;
+        while (!drained) {
+            var state = try self.registry.snapshot(self.allocator);
+            var queued: usize = 0;
+            for (state.entries) |entry| queued += entry.queue_depth;
+            state.deinit();
+
+            drained = queued == 0;
+            if (drained) break;
+            if (@import("compat.zig").monotonicMilliTimestamp() >= deadline_ms) break;
+            @import("compat.zig").sleep(10 * std.time.ns_per_ms);
+        }
+
+        if (self.options.shutdown_enabled) {
+            self.shutdown_manager.shutdown(.{});
+        }
+        return drained;
     }
 
     /// Mark the runtime as stopped and run shutdown hooks when enabled.
@@ -789,4 +834,74 @@ test "Runtime profiles configure inbox feature sets" {
     defer msg.deinit();
     try std.testing.expectEqualStrings("payload", msg.payload.?);
     try std.testing.expect(msg.metadata.ttl_ms == null);
+}
+
+test "Runtime snapshot includes timer service and timeline state" {
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var before = try rt.snapshot(std.testing.allocator);
+    defer before.deinit();
+    try std.testing.expect(before.timer_service == null);
+    try std.testing.expect(before.timeline_entries == null);
+
+    try rt.enableTimeline(8);
+    const service = try rt.timers();
+    _ = service;
+
+    var after = try rt.snapshot(std.testing.allocator);
+    defer after.deinit();
+    try std.testing.expect(after.timer_service != null);
+    try std.testing.expect(after.timer_service.?.running);
+    try std.testing.expectEqual(@as(?usize, 0), after.timeline_entries);
+
+    const dump = try rt.debugDump(std.testing.allocator);
+    defer std.testing.allocator.free(dump);
+    try std.testing.expect(std.mem.indexOf(u8, dump, "timers: 0 pending") != null);
+}
+
+test "Runtime drain empties queues, stops timers, and runs hooks" {
+    runtime_shutdown_count.store(0, .release);
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    try rt.onShutdown(recordRuntimeShutdown);
+    _ = try rt.timers();
+
+    var ib = try rt.inbox(.{ .capacity = 8 });
+    defer ib.close();
+    try rt.register("drain.inbox", ib.mailbox);
+    try ib.send("pending-1");
+    try ib.send("pending-2");
+
+    const Drainer = struct {
+        fn run(target: *inbox_api.Inbox) void {
+            @import("compat.zig").sleep(20 * std.time.ns_per_ms);
+            for (0..2) |_| {
+                const msg = target.recvTimeout(200) catch return orelse return;
+                msg.deinit();
+            }
+        }
+    };
+    const consumer = try std.Thread.spawn(.{}, Drainer.run, .{ib});
+    const drained = try rt.drain(2_000);
+    consumer.join();
+
+    try std.testing.expect(drained);
+    try std.testing.expect(!rt.isRunning());
+    try std.testing.expect(!rt.timer_svc.?.snapshot().running);
+    try std.testing.expectEqual(@as(u32, 1), runtime_shutdown_count.load(.acquire));
+}
+
+test "Runtime drain reports failure when queues stay backed up" {
+    var rt = try Runtime.init(std.testing.allocator, .{ .shutdown_enabled = false });
+    defer rt.deinit();
+
+    var ib = try rt.inbox(.{ .capacity = 4 });
+    defer ib.close();
+    try rt.register("stuck.inbox", ib.mailbox);
+    try ib.send("never-consumed");
+
+    try std.testing.expect(!try rt.drain(50));
+    try std.testing.expect(!rt.isRunning());
 }

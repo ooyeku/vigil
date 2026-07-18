@@ -14,6 +14,7 @@
 const std = @import("std");
 const CircuitBreaker = @import("circuit_breaker.zig").CircuitBreaker;
 const compat = @import("compat.zig");
+const telemetry = @import("telemetry.zig");
 
 /// Final outcome category for a policy-protected operation.
 pub const PolicyOutcome = enum {
@@ -285,6 +286,9 @@ pub fn PolicyOptions(comptime Context: type, comptime T: type) type {
         clock: *const fn (*Context) i64 = defaultClock(Context),
         /// Sleep hook for deterministic tests and custom runtime schedulers.
         sleeper: *const fn (*Context, u64) void = defaultSleeper(Context),
+        /// Optional emitter for policy outcome events (retries, timeouts,
+        /// fallbacks, circuit rejections, permanent failures). Not owned.
+        telemetry: ?*telemetry.TelemetryEmitter = null,
     };
 }
 
@@ -330,6 +334,7 @@ pub fn execute(
             }
 
             retries += 1;
+            emitPolicyEvent(Context, T, options, .policy_retry);
             const delay_ms = options.retry.delayMs(attempts);
             if (delay_ms > 0) {
                 options.sleeper(context, @as(u64, delay_ms) * std.time.ns_per_ms);
@@ -454,6 +459,20 @@ fn makeFailure(
     };
 }
 
+fn emitPolicyEvent(
+    comptime Context: type,
+    comptime T: type,
+    options: PolicyOptions(Context, T),
+    event_type: telemetry.EventType,
+) void {
+    const emitter = options.telemetry orelse return;
+    emitter.emit(.{
+        .event_type = event_type,
+        .timestamp_ms = compat.milliTimestamp(),
+        .metadata = null,
+    });
+}
+
 fn finishFailure(
     comptime Context: type,
     comptime T: type,
@@ -465,6 +484,11 @@ fn finishFailure(
     start_ms: i64,
     last_error: ?anyerror,
 ) PolicyResult(T) {
+    emitPolicyEvent(Context, T, options, switch (outcome) {
+        .timeout => .policy_timeout,
+        .circuit_open => .policy_circuit_open,
+        else => .policy_failure,
+    });
     const failure = makeFailure(Context, T, context, options, outcome, attempts, retries, start_ms, last_error);
 
     if (options.fallback) |fallback| {
@@ -472,6 +496,7 @@ fn finishFailure(
             const fallback_failure = makeFailure(Context, T, context, options, .permanent_failure, attempts, retries, start_ms, err);
             return .{ .permanent_failure = fallback_failure };
         };
+        emitPolicyEvent(Context, T, options, .policy_fallback);
         var report = makeReport(Context, T, context, options, .fallback, attempts, retries, start_ms, last_error);
         report.fallback_from = outcome;
 
@@ -765,4 +790,54 @@ test "Bulkhead run wraps an operation with a permit" {
     try std.testing.expectError(error.DependencyFailed, bulkhead.run(Dependency, u32, &dependency, Dependency.failing));
     try std.testing.expectEqual(@as(u32, 0), bulkhead.snapshot().in_flight);
     try std.testing.expectEqual(@as(u32, 2), dependency.calls);
+}
+
+var policy_event_counts = [_]u32{0} ** 5;
+
+fn recordPolicyEvent(event: telemetry.Event) void {
+    const index: usize = switch (event.event_type) {
+        .policy_retry => 0,
+        .policy_timeout => 1,
+        .policy_fallback => 2,
+        .policy_circuit_open => 3,
+        .policy_failure => 4,
+        else => return,
+    };
+    policy_event_counts[index] += 1;
+}
+
+test "execute emits policy telemetry for retries, failures, and fallbacks" {
+    policy_event_counts = [_]u32{0} ** 5;
+    var emitter = telemetry.TelemetryEmitter.init(std.testing.allocator);
+    defer emitter.deinit();
+    inline for (.{ .policy_retry, .policy_timeout, .policy_fallback, .policy_circuit_open, .policy_failure }) |event_type| {
+        try emitter.on(event_type, recordPolicyEvent);
+    }
+
+    const Failing = struct {
+        fn operation(_: *@This()) anyerror!void {
+            return error.Down;
+        }
+        fn fallback(_: *@This(), _: PolicyFailure) anyerror!void {}
+        fn clock(_: *@This()) i64 {
+            return 0;
+        }
+        fn sleep(_: *@This(), _: u64) void {}
+    };
+
+    var ctx = Failing{};
+    const result = execute(Failing, void, &ctx, Failing.operation, .{
+        .retry = .{ .max_attempts = 3 },
+        .fallback = Failing.fallback,
+        .clock = Failing.clock,
+        .sleeper = Failing.sleep,
+        .telemetry = &emitter,
+    });
+    try std.testing.expect(result == .fallback);
+
+    try std.testing.expectEqual(@as(u32, 2), policy_event_counts[0]); // retries
+    try std.testing.expectEqual(@as(u32, 1), policy_event_counts[4]); // permanent failure
+    try std.testing.expectEqual(@as(u32, 1), policy_event_counts[2]); // fallback
+    try std.testing.expectEqual(@as(u32, 0), policy_event_counts[1]);
+    try std.testing.expectEqual(@as(u32, 0), policy_event_counts[3]);
 }
