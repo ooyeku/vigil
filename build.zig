@@ -16,32 +16,16 @@ pub fn build(b: *std.Build) void {
     });
     vigil_mod.addOptions("vigil_build_options", build_options);
 
-    // Keep the reduced legacy compatibility module buildable during migration.
-    const legacy_mod = b.addModule("vigil/legacy", .{
-        .root_source_file = b.path("src/legacy.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    legacy_mod.addOptions("vigil_build_options", build_options);
-
     // Add tests
     const lib_unit_tests = b.addTest(.{
         .root_module = vigil_mod,
     });
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-    const legacy_unit_tests = b.addTest(.{
-        .root_module = legacy_mod,
-    });
-    const run_legacy_unit_tests = b.addRunArtifact(legacy_unit_tests);
-    const run_legacy_after_root = b.addRunArtifact(legacy_unit_tests);
-    run_legacy_after_root.step.dependOn(&run_lib_unit_tests.step);
     const root_test_step = b.step("test-root", "Run current API unit tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
-    const legacy_test_step = b.step("test-legacy", "Run reduced legacy compatibility tests");
-    legacy_test_step.dependOn(&run_legacy_unit_tests.step);
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_legacy_after_root.step);
+    test_step.dependOn(&run_lib_unit_tests.step);
 }
 
 fn readPackageVersion(b: *std.Build) std.SemanticVersion {

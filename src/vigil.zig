@@ -28,12 +28,6 @@
 //! defer msg.deinit();
 //! ```
 //!
-//! A reduced set of deprecated 0.2.x type aliases remains temporarily in the
-//! legacy module for migrations. Current code should not depend on it:
-//! ```zig
-//! const vigil_legacy = @import("vigil/legacy");
-//! ```
-
 const std = @import("std");
 const messages = @import("messages.zig");
 const genserver = @import("genserver.zig");

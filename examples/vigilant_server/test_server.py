@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 
-DEFAULT_ITERATIONS = 1000
+DEFAULT_ITERATIONS = 10000
 DEFAULT_POOL_SIZE = 50
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 9090
