@@ -111,9 +111,9 @@ pub const AppBuilder = app_builder.AppBuilder;
 /// Server-construction shortcut from `api/server_sugar.zig`.
 pub const server = server_sugar.server;
 /// Deployment presets used by app-builder APIs.
-pub const Preset = presets.Preset;
-/// Concrete values behind a `Preset`.
-pub const PresetConfig = presets.PresetConfig;
+pub const AppPreset = presets.AppPreset;
+/// Concrete values behind a `AppPreset`.
+pub const AppPresetConfig = presets.AppPresetConfig;
 /// Owned v2 runtime. Prefer this over global registries and shutdown hooks.
 pub const Runtime = runtime_api.Runtime;
 /// Runtime feature flags.

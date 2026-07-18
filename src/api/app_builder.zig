@@ -24,8 +24,8 @@ pub const SupervisorOptions = supervisor_mod.SupervisorOptions;
 pub const RestartStrategy = supervisor_mod.RestartStrategy;
 pub const ChildSpec = process.ChildSpec;
 pub const ProcessPriority = process.ProcessPriority;
-pub const Preset = presets.Preset;
-pub const PresetConfig = presets.PresetConfig;
+pub const AppPreset = presets.AppPreset;
+pub const AppPresetConfig = presets.AppPresetConfig;
 
 /// Builder for a simple supervised worker application.
 ///
@@ -38,16 +38,16 @@ pub const AppBuilder = struct {
     /// Lazily-created supervisor.
     supervisor: ?Supervisor = null,
     /// Concrete settings selected from the chosen preset.
-    preset_config: PresetConfig,
+    preset_config: AppPresetConfig,
     /// Worker ids allocated by the app builder.
     allocated_ids: std.ArrayList([]const u8),
 
     /// Allocate a new app builder for `preset`.
-    pub fn init(allocator: std.mem.Allocator, preset: Preset) !*AppBuilder {
+    pub fn init(allocator: std.mem.Allocator, preset: AppPreset) !*AppBuilder {
         const app_builder = try allocator.create(AppBuilder);
         errdefer allocator.destroy(app_builder);
 
-        const preset_config = PresetConfig.get(preset);
+        const preset_config = AppPresetConfig.get(preset);
 
         app_builder.* = .{
             .allocator = allocator,
@@ -180,7 +180,7 @@ pub fn app(allocator: std.mem.Allocator) !*AppBuilder {
 }
 
 /// Create an application builder using an explicit preset.
-pub fn appWithPreset(allocator: std.mem.Allocator, preset: Preset) !*AppBuilder {
+pub fn appWithPreset(allocator: std.mem.Allocator, preset: AppPreset) !*AppBuilder {
     return try AppBuilder.init(allocator, preset);
 }
 
@@ -280,7 +280,7 @@ test "AppBuilder all presets" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const preset_list = [_]Preset{ .development, .production, .high_availability, .testing };
+    const preset_list = [_]AppPreset{ .development, .production, .high_availability, .testing };
     for (preset_list) |preset| {
         var app_builder = try appWithPreset(allocator, preset);
         try app_builder.build();

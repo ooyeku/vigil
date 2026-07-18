@@ -3,7 +3,7 @@
 //! Pre-configured settings for different deployment scenarios.
 
 /// Named configuration profile for builder APIs.
-pub const Preset = enum {
+pub const AppPreset = enum {
     /// Lenient restart limits and verbose logging for local development.
     development,
     /// Conservative defaults for deployed services.
@@ -14,8 +14,8 @@ pub const Preset = enum {
     testing,
 };
 
-/// Concrete values selected by a `Preset`.
-pub const PresetConfig = struct {
+/// Concrete values selected by a `AppPreset`.
+pub const AppPresetConfig = struct {
     /// Maximum restarts allowed within `max_seconds`.
     max_restarts: u32,
     /// Time window for restart-limit accounting.
@@ -32,7 +32,7 @@ pub const PresetConfig = struct {
     enable_verbose_logging: bool,
 
     /// Return the concrete configuration for a preset.
-    pub fn get(preset: Preset) PresetConfig {
+    pub fn get(preset: AppPreset) AppPresetConfig {
         return switch (preset) {
             .development => .{
                 .max_restarts = 10,
@@ -74,8 +74,8 @@ pub const PresetConfig = struct {
     }
 };
 
-test "Presets development configuration" {
-    const config = PresetConfig.get(.development);
+test "AppPresets development configuration" {
+    const config = AppPresetConfig.get(.development);
 
     try @import("std").testing.expect(config.max_restarts == 10);
     try @import("std").testing.expect(config.max_seconds == 5);
@@ -84,8 +84,8 @@ test "Presets development configuration" {
     try @import("std").testing.expect(config.enable_verbose_logging == true);
 }
 
-test "Presets production configuration" {
-    const config = PresetConfig.get(.production);
+test "AppPresets production configuration" {
+    const config = AppPresetConfig.get(.production);
 
     try @import("std").testing.expect(config.max_restarts == 3);
     try @import("std").testing.expect(config.max_seconds == 60);
@@ -94,16 +94,16 @@ test "Presets production configuration" {
     try @import("std").testing.expect(config.enable_verbose_logging == false);
 }
 
-test "Presets high availability configuration" {
-    const config = PresetConfig.get(.high_availability);
+test "AppPresets high availability configuration" {
+    const config = AppPresetConfig.get(.high_availability);
 
     try @import("std").testing.expect(config.max_restarts == 5);
     try @import("std").testing.expect(config.max_seconds == 30);
     try @import("std").testing.expect(config.health_check_interval_ms == 2000);
 }
 
-test "Presets testing configuration" {
-    const config = PresetConfig.get(.testing);
+test "AppPresets testing configuration" {
+    const config = AppPresetConfig.get(.testing);
 
     try @import("std").testing.expect(config.max_restarts == 1);
     try @import("std").testing.expect(config.max_seconds == 10);
