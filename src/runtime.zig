@@ -905,3 +905,23 @@ test "Runtime drain reports failure when queues stay backed up" {
     try std.testing.expect(!try rt.drain(50));
     try std.testing.expect(!rt.isRunning());
 }
+
+test "Runtime snapshot and debugDump survive allocation failure" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, rt: *Runtime) !void {
+            var state = try rt.snapshot(allocator);
+            state.deinit();
+            const dump = try rt.debugDump(allocator);
+            allocator.free(dump);
+        }
+    };
+
+    var rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+    var ib = try rt.inbox(.{ .capacity = 4 });
+    defer ib.close();
+    try rt.register("alloc.inbox", ib.mailbox);
+    try ib.send("queued");
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{&rt});
+}

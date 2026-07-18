@@ -1772,3 +1772,33 @@ test "ProcessMailbox reclaims expired messages when a send finds it full" {
     defer received.deinit();
     try testing.expectEqualStrings("fresh", received.id);
 }
+
+test "Message init and clone survive allocation failure at every step" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var msg = try Message.init(allocator, "alloc-id", "sender", "payload", null, .normal, 1_000);
+            defer msg.deinit();
+            try msg.setCorrelationId("correlation");
+            var clone = try msg.cloneWithAllocator(allocator);
+            clone.deinit();
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{});
+}
+
+test "ProcessMailbox queue snapshot survives allocation failure" {
+    const Case = struct {
+        fn run(allocator: Allocator, mailbox: *ProcessMailbox) !void {
+            var snapshot = try mailbox.snapshotQueue(allocator);
+            snapshot.deinit();
+        }
+    };
+
+    var mailbox = ProcessMailbox.init(testing.allocator, .{ .capacity = 8 });
+    defer mailbox.deinit();
+    for (0..3) |_| {
+        const msg = try Message.init(testing.allocator, "id", "sender", "body", null, .normal, null);
+        try mailbox.send(msg);
+    }
+    try testing.checkAllAllocationFailures(testing.allocator, Case.run, .{&mailbox});
+}

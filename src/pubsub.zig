@@ -771,3 +771,24 @@ fn buildRandomTopic(random: std.Random, buffer: []u8, allow_wildcards: bool) usi
     }
     return len;
 }
+
+test "PubSubBroker snapshot survives allocation failure" {
+    const Case = struct {
+        fn run(allocator: std.mem.Allocator, broker: *PubSubBroker) !void {
+            var snapshot = try broker.snapshot(allocator);
+            snapshot.deinit();
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var broker = PubSubBroker.init(allocator);
+    defer broker.deinit();
+    var inbox = try Inbox.init(allocator);
+    defer inbox.close();
+    var subscriber = Subscriber.init(allocator, inbox);
+    defer subscriber.deinit();
+    try subscriber.subscribe(&.{ "orders.*", "audit.#" });
+    try broker.subscribe(&subscriber);
+
+    try std.testing.checkAllAllocationFailures(allocator, Case.run, .{&broker});
+}

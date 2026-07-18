@@ -771,3 +771,18 @@ test "CheckpointService saveAsync requires a running worker" {
     defer service.deinit();
     try std.testing.expectError(error.NotRunning, service.saveAsync("id", "state"));
 }
+
+test "CheckpointService save pipeline survives allocation failure" {
+    const Case = struct {
+        fn run(allocator: Allocator) !void {
+            var backend = MemoryCheckpointer.init(allocator);
+            defer backend.deinit();
+            var service = CheckpointService.init(allocator, backend.toCheckpointer(), .{});
+            defer service.deinit();
+            try service.save("alloc-check", "state-bytes");
+            const loaded = (try service.load("alloc-check", allocator)) orelse return error.MissingCheckpoint;
+            allocator.free(loaded);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
