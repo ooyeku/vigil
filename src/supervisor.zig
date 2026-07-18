@@ -64,13 +64,8 @@ pub const SupervisorOptions = struct {
     enable_telemetry: bool = false,
 };
 
-/// Statistics about supervisor operations.
-/// These stats can be used for monitoring and debugging.
-/// - total_restarts: u32,
-/// - uptime_ms: i64,
-/// - last_failure_time: i64,
-/// - active_children: u32,
-pub const SupervisorStats = struct {
+/// Internal restart bookkeeping surfaced through `Supervisor.snapshot()`.
+const SupervisorStats = struct {
     /// Total number of process restarts since supervisor start
     total_restarts: u32 = 0,
     /// Supervisor uptime in milliseconds
@@ -105,6 +100,45 @@ pub const SupervisorState = enum {
     stopped,
 };
 
+/// Snapshot of one supervised child.
+pub const SupervisorChildSnapshot = struct {
+    /// Copied child id owned by the enclosing snapshot.
+    id: []const u8,
+    /// Child process state at snapshot time.
+    state: Process.ProcessState,
+    /// Restarts recorded for this child.
+    restart_count: u32,
+};
+
+/// Owned snapshot of a supervisor and its supervised children.
+pub const SupervisorSnapshot = struct {
+    allocator: Allocator,
+    /// Supervisor state at snapshot time.
+    state: SupervisorState,
+    /// Configured restart strategy.
+    strategy: RestartStrategy,
+    /// Number of supervised children.
+    child_count: usize,
+    /// Number of children currently running.
+    active_children: usize,
+    /// Total restarts since supervisor start.
+    total_restarts: u32,
+    /// Wall-clock timestamp of the most recent child failure, or zero.
+    last_failure_time_ms: i64,
+    /// Elapsed supervisor uptime in milliseconds.
+    uptime_ms: i64,
+    /// Per-child snapshots in registration order.
+    children: []SupervisorChildSnapshot,
+
+    /// Release copied child ids and snapshot storage.
+    pub fn deinit(self: *SupervisorSnapshot) void {
+        for (self.children) |child| {
+            self.allocator.free(child.id);
+        }
+        self.allocator.free(self.children);
+    }
+};
+
 /// Main supervisor structure that manages child processes
 ///
 /// fields:
@@ -128,7 +162,7 @@ pub const SupervisorState = enum {
 /// - stop: fn (self: *Supervisor) void,
 /// - startMonitoring: fn (self: *Supervisor) !void,
 /// - stopMonitoring: fn (self: *Supervisor) void,
-/// - getStats: fn (self: *Supervisor) SupervisorStats,
+/// - snapshot: fn (self: *Supervisor, allocator: Allocator) !SupervisorSnapshot,
 /// - shutdown: fn (self: *Supervisor, timeout_ms: i64) SupervisorError!void,
 /// - findChild: fn (self: *Supervisor, id: []const u8) ?*Process.ChildProcess,
 pub const Supervisor = struct {
@@ -284,25 +318,6 @@ pub const Supervisor = struct {
         }
     }
 
-    /// Get current supervisor statistics.
-    /// Returns a copy of the current stats with up-to-date active children count.
-    pub fn getStats(self: *Supervisor) SupervisorStats {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        var active: u32 = 0;
-        for (self.children.items) |*child| {
-            if (child.getState() == .running) active +|= 1;
-        }
-
-        self.stats.active_children = active;
-        self.stats.uptime_ms = @max(
-            0,
-            compat.monotonicMilliTimestamp() -| self.started_at_ms,
-        );
-        return self.stats;
-    }
-
     /// Gracefully shut down the supervisor and all child processes.
     /// Waits up to timeout_ms for processes to stop before returning error.ShutdownTimeout.
     pub fn shutdown(self: *Supervisor, timeout_ms: i64) SupervisorError!void {
@@ -376,43 +391,6 @@ pub const Supervisor = struct {
         return null;
     }
 
-    /// Snapshot of one supervised child.
-    pub const SupervisorChildSnapshot = struct {
-        /// Copied child id owned by the enclosing snapshot.
-        id: []const u8,
-        /// Child process state at snapshot time.
-        state: Process.ProcessState,
-        /// Restarts recorded for this child.
-        restart_count: u32,
-    };
-
-    /// Owned snapshot of a supervisor and its supervised children.
-    pub const SupervisorSnapshot = struct {
-        allocator: Allocator,
-        /// Supervisor state at snapshot time.
-        state: SupervisorState,
-        /// Configured restart strategy.
-        strategy: RestartStrategy,
-        /// Number of supervised children.
-        child_count: usize,
-        /// Number of children currently running.
-        active_children: usize,
-        /// Total restarts since supervisor start.
-        total_restarts: u32,
-        /// Elapsed supervisor uptime in milliseconds.
-        uptime_ms: i64,
-        /// Per-child snapshots in registration order.
-        children: []SupervisorChildSnapshot,
-
-        /// Release copied child ids and snapshot storage.
-        pub fn deinit(self: *SupervisorSnapshot) void {
-            for (self.children) |child| {
-                self.allocator.free(child.id);
-            }
-            self.allocator.free(self.children);
-        }
-    };
-
     /// Capture an owned snapshot of the supervision tree.
     ///
     /// The caller owns the returned snapshot and must call `deinit()`.
@@ -448,60 +426,10 @@ pub const Supervisor = struct {
             .child_count = children.len,
             .active_children = active,
             .total_restarts = self.stats.total_restarts,
+            .last_failure_time_ms = self.stats.last_failure_time,
             .uptime_ms = @max(0, compat.monotonicMilliTimestamp() -| self.started_at_ms),
             .children = children,
         };
-    }
-
-    /// Supervisor introspection information
-    pub const InspectionInfo = struct {
-        child_count: usize,
-        active_children: usize,
-        state: SupervisorState,
-        restart_count: u32,
-        total_restarts: u32,
-
-        pub const ChildInfo = struct {
-            id: []const u8,
-            state: Process.ProcessState,
-            restart_count: u32,
-        };
-    };
-
-    /// Inspect supervisor state (returns snapshot without child details to avoid memory issues)
-    pub fn inspect(self: *Supervisor) InspectionInfo {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        var active: usize = 0;
-        for (self.children.items) |*child| {
-            if (child.getState() == .running) active += 1;
-        }
-
-        return .{
-            .child_count = self.children.items.len,
-            .active_children = active,
-            .state = self.state,
-            .restart_count = self.restart_count,
-            .total_restarts = self.stats.total_restarts,
-        };
-    }
-
-    /// Get child info by ID (caller does not own returned data)
-    pub fn getChildInfo(self: *Supervisor, id: []const u8) ?InspectionInfo.ChildInfo {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        for (self.children.items) |*child| {
-            if (std.mem.eql(u8, child.spec.id, id)) {
-                return .{
-                    .id = child.spec.id,
-                    .state = child.getState(),
-                    .restart_count = child.stats.restart_count,
-                };
-            }
-        }
-        return null;
     }
 
     /// Force restart a child
@@ -676,7 +604,8 @@ test "supervisor basic operations" {
         .shutdown_timeout_ms = 100,
     }));
 
-    const stats = supervisor.getStats();
+    var stats = try supervisor.snapshot(allocator);
+    defer stats.deinit();
     try std.testing.expect(stats.active_children == 1);
     try std.testing.expect(stats.total_restarts == 0);
     try std.testing.expect(stats.uptime_ms >= 0);
@@ -726,7 +655,8 @@ test "supervisor monitoring" {
     // Wait for process to start
     compat.sleep(150 * std.time.ns_per_ms);
 
-    const stats = supervisor.getStats();
+    var stats = try supervisor.snapshot(allocator);
+    defer stats.deinit();
     try std.testing.expect(stats.active_children == 1);
 
     // Stop monitoring first before shutdown
@@ -824,7 +754,7 @@ test "supervisor restart strategies" {
 
         // Wait for restart, crash callback, and telemetry to complete.
         var waited_ms: u32 = 0;
-        while ((supervisor.getStats().total_restarts == 0 or
+        while ((supervisor.stats.total_restarts == 0 or
             supervisor_crash_count.load(.acquire) == 0 or
             supervisor_crash_event_count.load(.acquire) == 0) and waited_ms < 3000) : (waited_ms += 25)
         {
@@ -832,9 +762,10 @@ test "supervisor restart strategies" {
         }
 
         // Get stats with mutex protection
-        const stats = supervisor.getStats();
+        var stats = try supervisor.snapshot(allocator);
+        defer stats.deinit();
         try std.testing.expectEqual(@as(u32, 1), stats.total_restarts);
-        try std.testing.expectEqual(@as(u32, 1), stats.active_children);
+        try std.testing.expectEqual(@as(usize, 1), stats.active_children);
         try std.testing.expectEqual(@as(u32, 1), supervisor_crash_count.load(.acquire));
         try std.testing.expectEqual(@as(u32, 1), supervisor_crash_event_count.load(.acquire));
     }

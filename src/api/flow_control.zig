@@ -155,7 +155,7 @@ pub const BackpressureConfig = struct {
 /// Producer overload shows up here (throttled, delayed, blocked, dropped);
 /// consumer failure is handled separately by the dead-letter and poison
 /// machinery on the inbox itself.
-pub const FlowControlStats = struct {
+pub const FlowControlMetrics = struct {
     /// Sends that reached the inbox.
     accepted: u64 = 0,
     /// Sends rejected by the rate limiter.
@@ -294,7 +294,7 @@ pub const FlowControlledInbox = struct {
     }
 
     /// Return lifetime flow-control counters for this wrapper.
-    pub fn flowStats(self: *FlowControlledInbox) FlowControlStats {
+    pub fn metrics(self: *FlowControlledInbox) FlowControlMetrics {
         return .{
             .accepted = self.accepted.load(.monotonic),
             .throttled = self.throttled.load(.monotonic),
@@ -321,11 +321,6 @@ pub const FlowControlledInbox = struct {
     /// After calling this, do not call `close()` on the original inbox pointer.
     pub fn close(self: *FlowControlledInbox) void {
         self.inbox.close();
-    }
-
-    /// Return statistics from the wrapped inbox.
-    pub fn stats(self: *FlowControlledInbox) messages.ProcessMailbox.MailboxStats {
-        return self.inbox.stats();
     }
 };
 
@@ -412,7 +407,7 @@ test "FlowControlledInbox backpressure drop_oldest" {
     try flow_inbox.send("new");
 
     try std.testing.expectEqual(@as(usize, 5), inbox.mailbox.queuedCount());
-    const stats = inbox.stats();
+    const stats = inbox.metrics();
     try std.testing.expectEqual(@as(usize, 6), stats.messages_dropped);
 
     var saw_new = false;
@@ -492,12 +487,12 @@ test "FlowControlledInbox adaptive strategy delays and blocks with metrics" {
     // Below the low watermark: no delay recorded.
     try flow_inbox.send("m1");
     try flow_inbox.send("m2");
-    try std.testing.expectEqual(@as(u64, 0), flow_inbox.flowStats().delayed);
+    try std.testing.expectEqual(@as(u64, 0), flow_inbox.metrics().delayed);
 
     // Inside the pressure band: sends are delayed but accepted.
     try flow_inbox.send("m3");
     try flow_inbox.send("m4");
-    const banded = flow_inbox.flowStats();
+    const banded = flow_inbox.metrics();
     try std.testing.expectEqual(@as(u64, 2), banded.delayed);
     try std.testing.expectEqual(@as(u64, 4), banded.accepted);
 
@@ -519,7 +514,7 @@ test "FlowControlledInbox adaptive strategy delays and blocks with metrics" {
     try flow_inbox.send("m7");
     drainer.join();
 
-    const final = flow_inbox.flowStats();
+    const final = flow_inbox.metrics();
     try std.testing.expectEqual(@as(u64, 1), final.blocked);
     try std.testing.expectEqual(@as(u64, 7), final.accepted);
 }
@@ -538,7 +533,7 @@ test "FlowControlledInbox records throttled and rejected sends" {
     try throttled_inbox.send("a");
     try throttled_inbox.send("b");
     try std.testing.expectError(MessageError.RateLimitExceeded, throttled_inbox.send("c"));
-    const throttled = throttled_inbox.flowStats();
+    const throttled = throttled_inbox.metrics();
     try std.testing.expectEqual(@as(u64, 2), throttled.accepted);
     try std.testing.expectEqual(@as(u64, 1), throttled.throttled);
 
@@ -548,5 +543,5 @@ test "FlowControlledInbox records throttled and rejected sends" {
         .low_watermark = 1,
     });
     try std.testing.expectError(MessageError.MailboxFull, rejecting_inbox.send("d"));
-    try std.testing.expectEqual(@as(u64, 1), rejecting_inbox.flowStats().rejected);
+    try std.testing.expectEqual(@as(u64, 1), rejecting_inbox.metrics().rejected);
 }

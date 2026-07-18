@@ -75,7 +75,7 @@ pub const RuntimeProfile = enum {
 };
 
 /// Per-process information captured by a runtime snapshot.
-pub const RuntimeProcessSnapshot = Registry.RegisteredMailboxSnapshot;
+pub const RuntimeProcessSnapshot = @import("registry.zig").RegisteredMailboxSnapshot;
 
 /// Owned runtime snapshot for debugging and health reporting.
 pub const RuntimeSnapshot = struct {
@@ -606,7 +606,7 @@ test "Runtime snapshot and health expose dead-letter and poison state" {
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].dead_letter_count);
     try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].poison_count);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].stats.poison_messages);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.processes[0].metrics.poison_messages);
 
     const report = try rt.health(std.testing.allocator);
     try std.testing.expectEqual(RuntimeHealthStatus.degraded, report.status);

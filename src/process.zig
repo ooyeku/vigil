@@ -30,7 +30,7 @@
 //! }
 //!
 //! // Get process statistics
-//! const stats = process.getStats();
+//! const stats = process.metrics();
 //! ```
 const std = @import("std");
 const Thread = std.Thread;
@@ -103,7 +103,7 @@ pub const ProcessSignal = enum {
 /// - peak_memory_bytes: usize,
 /// - health_check_failures: u32,
 ///
-pub const ProcessStats = struct {
+pub const ProcessMetrics = struct {
     /// Timestamp when the process was started
     start_time: i64,
     /// Last time the process was known to be active
@@ -205,7 +205,7 @@ pub const ProcessResult = struct {
 /// - mutex: Mutex,
 /// - state: ProcessState,
 /// - last_error: ?anyerror,
-/// - stats: ProcessStats,
+/// - stats: ProcessMetrics,
 /// - result: ?ProcessResult,
 ///
 /// Methods:
@@ -216,7 +216,7 @@ pub const ProcessResult = struct {
 /// - getState: fn (self: *ChildProcess) ProcessState,
 /// - sendSignal: fn (self: *ChildProcess, signal: ProcessSignal) ProcessError!void,
 /// - checkHealth: fn (self: *ChildProcess) bool,
-/// - getStats: fn (self: *ChildProcess) ProcessStats,
+/// - getStats: fn (self: *ChildProcess) ProcessMetrics,
 /// - getResult: fn (self: *ChildProcess) ?ProcessResult,
 /// - updateStats: fn (self: *ChildProcess) void,
 /// - checkResourceLimits: fn (self: *ChildProcess) ProcessError!void,
@@ -234,7 +234,7 @@ pub const ChildProcess = struct {
     /// Last error encountered, if any
     last_error: ?anyerror,
     /// Process execution statistics
-    stats: ProcessStats,
+    stats: ProcessMetrics,
     /// Process termination result
     result: ?ProcessResult,
     /// Memory allocator for process resources
@@ -528,8 +528,8 @@ pub const ChildProcess = struct {
     /// Get current process statistics.
     /// Provides insight into process execution and resource usage.
     ///
-    /// Returns: Copy of current ProcessStats
-    pub fn getStats(self: *ChildProcess) ProcessStats {
+    /// Returns: Copy of current ProcessMetrics
+    pub fn metrics(self: *ChildProcess) ProcessMetrics {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.stats;
@@ -839,7 +839,7 @@ test "Process health checks" {
 
     // Let it run and check stats
     compat.sleep(20 * std.time.ns_per_ms);
-    const stats = process.getStats();
+    const stats = process.metrics();
     try std.testing.expect(stats.health_check_failures == 0);
     try std.testing.expect(stats.start_time > 0);
     try std.testing.expectEqual(ProcessState.running, process.getState());

@@ -3,6 +3,36 @@ const compat = @import("compat.zig");
 const Mutex = compat.Mutex;
 const ProcessMailbox = @import("messages.zig").ProcessMailbox;
 
+/// Snapshot of one registered mailbox.
+pub const RegisteredMailboxSnapshot = struct {
+    /// Registered process name.
+    name: []const u8,
+    /// Current queued message count.
+    queue_depth: usize,
+    /// Configured mailbox capacity.
+    capacity: usize,
+    /// Current retained dead-letter entry count.
+    dead_letter_count: usize,
+    /// Current retained poison-message count.
+    poison_count: usize,
+    /// Lifetime mailbox counters.
+    metrics: ProcessMailbox.MailboxMetrics,
+};
+
+/// Owned snapshot of registry entries.
+pub const RegistrySnapshot = struct {
+    allocator: std.mem.Allocator,
+    entries: []RegisteredMailboxSnapshot,
+
+    /// Release copied names and snapshot storage.
+    pub fn deinit(self: *RegistrySnapshot) void {
+        for (self.entries) |entry| {
+            self.allocator.free(entry.name);
+        }
+        self.allocator.free(self.entries);
+    }
+};
+
 /// Local process registry for mapping names to process mailboxes.
 ///
 /// Thread-safe implementation sharded by name hash: each shard has its own
@@ -29,36 +59,6 @@ pub const Registry = struct {
         const hash = std.hash.Wyhash.hash(0, name);
         return &self.shards[@as(usize, @intCast(hash & (shard_count - 1)))];
     }
-
-    /// Snapshot of one registered mailbox.
-    pub const RegisteredMailboxSnapshot = struct {
-        /// Registered process name.
-        name: []const u8,
-        /// Current queued message count.
-        queue_depth: usize,
-        /// Configured mailbox capacity.
-        capacity: usize,
-        /// Current retained dead-letter entry count.
-        dead_letter_count: usize,
-        /// Current retained poison-message count.
-        poison_count: usize,
-        /// Mailbox usage statistics.
-        stats: ProcessMailbox.MailboxStats,
-    };
-
-    /// Owned snapshot of registry entries.
-    pub const Snapshot = struct {
-        allocator: std.mem.Allocator,
-        entries: []RegisteredMailboxSnapshot,
-
-        /// Release copied names and snapshot storage.
-        pub fn deinit(self: *Snapshot) void {
-            for (self.entries) |entry| {
-                self.allocator.free(entry.name);
-            }
-            self.allocator.free(self.entries);
-        }
-    };
 
     /// Initialize an empty registry.
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -136,7 +136,7 @@ pub const Registry = struct {
     /// Registered mailboxes must remain alive while this function runs.
     /// Shards are locked one at a time, so entries reflect a per-shard
     /// consistent view rather than one global instant.
-    pub fn snapshot(self: *Registry, allocator: std.mem.Allocator) !Snapshot {
+    pub fn snapshot(self: *Registry, allocator: std.mem.Allocator) !RegistrySnapshot {
         var entries: std.ArrayListUnmanaged(RegisteredMailboxSnapshot) = .empty;
         errdefer {
             for (entries.items) |entry| {
@@ -160,7 +160,7 @@ pub const Registry = struct {
                     .capacity = mailbox.config.capacity,
                     .dead_letter_count = mailbox.deadLetterCount(),
                     .poison_count = mailbox.poisonCount(),
-                    .stats = mailbox.getStats(),
+                    .metrics = mailbox.metrics(),
                 });
             }
         }

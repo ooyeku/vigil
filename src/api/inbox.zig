@@ -336,11 +336,11 @@ pub const Inbox = struct {
         return accepted;
     }
 
-    /// Return a snapshot of the underlying mailbox statistics.
-    pub fn stats(self: *Inbox) ProcessMailbox.MailboxStats {
+    /// Return lifetime counters from the underlying mailbox.
+    pub fn metrics(self: *Inbox) ProcessMailbox.MailboxMetrics {
         var operation = self.acquireOperation() catch return .{};
         defer operation.release();
-        return self.mailbox.getStats();
+        return self.mailbox.metrics();
     }
 
     /// Attach an emitter used for dead-letter lifecycle events.
@@ -828,7 +828,7 @@ test "Inbox stats" {
     try inbox_ptr.send("msg1");
     try inbox_ptr.send("msg2");
 
-    const inbox_stats = inbox_ptr.stats();
+    const inbox_stats = inbox_ptr.metrics();
     // Just verify stats are accessible and reasonable
     try std.testing.expect(inbox_stats.messages_received >= 0);
     try std.testing.expect(inbox_stats.messages_sent >= 0);
@@ -1075,7 +1075,7 @@ test "InboxBuilder drop_oldest backpressure replaces existing message" {
     defer msg.deinit();
     try std.testing.expectEqualStrings("second", msg.payload.?);
     try std.testing.expectEqual(@as(?Message, null), try inbox_ptr.recvTimeout(5));
-    try std.testing.expectEqual(@as(usize, 1), inbox_ptr.stats().messages_dropped);
+    try std.testing.expectEqual(@as(usize, 1), inbox_ptr.metrics().messages_dropped);
 }
 
 test "Inbox supports concurrent producer and consumer churn" {

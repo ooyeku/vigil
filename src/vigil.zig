@@ -159,7 +159,7 @@ pub const BackpressureStrategy = flow_control.BackpressureStrategy;
 /// Wrapper that applies rate limiting/backpressure around an inbox.
 pub const FlowControlledInbox = flow_control.FlowControlledInbox;
 /// Lifetime counters for flow-control outcomes.
-pub const FlowControlStats = flow_control.FlowControlStats;
+pub const FlowControlMetrics = flow_control.FlowControlMetrics;
 
 /// Build a reply message that preserves the request correlation id.
 pub const reply = request_reply.reply;
@@ -276,9 +276,9 @@ pub const DeadLetterReplayStatus = messages.DeadLetterReplayStatus;
 /// Low-level supervisor type re-exported for compatibility.
 pub const Supervisor = supervisor_builder.Supervisor;
 /// Owned snapshot of a supervisor and its supervised children.
-pub const SupervisorSnapshot = Supervisor.SupervisorSnapshot;
+pub const SupervisorSnapshot = @import("supervisor.zig").SupervisorSnapshot;
 /// Snapshot of one supervised child.
-pub const SupervisorChildSnapshot = Supervisor.SupervisorChildSnapshot;
+pub const SupervisorChildSnapshot = @import("supervisor.zig").SupervisorChildSnapshot;
 /// Restart strategy used by supervisors.
 pub const RestartStrategy = supervisor_builder.RestartStrategy;
 /// Process scheduling priority used by supervisor children.

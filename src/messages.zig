@@ -654,7 +654,7 @@ pub const MailboxConfig = struct {
 /// - deadletter_queue: ?std.ArrayList(Message), // Queue for undeliverable messages (optional)
 /// - mutex: Mutex, // Thread synchronization
 /// - config: MailboxConfig, // Mailbox configuration
-/// - stats: MailboxStats, // Usage statistics
+/// - stats: MailboxMetrics, // Usage statistics
 ///
 /// Methods:
 /// - init: fn (allocator: Allocator, config: MailboxConfig) ProcessMailbox
@@ -704,12 +704,12 @@ pub const ProcessMailbox = struct {
     /// Mailbox behavior settings.
     config: MailboxConfig,
     /// Usage statistics.
-    stats: MailboxStats,
+    stats: MailboxMetrics,
     /// Allocator for queue storage.
     allocator: Allocator,
 
     /// Statistics for monitoring mailbox performance and usage.
-    pub const MailboxStats = struct {
+    pub const MailboxMetrics = struct {
         /// Total messages accepted by `send()`.
         messages_received: usize = 0,
         /// Total messages returned by `receive()`.
@@ -1153,8 +1153,8 @@ pub const ProcessMailbox = struct {
         return true;
     }
 
-    /// Return a snapshot of mailbox statistics.
-    pub fn getStats(self: *ProcessMailbox) MailboxStats {
+    /// Return lifetime mailbox counters.
+    pub fn metrics(self: *ProcessMailbox) MailboxMetrics {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.stats;
@@ -1380,7 +1380,7 @@ test "Message TTL and expiration" {
     try testing.expectError(MessageError.EmptyMailbox, mailbox.receive());
 
     // Verify stats
-    const stats = mailbox.getStats();
+    const stats = mailbox.metrics();
     try testing.expectEqual(@as(usize, 1), stats.messages_received);
     try testing.expectEqual(@as(usize, 0), stats.messages_sent);
     try testing.expectEqual(@as(usize, 1), stats.messages_expired);
@@ -1557,7 +1557,7 @@ test "ProcessMailbox retains overflow in bounded dead-letter storage" {
         MessageError.DeadLetterFull,
         mailbox.send(try Message.init(allocator, "overflow-2", "sender", "three", null, .normal, null)),
     );
-    const stats = mailbox.getStats();
+    const stats = mailbox.metrics();
     try testing.expectEqual(@as(usize, 1), stats.messages_dead_lettered);
     try testing.expectEqual(@as(usize, 1), stats.messages_dropped);
 }
@@ -1595,7 +1595,7 @@ test "ProcessMailbox snapshots replays and discards dead letters" {
     try testing.expectEqual(@as(u32, 1), delivered.metadata.attempt_count);
 
     try testing.expectEqual(@as(usize, 0), mailbox.discardAllDeadLetters());
-    const stats = mailbox.getStats();
+    const stats = mailbox.metrics();
     try testing.expectEqual(@as(usize, 1), stats.dead_letters_replayed);
 }
 
@@ -1626,7 +1626,7 @@ test "ProcessMailbox classifies repeatedly rejected delivery as poison" {
     try testing.expect(mailbox.discardDeadLetter(poison.id) != null);
     try testing.expectEqual(@as(usize, 0), mailbox.deadLetterCount());
 
-    const stats = mailbox.getStats();
+    const stats = mailbox.metrics();
     try testing.expectEqual(@as(usize, 1), stats.poison_messages);
     try testing.expectEqual(@as(usize, 1), stats.dead_letters_discarded);
 }
@@ -1675,7 +1675,7 @@ test "ProcessMailbox serializes concurrent replay and discard" {
         var owned = message;
         owned.deinit();
     } else |err| try testing.expectEqual(MessageError.EmptyMailbox, err);
-    const stats = mailbox.getStats();
+    const stats = mailbox.metrics();
     try testing.expectEqual(@as(usize, 1), stats.dead_letters_replayed + stats.dead_letters_discarded);
 }
 
@@ -1737,7 +1737,7 @@ test "ProcessMailbox lazy expiry skips stale messages at delivery time" {
     var received = try mailbox.receive();
     defer received.deinit();
     try testing.expectEqualStrings("fresh", received.id);
-    try testing.expectEqual(@as(usize, 1), mailbox.getStats().messages_expired);
+    try testing.expectEqual(@as(usize, 1), mailbox.metrics().messages_expired);
     try testing.expectEqual(@as(usize, 0), mailbox.queuedCount());
 }
 
@@ -1766,7 +1766,7 @@ test "ProcessMailbox reclaims expired messages when a send finds it full" {
     try mailbox.send(fresh);
 
     try testing.expectEqual(@as(usize, 1), mailbox.queuedCount());
-    try testing.expectEqual(@as(usize, 2), mailbox.getStats().messages_expired);
+    try testing.expectEqual(@as(usize, 2), mailbox.metrics().messages_expired);
 
     var received = try mailbox.receive();
     defer received.deinit();
