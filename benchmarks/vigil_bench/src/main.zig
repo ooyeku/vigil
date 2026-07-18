@@ -333,21 +333,6 @@ pub fn benchRegistryContention(allocator: std.mem.Allocator, iterations: usize) 
     };
 }
 
-pub fn benchTimerScheduling(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
-    const start = nowNs();
-    for (0..iterations) |_| {
-        var timer = vigil.Timer.init(allocator);
-        try timer.setTimeout(0, noopTimerCallback);
-        timer.deinit();
-    }
-
-    return .{
-        .name = "timer schedule+join",
-        .operations = iterations,
-        .elapsed_ns = elapsedSince(start),
-    };
-}
-
 pub fn benchTimerService(allocator: std.mem.Allocator, iterations: usize) !BenchmarkResult {
     var service = vigil.TimerService.init(allocator);
     defer service.deinit();
@@ -601,7 +586,6 @@ pub fn main(init: std.process.Init) !void {
     printResult(try runBenchmark(benchRegistryRegister, iterations));
     printResult(try runBenchmark(benchRegistryContention, iterations));
     printResult(try runBenchmark(benchTelemetry, iterations));
-    printResult(try runBenchmark(benchTimerScheduling, iterations));
     printResult(try runBenchmark(benchTimerService, iterations));
     printResult(try runBenchmark(benchProcessGroupRoute, iterations));
     printResult(try runBenchmark(benchProcessGroupBroadcast, iterations));

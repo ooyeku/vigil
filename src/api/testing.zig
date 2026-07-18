@@ -533,7 +533,7 @@ pub const SimulatedClock = struct {
 
 /// Deterministic timer service driven by a `SimulatedClock`.
 ///
-/// Unlike `vigil.Timer`, no threads are spawned: callbacks fire synchronously
+/// Unlike `vigil.TimerService`, no threads are spawned: callbacks fire synchronously
 /// inside `advance()`, in deadline order, on the calling thread.
 pub const SimulatedTimerService = struct {
     /// Allocator for timer storage.
@@ -582,7 +582,7 @@ pub const SimulatedTimerService = struct {
     /// Schedule `callback` to fire every `interval_ms` of simulated time.
     ///
     /// Returns an id usable with `cancel()`. Zero-length intervals are
-    /// rejected to match `vigil.Timer.setInterval`.
+    /// rejected to match `vigil.TimerService.setInterval`.
     pub fn setInterval(self: *SimulatedTimerService, interval_ms: u32, callback: *const fn () void) !u64 {
         if (interval_ms == 0) return error.InvalidInterval;
         return try self.schedule(interval_ms, interval_ms, callback);

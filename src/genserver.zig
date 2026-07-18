@@ -26,6 +26,9 @@ pub fn GenServer(comptime StateType: type) type {
         reply_mailboxes: std.StringHashMap(*vigil.ProcessMailbox),
         reply_mutex: compat.Mutex = .{},
 
+        /// Optional timer service used by `schedule()`. Not owned.
+        timer_service: ?*vigil.TimerService = null,
+
         /// Optional state checkpointing
         checkpointer: ?checkpoint_mod.Checkpointer = null,
         checkpoint_id: ?[]const u8 = null,
@@ -326,9 +329,22 @@ pub fn GenServer(comptime StateType: type) type {
             try registry.register(name, self.mailbox);
         }
 
-        /// Schedule a message to be sent to self after a delay
+        /// Attach a timer service used by `schedule()`. Not owned.
+        pub fn setTimerService(self: *Self, service: ?*vigil.TimerService) void {
+            self.timer_service = service;
+        }
+
+        /// Schedule a message to be sent to self after a delay.
+        ///
+        /// Requires a timer service attached with `setTimerService()`
+        /// (typically `Runtime.timers()`); returns `error.NoTimerService`
+        /// otherwise. The message is consumed on success and on error.
         pub fn schedule(self: *Self, msg: vigil.Message, delay_ms: u32) !void {
-            try vigil.Timer.sendAfter(self.allocator, delay_ms, self.mailbox, msg);
+            const service = self.timer_service orelse {
+                msg.deinit();
+                return error.NoTimerService;
+            };
+            _ = try service.sendAfter(delay_ms, self.mailbox, msg);
         }
 
         /// Signal the GenServer to stop.

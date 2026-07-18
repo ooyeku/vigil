@@ -287,12 +287,6 @@ pub const GenServer = genserver.GenServer;
 pub const ProcessMailbox = messages.ProcessMailbox;
 /// Thread-safe local process registry.
 pub const Registry = @import("registry.zig").Registry;
-/// Timer helper for delayed and periodic callbacks.
-///
-/// Spawns one thread per timer; prefer `TimerService` for new code.
-pub const Timer = @import("timer.zig").Timer;
-/// Value snapshot of timer state.
-pub const TimerSnapshot = @import("timer.zig").TimerSnapshot;
 /// Runtime-owned timer scheduler module.
 pub const timer_service = @import("timer_service.zig");
 /// Min-heap timer scheduler: timeouts, intervals, and delayed sends on one
@@ -336,7 +330,6 @@ test "v2 root module exports runtime and version" {
     try std.testing.expect(@hasDecl(@This(), "ProcessGroupSnapshot"));
     try std.testing.expect(@hasDecl(@This(), "PubSubBrokerSnapshot"));
     try std.testing.expect(@hasDecl(@This(), "CircuitBreakerSnapshot"));
-    try std.testing.expect(@hasDecl(@This(), "TimerSnapshot"));
     try std.testing.expect(@hasDecl(@This(), "ReplyMailboxSnapshot"));
     try std.testing.expect(@hasDecl(@This(), "policy"));
     try std.testing.expect(@hasDecl(@This(), "PolicyOutcome"));
