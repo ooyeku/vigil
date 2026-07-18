@@ -156,8 +156,6 @@ pub const FakeDistributedRegistry = testing.FakeDistributedRegistry;
 pub const RateLimiter = flow_control.RateLimiter;
 /// Strategy used when an inbox crosses its high-water mark.
 pub const BackpressureStrategy = flow_control.BackpressureStrategy;
-/// Wrapper that applies rate limiting/backpressure around an inbox.
-pub const FlowControlledInbox = flow_control.FlowControlledInbox;
 /// Lifetime counters for flow-control outcomes.
 pub const FlowControlMetrics = flow_control.FlowControlMetrics;
 

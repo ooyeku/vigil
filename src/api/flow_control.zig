@@ -2,7 +2,9 @@
 //!
 //! Use these APIs when producers can temporarily outpace consumers. A
 //! `RateLimiter` caps operation frequency, while backpressure policies define
-//! what an inbox should do once queued work crosses a high-water mark.
+//! what an inbox should do once queued work crosses a high-water mark. Both
+//! are applied through the inbox builder (`withRateLimit`, `withBackpressure`)
+//! and observed through `Inbox.flowMetrics()`.
 
 const std = @import("std");
 const messages = @import("../messages.zig");
@@ -172,158 +174,6 @@ pub const FlowControlMetrics = struct {
     delayed: u64 = 0,
 };
 
-/// Wrapper that applies flow control before delegating to an `Inbox`.
-///
-/// The wrapper does not own the wrapped inbox. Callers must keep the inbox
-/// alive for the wrapper's lifetime and close the inbox through either the
-/// wrapper or the original inbox pointer, but not both.
-pub const FlowControlledInbox = struct {
-    /// Wrapped inbox.
-    inbox: *@import("./inbox.zig").Inbox,
-    /// Optional limiter applied before each send.
-    rate_limiter: ?RateLimiter,
-    /// Optional backpressure policy.
-    backpressure_config: ?BackpressureConfig,
-    /// Allocator retained for future extensions and ABI consistency.
-    allocator: std.mem.Allocator,
-    /// Lifetime counters for flow-control outcomes.
-    accepted: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    throttled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    dropped_oldest: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    dropped_newest: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    rejected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    blocked: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    delayed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-
-    /// Initialize a flow-control wrapper around an existing inbox.
-    pub fn init(
-        allocator: std.mem.Allocator,
-        inbox: *@import("./inbox.zig").Inbox,
-        rate_limit: ?RateLimitConfig,
-        backpressure: ?BackpressureConfig,
-    ) FlowControlledInbox {
-        return .{
-            .inbox = inbox,
-            .rate_limiter = if (rate_limit) |rl| rl.limiter() else null,
-            .backpressure_config = backpressure,
-            .allocator = allocator,
-        };
-    }
-
-    /// Send a payload after applying rate-limit and backpressure rules.
-    pub fn send(self: *FlowControlledInbox, payload: []const u8) !void {
-        var operation = try self.inbox.acquireOperation();
-        defer operation.release();
-
-        if (self.inbox.isClosed()) return error.InboxClosed;
-
-        // Check rate limit
-        if (self.rate_limiter) |*limiter| {
-            if (!limiter.allow()) {
-                _ = self.throttled.fetchAdd(1, .monotonic);
-                return MessageError.RateLimitExceeded;
-            }
-        }
-
-        // Check backpressure
-        if (self.backpressure_config) |config| {
-            const needs_low_watermark = config.strategy == .block or config.strategy == .adaptive;
-            if (config.low_watermark > config.high_watermark or
-                (needs_low_watermark and config.low_watermark == 0))
-            {
-                return error.InvalidConfiguration;
-            }
-
-            const current_count = self.inbox.mailbox.queuedCount();
-
-            // The adaptive strategy throttles before the queue is full:
-            // between the watermarks each send is delayed proportionally to
-            // how far the queue has grown into the pressure band.
-            if (config.strategy == .adaptive and
-                current_count >= config.low_watermark and
-                current_count < config.high_watermark)
-            {
-                const band = config.high_watermark - config.low_watermark;
-                const fill = current_count - config.low_watermark + 1;
-                const delay_ms = @max(1, config.max_delay_ms * fill / band);
-                _ = self.delayed.fetchAdd(1, .monotonic);
-                compat.sleep(@as(u64, delay_ms) * std.time.ns_per_ms);
-            }
-
-            if (current_count >= config.high_watermark) {
-                switch (config.strategy) {
-                    .drop_oldest => {
-                        // Drop through the mailbox so ownership and drop
-                        // statistics are updated together.
-                        _ = self.inbox.mailbox.dropOldest();
-                        _ = self.dropped_oldest.fetchAdd(1, .monotonic);
-                        try self.sendAccepted(payload);
-                    },
-                    .drop_newest => {
-                        // Don't send, just drop
-                        _ = self.dropped_newest.fetchAdd(1, .monotonic);
-                        return;
-                    },
-                    .block, .adaptive => {
-                        // Wait until below low watermark
-                        _ = self.blocked.fetchAdd(1, .monotonic);
-                        while (true) {
-                            if (self.inbox.isClosed()) return error.InboxClosed;
-                            const current = self.inbox.mailbox.queuedCount();
-                            if (current < config.low_watermark) break;
-                            compat.sleep(10 * std.time.ns_per_ms);
-                        }
-                        try self.sendAccepted(payload);
-                    },
-                    .return_error => {
-                        _ = self.rejected.fetchAdd(1, .monotonic);
-                        return MessageError.MailboxFull;
-                    },
-                }
-            } else {
-                try self.sendAccepted(payload);
-            }
-        } else {
-            try self.sendAccepted(payload);
-        }
-    }
-
-    fn sendAccepted(self: *FlowControlledInbox, payload: []const u8) !void {
-        try self.inbox.send(payload);
-        _ = self.accepted.fetchAdd(1, .monotonic);
-    }
-
-    /// Return lifetime flow-control counters for this wrapper.
-    pub fn metrics(self: *FlowControlledInbox) FlowControlMetrics {
-        return .{
-            .accepted = self.accepted.load(.monotonic),
-            .throttled = self.throttled.load(.monotonic),
-            .dropped_oldest = self.dropped_oldest.load(.monotonic),
-            .dropped_newest = self.dropped_newest.load(.monotonic),
-            .rejected = self.rejected.load(.monotonic),
-            .blocked = self.blocked.load(.monotonic),
-            .delayed = self.delayed.load(.monotonic),
-        };
-    }
-
-    /// Receive from the wrapped inbox.
-    pub fn recv(self: *FlowControlledInbox) !Message {
-        return self.inbox.recv();
-    }
-
-    /// Receive from the wrapped inbox with a timeout in milliseconds.
-    pub fn recvTimeout(self: *FlowControlledInbox, timeout_ms: u32) !?Message {
-        return self.inbox.recvTimeout(timeout_ms);
-    }
-
-    /// Close the wrapped inbox.
-    ///
-    /// After calling this, do not call `close()` on the original inbox pointer.
-    pub fn close(self: *FlowControlledInbox) void {
-        self.inbox.close();
-    }
-};
-
 test "RateLimiter basic operations" {
     var limiter = RateLimiter.init(10); // 10 per second
 
@@ -351,91 +201,6 @@ test "RateLimiter refill over time" {
     const avail = limiter.available();
     // With 1000/sec rate, 200ms should refill ~200 tokens (minus 1 for the allow call)
     try std.testing.expect(avail >= 50); // Conservative check to handle timing variance
-}
-
-test "FlowControlledInbox rate limiting" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var inbox = try @import("./inbox.zig").inbox(allocator);
-    defer inbox.close();
-
-    var flow_inbox = FlowControlledInbox.init(
-        allocator,
-        inbox,
-        .{ .max_per_second = 5 },
-        null,
-    );
-
-    // Should allow some sends
-    var success_count: u32 = 0;
-    for (0..10) |_| {
-        flow_inbox.send("test") catch {
-            break;
-        };
-        success_count += 1;
-    }
-    try std.testing.expect(success_count > 0);
-}
-
-test "FlowControlledInbox backpressure drop_oldest" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var inbox = try @import("./inbox.zig").inbox(allocator);
-    defer inbox.close();
-
-    var flow_inbox = FlowControlledInbox.init(
-        allocator,
-        inbox,
-        null,
-        .{
-            .strategy = .drop_oldest,
-            .high_watermark = 5,
-            .low_watermark = 2,
-        },
-    );
-
-    // Fill up to high watermark
-    for (0..10) |_| {
-        flow_inbox.send("test") catch {};
-    }
-
-    // Should still accept new messages (dropping oldest)
-    try flow_inbox.send("new");
-
-    try std.testing.expectEqual(@as(usize, 5), inbox.mailbox.queuedCount());
-    const stats = inbox.metrics();
-    try std.testing.expectEqual(@as(usize, 6), stats.messages_dropped);
-
-    var saw_new = false;
-    while (try inbox.recvTimeout(0)) |msg| {
-        defer msg.deinit();
-        if (std.mem.eql(u8, msg.payload.?, "new")) saw_new = true;
-    }
-    try std.testing.expect(saw_new);
-}
-
-test "FlowControlledInbox rejects invalid blocking watermarks" {
-    const allocator = std.testing.allocator;
-    var inbox = try @import("./inbox.zig").inbox(allocator);
-    defer inbox.close();
-
-    var zero_low = FlowControlledInbox.init(allocator, inbox, null, .{
-        .strategy = .block,
-        .high_watermark = 1,
-        .low_watermark = 0,
-    });
-    try std.testing.expectError(error.InvalidConfiguration, zero_low.send("blocked forever"));
-
-    var inverted = FlowControlledInbox.init(allocator, inbox, null, .{
-        .strategy = .block,
-        .high_watermark = 1,
-        .low_watermark = 2,
-    });
-    try std.testing.expectError(error.InvalidConfiguration, inverted.send("invalid"));
 }
 
 test "RateLimiter allowN admits batches all-or-nothing" {
@@ -472,37 +237,36 @@ test "RateLimiter honors a burst size smaller than the sustained rate" {
     try std.testing.expect(from_config.allowN(3));
 }
 
-test "FlowControlledInbox adaptive strategy delays and blocks with metrics" {
+test "Inbox adaptive backpressure delays, blocks, and reports flow metrics" {
     const allocator = std.testing.allocator;
-    var inbox = try @import("./inbox.zig").inboxBuilder(allocator).capacity(16).build();
-    defer inbox.close();
-
-    var flow_inbox = FlowControlledInbox.init(allocator, inbox, null, .{
+    const inbox_api = @import("./inbox.zig");
+    var inbox = try inbox_api.inboxBuilder(allocator).capacity(16).withBackpressure(.{
         .strategy = .adaptive,
         .high_watermark = 6,
         .low_watermark = 2,
         .max_delay_ms = 1,
-    });
+    }).build();
+    defer inbox.close();
 
     // Below the low watermark: no delay recorded.
-    try flow_inbox.send("m1");
-    try flow_inbox.send("m2");
-    try std.testing.expectEqual(@as(u64, 0), flow_inbox.metrics().delayed);
+    try inbox.send("m1");
+    try inbox.send("m2");
+    try std.testing.expectEqual(@as(u64, 0), inbox.flowMetrics().delayed);
 
     // Inside the pressure band: sends are delayed but accepted.
-    try flow_inbox.send("m3");
-    try flow_inbox.send("m4");
-    const banded = flow_inbox.metrics();
+    try inbox.send("m3");
+    try inbox.send("m4");
+    const banded = inbox.flowMetrics();
     try std.testing.expectEqual(@as(u64, 2), banded.delayed);
     try std.testing.expectEqual(@as(u64, 4), banded.accepted);
 
     // At the high watermark a sender blocks until a consumer drains the
     // queue below the low watermark.
-    try flow_inbox.send("m5");
-    try flow_inbox.send("m6");
+    try inbox.send("m5");
+    try inbox.send("m6");
 
     const Drainer = struct {
-        fn run(target: *@import("./inbox.zig").Inbox) void {
+        fn run(target: *inbox_api.Inbox) void {
             compat.sleep(20 * std.time.ns_per_ms);
             for (0..5) |_| {
                 const msg = target.recvTimeout(100) catch return orelse return;
@@ -511,37 +275,42 @@ test "FlowControlledInbox adaptive strategy delays and blocks with metrics" {
         }
     };
     const drainer = try std.Thread.spawn(.{}, Drainer.run, .{inbox});
-    try flow_inbox.send("m7");
+    try inbox.send("m7");
     drainer.join();
 
-    const final = flow_inbox.metrics();
+    const final = inbox.flowMetrics();
     try std.testing.expectEqual(@as(u64, 1), final.blocked);
     try std.testing.expectEqual(@as(u64, 7), final.accepted);
 }
 
-test "FlowControlledInbox records throttled and rejected sends" {
+test "Inbox records throttled and rejected sends in flow metrics" {
     const allocator = std.testing.allocator;
-    var inbox = try @import("./inbox.zig").inboxBuilder(allocator).capacity(16).build();
-    defer inbox.close();
+    const inbox_api = @import("./inbox.zig");
 
     // A slow rate keeps the refill interval (100ms) far larger than the test
     // duration, so the third send deterministically exceeds the burst.
-    var throttled_inbox = FlowControlledInbox.init(allocator, inbox, .{
+    var throttled = try inbox_api.inboxBuilder(allocator).capacity(16).withRateLimit(.{
         .max_per_second = 10,
         .burst_size = 2,
-    }, null);
-    try throttled_inbox.send("a");
-    try throttled_inbox.send("b");
-    try std.testing.expectError(MessageError.RateLimitExceeded, throttled_inbox.send("c"));
-    const throttled = throttled_inbox.metrics();
-    try std.testing.expectEqual(@as(u64, 2), throttled.accepted);
-    try std.testing.expectEqual(@as(u64, 1), throttled.throttled);
+    }).build();
+    defer throttled.close();
+    try throttled.send("a");
+    try throttled.send("b");
+    try std.testing.expectError(MessageError.RateLimitExceeded, throttled.send("c"));
+    const throttled_metrics = throttled.flowMetrics();
+    try std.testing.expectEqual(@as(u64, 2), throttled_metrics.accepted);
+    try std.testing.expectEqual(@as(u64, 1), throttled_metrics.throttled);
 
-    var rejecting_inbox = FlowControlledInbox.init(allocator, inbox, null, .{
+    var rejecting = try inbox_api.inboxBuilder(allocator).capacity(16).withBackpressure(.{
         .strategy = .return_error,
         .high_watermark = 2,
         .low_watermark = 1,
-    });
-    try std.testing.expectError(MessageError.MailboxFull, rejecting_inbox.send("d"));
-    try std.testing.expectEqual(@as(u64, 1), rejecting_inbox.metrics().rejected);
+    }).build();
+    defer rejecting.close();
+    try rejecting.send("d");
+    try rejecting.send("e");
+    try std.testing.expectError(MessageError.MailboxFull, rejecting.send("f"));
+    const rejecting_metrics = rejecting.flowMetrics();
+    try std.testing.expectEqual(@as(u64, 2), rejecting_metrics.accepted);
+    try std.testing.expectEqual(@as(u64, 1), rejecting_metrics.rejected);
 }

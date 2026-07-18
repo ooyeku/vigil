@@ -92,6 +92,14 @@ pub const Inbox = struct {
     poison_context: ?*anyopaque,
     /// Optional callback invoked on the first poison classification.
     poison_handler: ?PoisonMessageHandler,
+    // Lifetime flow-control counters, reported by flowMetrics().
+    fc_accepted: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fc_throttled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fc_dropped_oldest: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fc_dropped_newest: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fc_rejected: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fc_blocked: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fc_delayed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// Allocate a new inbox with default mailbox settings.
     ///
@@ -191,6 +199,7 @@ pub const Inbox = struct {
             null,
         );
         const delivery = try self.mailbox.sendWithDisposition(message);
+        _ = self.fc_accepted.fetchAdd(1, .monotonic);
         const targets = self.captureLifecycleTargets();
         self.endOperation();
 
@@ -198,6 +207,23 @@ pub const Inbox = struct {
             .enqueued => {},
             .dead_lettered => |notice| emitDeadLetterLifecycle(targets, .message_dead_lettered, notice),
         }
+    }
+
+    /// Return lifetime flow-control counters for this inbox.
+    ///
+    /// Producer overload shows up here (throttled, delayed, blocked,
+    /// dropped); consumer failure is reported separately by the dead-letter
+    /// counters in `metrics()`.
+    pub fn flowMetrics(self: *Inbox) flow_control.FlowControlMetrics {
+        return .{
+            .accepted = self.fc_accepted.load(.monotonic),
+            .throttled = self.fc_throttled.load(.monotonic),
+            .dropped_oldest = self.fc_dropped_oldest.load(.monotonic),
+            .dropped_newest = self.fc_dropped_newest.load(.monotonic),
+            .rejected = self.fc_rejected.load(.monotonic),
+            .blocked = self.fc_blocked.load(.monotonic),
+            .delayed = self.fc_delayed.load(.monotonic),
+        };
     }
 
     /// Send an existing owned message without rebuilding its metadata.
@@ -212,6 +238,7 @@ pub const Inbox = struct {
         errdefer self.endOperation();
 
         const delivery = try self.mailbox.sendWithDisposition(message);
+        _ = self.fc_accepted.fetchAdd(1, .monotonic);
         const targets = self.captureLifecycleTargets();
         self.endOperation();
 
@@ -555,6 +582,7 @@ pub const Inbox = struct {
     fn applyFlowControl(self: *Inbox) !bool {
         if (self.rate_limiter) |*limiter| {
             if (!limiter.allow()) {
+                _ = self.fc_throttled.fetchAdd(1, .monotonic);
                 return MessageError.RateLimitExceeded;
             }
         }
@@ -571,6 +599,7 @@ pub const Inbox = struct {
             const band = config.high_watermark - config.low_watermark;
             const fill = depth - config.low_watermark + 1;
             const delay_ms = @max(1, config.max_delay_ms * fill / band);
+            _ = self.fc_delayed.fetchAdd(1, .monotonic);
             compat.sleep(@as(u64, delay_ms) * std.time.ns_per_ms);
         }
 
@@ -579,15 +608,23 @@ pub const Inbox = struct {
         switch (config.strategy) {
             .drop_oldest => {
                 _ = self.mailbox.dropOldest();
+                _ = self.fc_dropped_oldest.fetchAdd(1, .monotonic);
             },
-            .drop_newest => return false,
+            .drop_newest => {
+                _ = self.fc_dropped_newest.fetchAdd(1, .monotonic);
+                return false;
+            },
             .block, .adaptive => {
+                _ = self.fc_blocked.fetchAdd(1, .monotonic);
                 while (self.queuedCount() >= config.low_watermark) {
                     if (self.closed.load(.acquire)) return MessageError.InboxClosed;
                     compat.sleep(10 * std.time.ns_per_ms);
                 }
             },
-            .return_error => return MessageError.MailboxFull,
+            .return_error => {
+                _ = self.fc_rejected.fetchAdd(1, .monotonic);
+                return MessageError.MailboxFull;
+            },
         }
         return true;
     }
