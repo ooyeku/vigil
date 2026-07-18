@@ -17,7 +17,7 @@
 //!     .restart_type = .permanent,
 //!     .shutdown_timeout_ms = 1000,
 //!     .priority = .normal,
-//!     .health_check_fn = healthCheck,
+//!     .health_check_fn = health_check,
 //!     .max_memory_bytes = 1024 * 1024 * 100, // 100MB limit
 //! });
 //!

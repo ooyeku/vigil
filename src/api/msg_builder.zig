@@ -193,7 +193,7 @@ test "MessageBuilder chaining all methods" {
         .from("sender_app")
         .priority(.critical)
         .ttl(5000)
-        .signal(.healthCheck)
+        .signal(.health_check)
         .withCorrelation("req_456")
         .replyTo("response_channel");
 
@@ -204,7 +204,7 @@ test "MessageBuilder chaining all methods" {
     try std.testing.expectEqualSlices(u8, "sender_app", message.sender);
     try std.testing.expect(message.priority == .critical);
     try std.testing.expect(message.metadata.ttl_ms == 5000);
-    try std.testing.expect(message.signal == .healthCheck);
+    try std.testing.expect(message.signal == .health_check);
     try std.testing.expectEqualSlices(u8, "req_456", message.metadata.correlation_id.?);
     try std.testing.expectEqualSlices(u8, "response_channel", message.metadata.reply_to.?);
 }
@@ -237,7 +237,7 @@ test "MessageBuilder with different signals" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const signals = [_]Signal{ .restart, .shutdown, .healthCheck, .alert, .info };
+    const signals = [_]Signal{ .restart, .shutdown, .health_check, .alert, .info };
     for (signals) |sig| {
         var builder = msg("test").signal(sig);
         var message = try builder.build(allocator);

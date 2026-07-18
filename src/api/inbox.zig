@@ -41,12 +41,6 @@ const LifecycleTargets = struct {
     poison_handler: ?PoisonMessageHandler,
 };
 
-/// Error returned when attempting to receive from a closed inbox
-pub const InboxError = error{
-    /// The inbox has been closed
-    InboxClosed,
-};
-
 /// High-level inbox wrapper around ProcessMailbox.
 ///
 /// Uses an atomic reference count to prevent use-after-free: every
@@ -230,13 +224,13 @@ pub const Inbox = struct {
     /// Receive the next available message, blocking until one arrives.
     ///
     /// The returned `Message` is owned by the caller and must be deinitialized.
-    /// Returns `InboxError.InboxClosed` if the inbox closes while waiting.
+    /// Returns `MessageError.InboxClosed` if the inbox closes while waiting.
     pub fn recv(self: *Inbox) !Message {
         try self.beginOperation();
         defer self.endOperation();
 
         while (true) {
-            if (self.closed.load(.acquire)) return InboxError.InboxClosed;
+            if (self.closed.load(.acquire)) return MessageError.InboxClosed;
 
             // Park on the mailbox condition instead of polling. `close()`
             // broadcasts while draining operations, so a blocked receiver
@@ -262,7 +256,7 @@ pub const Inbox = struct {
 
         var first_poll = true;
         while (true) {
-            if (self.closed.load(.acquire)) return InboxError.InboxClosed;
+            if (self.closed.load(.acquire)) return MessageError.InboxClosed;
 
             if (timeout_ms == 0) {
                 // Non-blocking poll.
@@ -491,7 +485,7 @@ pub const Inbox = struct {
     fn beginOperation(self: *Inbox) !void {
         var lifecycle = self.active_ops.load(.acquire);
         while (true) {
-            if (lifecycle & closed_operation_bit != 0) return InboxError.InboxClosed;
+            if (lifecycle & closed_operation_bit != 0) return MessageError.InboxClosed;
             if (lifecycle & operation_count_mask == operation_count_mask) {
                 return error.TooManyOperations;
             }
@@ -509,7 +503,7 @@ pub const Inbox = struct {
             // atomics, release the admitted reference and honor shutdown.
             if (self.closed.load(.acquire)) {
                 self.endOperation();
-                return InboxError.InboxClosed;
+                return MessageError.InboxClosed;
             }
             return;
         }
@@ -589,7 +583,7 @@ pub const Inbox = struct {
             .drop_newest => return false,
             .block, .adaptive => {
                 while (self.queuedCount() >= config.low_watermark) {
-                    if (self.closed.load(.acquire)) return InboxError.InboxClosed;
+                    if (self.closed.load(.acquire)) return MessageError.InboxClosed;
                     compat.sleep(10 * std.time.ns_per_ms);
                 }
             },
@@ -1138,7 +1132,7 @@ test "Inbox lifecycle bit atomically rejects operation admission" {
     defer inbox_ptr.close();
 
     _ = inbox_ptr.active_ops.fetchOr(Inbox.closed_operation_bit, .acq_rel);
-    try std.testing.expectError(InboxError.InboxClosed, inbox_ptr.queueDepth());
+    try std.testing.expectError(MessageError.InboxClosed, inbox_ptr.queueDepth());
 
     // Restore the lifecycle word so the deferred close remains the sole owner
     // of destruction in this test.
@@ -1152,7 +1146,7 @@ test "Inbox close waits for a blocked receiver to observe shutdown" {
 
         fn run(context: *@This()) void {
             _ = context.inbox.recv() catch |err| {
-                if (err == InboxError.InboxClosed) {
+                if (err == MessageError.InboxClosed) {
                     context.observed_close.store(true, .release);
                 }
                 return;

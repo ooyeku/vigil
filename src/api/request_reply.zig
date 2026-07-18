@@ -9,7 +9,6 @@ const std = @import("std");
 const Message = @import("../messages.zig").Message;
 const MessageError = @import("../messages.zig").MessageError;
 const Inbox = @import("./inbox.zig").Inbox;
-const InboxError = @import("./inbox.zig").InboxError;
 const compat = @import("../compat.zig");
 
 /// Value snapshot of reply-mailbox state.
@@ -197,7 +196,7 @@ pub const ReplyMailbox = struct {
                 }
             } else |err| {
                 // Check if inbox is closed
-                if (err == InboxError.InboxClosed) {
+                if (err == MessageError.InboxClosed) {
                     self.flushStash();
                     return MessageError.ReceiverUnavailable;
                 }

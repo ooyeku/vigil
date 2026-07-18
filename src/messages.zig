@@ -78,6 +78,8 @@ pub const MessageError = error{
     DeliveryFailed,
     /// Dead-letter storage is enabled but has reached its configured capacity.
     DeadLetterFull,
+    /// The inbox has been closed.
+    InboxClosed,
 };
 
 /// Message priority levels for handling urgent communications.
@@ -139,11 +141,11 @@ pub const MessagePriority = enum {
 /// - exit
 /// - suspend
 /// - resume
-/// - healthCheck
-/// - memoryWarning
-/// - cpuWarning
-/// - deadlockDetected
-/// - messageErr
+/// - health_check
+/// - memory_warning
+/// - cpu_warning
+/// - deadlock_detected
+/// - message_error
 /// - info
 /// - warning
 /// - debug
@@ -162,7 +164,7 @@ pub const MessagePriority = enum {
 ///     "health_check",
 ///     "monitor",
 ///     null,
-///     .healthCheck,
+///     .health_check,
 ///     .high,
 ///     1000,
 /// );
@@ -181,15 +183,15 @@ pub const Signal = enum {
     /// Resume process execution.
     @"resume",
     /// Request health status.
-    healthCheck,
+    health_check,
     /// Memory usage alert.
-    memoryWarning,
+    memory_warning,
     /// CPU usage alert.
-    cpuWarning,
+    cpu_warning,
     /// Deadlock condition detected.
-    deadlockDetected,
+    deadlock_detected,
     /// Message processing error.
-    messageErr,
+    message_error,
     /// Informational message.
     info,
     /// Warning condition.
@@ -1684,7 +1686,7 @@ test "ProcessMailbox snapshotQueue reports queued messages without consuming" {
 
     const normal = try Message.init(allocator, "normal-msg", "worker", "payload", null, .normal, null);
     try mailbox.send(normal);
-    const critical = try Message.init(allocator, "critical-msg", "worker", null, .healthCheck, .critical, 5_000);
+    const critical = try Message.init(allocator, "critical-msg", "worker", null, .health_check, .critical, 5_000);
     try mailbox.send(critical);
 
     var snapshot = try mailbox.snapshotQueue(allocator);
@@ -1694,7 +1696,7 @@ test "ProcessMailbox snapshotQueue reports queued messages without consuming" {
     // Delivery order: critical priority is listed before normal.
     try testing.expectEqualStrings("critical-msg", snapshot.entries[0].id);
     try testing.expectEqual(MessagePriority.critical, snapshot.entries[0].priority);
-    try testing.expectEqual(Signal.healthCheck, snapshot.entries[0].signal.?);
+    try testing.expectEqual(Signal.health_check, snapshot.entries[0].signal.?);
     try testing.expectEqual(@as(usize, 0), snapshot.entries[0].payload_len);
     try testing.expectEqual(@as(?u32, 5_000), snapshot.entries[0].ttl_ms);
     try testing.expect(!snapshot.entries[0].expired);
