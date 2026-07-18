@@ -210,12 +210,11 @@ Non-consuming inspection is available on inboxes and routing primitives:
 - `Subscriber.snapshotPatterns(allocator)` returns owned copies of a subscriber's topic patterns.
 - `EventTimeline` can also be used standalone: `attachTimeline()` on any `TelemetryEmitter` records emitted events into a bounded, thread-safe buffer.
 
-### Migrating from the legacy API
+### Migrating from older APIs
 
 Use `vigil.inboxBuilder`, `vigil.supervisor`, `vigil.Runtime`, and the other
-owned root APIs for current code. `vigil/legacy` is a deprecated, reduced set of
-type aliases for migrations; obsolete worker, configuration, and
-supervision-tree APIs are no longer shipped.
+owned root APIs. The `vigil/legacy` compatibility module was removed in
+v3.0.0; see `migration-3.0.md` for the rename and removal table.
 
 ---
 
@@ -230,7 +229,7 @@ var msg = try vigil.msg("Hello World")
     .from("sender_id")
     .priority(.high)
     .ttl(5000)
-    .signal(.healthCheck)
+    .signal(.health_check)
     .withCorrelation("request_123")
     .replyTo("response_queue")
     .build(allocator);
@@ -451,34 +450,16 @@ Runtime inspection and control of supervisors.
 ```zig
 var supervisor = builder.build();
 
-// Get supervisor state snapshot
-const info = supervisor.inspect();
-std.debug.print("Children: {d}, Active: {d}\n", .{
-    info.child_count,
-    info.active_children,
-});
-
-const stats = supervisor.getStats();
-// stats.uptime_ms is elapsed monotonic time since Supervisor.init().
-
-// Get specific child info
-if (supervisor.getChildInfo("worker_1")) |child| {
-    std.debug.print("Child state: {s}\n", .{@tagName(child.state)});
-}
-
-// Runtime control
-try supervisor.restartChild("worker_1");
-try supervisor.suspendChild("worker_1");
-try supervisor.resumeChild("worker_1");
-
-```
-
-For an owned supervision-tree snapshot with copied child ids, use
-`snapshot(allocator)`:
-
-```zig
+// Owned supervision-tree snapshot: state, counters, uptime, and per-child
+// detail in one call.
 var tree = try supervisor.snapshot(allocator);
 defer tree.deinit();
+std.debug.print("state: {s}, active: {d}/{d}, restarts: {d}\n", .{
+    @tagName(tree.state),
+    tree.active_children,
+    tree.child_count,
+    tree.total_restarts,
+});
 for (tree.children) |child| {
     std.debug.print("{s}: {s} ({d} restarts)\n", .{
         child.id,
@@ -486,14 +467,16 @@ for (tree.children) |child| {
         child.restart_count,
     });
 }
+
+// Runtime control
+try supervisor.restartChild("worker_1");
+try supervisor.suspendChild("worker_1");
+try supervisor.resumeChild("worker_1");
 ```
 
 | Method | Description |
 |--------|-------------|
-| `inspect()` | Get supervisor state snapshot |
-| `snapshot(allocator)` | Owned supervision-tree snapshot with per-child state |
-| `getStats()` | Get counters, active children, and elapsed uptime |
-| `getChildInfo(id)` | Get specific child info |
+| `snapshot(allocator)` | Owned supervision-tree snapshot: state, counters, uptime, per-child detail |
 | `restartChild(id)` | Force restart a child |
 | `suspendChild(id)` | Pause a child |
 | `resumeChild(id)` | Resume a paused child |
@@ -736,24 +719,24 @@ limiter.reset();
 Handle overload with configurable strategies.
 
 ```zig
-var flow_inbox = vigil.FlowControlledInbox.init(
-    allocator,
-    inbox,
-    .{ .max_per_second = 100 },  // Rate limit config
-    .{
-        .strategy = .drop_oldest,  // Backpressure strategy
+var inbox = try vigil.inboxBuilder(allocator)
+    .capacity(2048)
+    .withRateLimit(.{ .max_per_second = 100, .burst_size = 20 })
+    .withBackpressure(.{
+        .strategy = .adaptive,
         .high_watermark = 1000,
         .low_watermark = 500,
-    },
-);
+    })
+    .build();
+defer inbox.close();
 
-try flow_inbox.send("message");
-const msg = try flow_inbox.recv();
+try inbox.send("message");
+const flow = inbox.flowMetrics(); // accepted/throttled/dropped/blocked/delayed
 ```
 
-Backpressure uses the wrapped inbox's current queue depth. The low watermark
-must not exceed the high watermark, and `.block` requires a nonzero low
-watermark; `send()` returns `error.InvalidConfiguration` for invalid
+Backpressure uses the inbox's current queue depth. The low watermark must
+not exceed the high watermark, and `.block`/`.adaptive` require a nonzero
+low watermark; `send()` returns `error.InvalidConfiguration` for invalid
 combinations.
 
 | Strategy | Description |
@@ -944,7 +927,7 @@ try vigil.expectMessage(std.testing, mock_inbox, .{
     .priority = .high,
 });
 
-try vigil.expectSignal(std.testing, mock_inbox, .healthCheck);
+try vigil.expectSignal(std.testing, mock_inbox, .health_check);
 ```
 
 ### Deterministic Simulation
@@ -1262,33 +1245,6 @@ registry.unregister("my_process");
 
 ---
 
-### Timer
-
-Scheduled and periodic callbacks.
-
-```zig
-var timer = vigil.Timer.init(allocator);
-defer timer.deinit();
-
-// One-shot timer
-try timer.setTimeout(1000, callbackFn);
-
-// Periodic timer
-try timer.setInterval(500, periodicFn);
-
-// Cancel timer
-timer.cancel();
-```
-
-Intervals must be greater than zero; `setInterval(0, ...)` returns
-`error.InvalidInterval`. After a one-shot callback finishes,
-`snapshot().active` is false.
-
-`vigil.Timer` spawns one thread per timer and is kept for compatibility;
-prefer the timer service below for new code.
-
----
-
 ### Timer Service
 
 One scheduler thread drives every timeout, interval, and delayed send from a
@@ -1321,7 +1277,7 @@ const state = timers.snapshot(); // running, pending, fired, cancelled
 
 ## Configuration Presets
 
-| Preset | Max Restarts | Window | Health Check | Shutdown Timeout | Mailbox Capacity |
+| AppPreset | Max Restarts | Window | Health Check | Shutdown Timeout | Mailbox Capacity |
 |--------|-------------|--------|--------------|------------------|------------------|
 | `.production` | 3 | 60s | 5000ms | 30000ms | 1000 |
 | `.development` | 10 | 5s | 1000ms | 5000ms | 100 |
@@ -1454,10 +1410,10 @@ pub const Signal = enum {
     @"suspend", @"resume",
     
     // Monitoring
-    healthCheck, memoryWarning, cpuWarning, deadlockDetected,
+    health_check, memory_warning, cpu_warning, deadlock_detected,
     
     // Logging
-    messageErr, info, warning, debug, log, alert, metric, event, heartbeat,
+    message_error, info, warning, debug, log, alert, metric, event, heartbeat,
     
     // Custom
     custom,
