@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-07-18
+
+The production-runtime release: one coherent API surface, no global state,
+verified under soak, chaos, and allocation-failure testing. See
+`docs/migration-3.0.md` for the complete migration table.
+
+### Added
+- **Graceful drain**: `Runtime.drain(timeout_ms)` stops intake, halts timers, waits for registered inboxes to empty, then runs shutdown hooks, reporting whether everything drained in time.
+- **Complete runtime snapshots**: `Runtime.snapshot()` and `debugDump()` now include timer-service state and event-timeline depth, covering every runtime-owned service.
+- **Policy telemetry**: `executePolicy` emits `policy_retry`/`policy_timeout`/`policy_fallback`/`policy_circuit_open`/`policy_failure` events through an optional injected emitter.
+- **Flow metrics on every inbox**: `Inbox.flowMetrics()` reports accepted/throttled/dropped/rejected/blocked/delayed counters for builder-configured flow control.
+- **Stability battery**: `stress/vigil_soak` soak harness (six concurrent-churn scenarios with invariant and leak checking, including repeated distributed partition/heal cycles), allocation-failure sweeps across message, snapshot, and checkpoint paths, and partition-heal plus background-sync integration tests.
+- **Documentation suite**: performance tuning, reliability patterns, debugging, distributed systems, and checkpointing guides, indexed from the API reference.
+- **Production examples**: worker pool, metrics collector, distributed registry, pub/sub pipeline, and graceful drain demos complete the roadmap's nine.
+
+### Changed
+- **One naming convention**: `snapshot()` for point-in-time state, `metrics()` for lifetime counters, everywhere. `getStats`/`stats()` renamed; `MailboxStats`→`MailboxMetrics`, `ProcessStats`→`ProcessMetrics`, `FlowControlStats`→`FlowControlMetrics`; `Registry.Snapshot`→`RegistrySnapshot` and supervisor snapshot types hoisted to module level.
+- **Injected telemetry everywhere**: `CircuitBreaker`, `ProcessGroup`, `PubSubBroker`, and `Supervisor` take emitters via `setTelemetryEmitter()`; `Runtime.supervisor()` wires the runtime emitter automatically.
+- **Signal enum is snake_case**: `healthCheck`→`health_check` and friends; `InboxError` folded into `MessageError`.
+- **`Preset` renamed to `AppPreset`** to distinguish app deployment presets from inbox `RuntimeProfile`s.
+- **Successful peer exchanges mark peers alive**, not just heartbeats.
+
+### Fixed
+- **Permanent restart semantics**: `permanent` children now restart on any termination (as documented), not only on failure; `transient` remains failure-only.
+- **Per-child restart counts**: `SupervisorSnapshot` child `restart_count` was never incremented on any restart path; all strategies and `restartChild()` now count.
+
+### Removed
+- **`vigil/legacy` module**, **thread-per-timer `Timer`** (`GenServer.schedule()` now requires `setTimerService()`), **global telemetry** (`initGlobal`/`getGlobal`/`on`/`emit`), **`FlowControlledInbox`** (fold into `Inbox` builder flow control), and the redundant `Supervisor.getStats()`/`inspect()`/`getChildInfo()` accessors.
+
 ## [2.3.0] - 2026-07-15
 
 ### Added

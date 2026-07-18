@@ -19,6 +19,33 @@ registration, telemetry emission, timer scheduling, process-group routing,
 process-group broadcast, pub/sub fanout, request/reply correlation, and
 concurrent inbox producer/consumer contention.
 
+## Baseline (v3.0.0)
+
+Captured on 2026-07-18 with Zig 0.16.0 on Darwin arm64 using:
+
+```bash
+zig build run -Doptimize=ReleaseSafe -- --iterations 10000
+```
+
+| Benchmark | Ops | Avg | Throughput | Allocs/Op |
+| --- | ---: | ---: | ---: | ---: |
+| inbox send+recv | 20,000 | 117 ns | 8,503,401/s | 0.501 |
+| inbox send+recv (throughput profile) | 20,000 | 107 ns | 9,302,325/s | 0.501 |
+| registry lookup | 10,000 | 8 ns | 113,636,363/s | 0.000 |
+| registry register | 10,000 | 156 ns | 6,410,256/s | 1.038 |
+| registry contention (8 threads) | 80,000 | 23 ns | 42,553,191/s | 0.001 |
+| telemetry emit | 10,000 | 6 ns | 158,730,158/s | 0.000 |
+| timer service schedule | 10,000 | 453 ns | 2,206,531/s | 0.001 |
+| process group route | 10,000 | 140 ns | 7,097,232/s | 1.006 |
+| process group broadcast | 40,000 | 140 ns | 7,111,111/s | 1.002 |
+| pubsub fanout | 40,000 | 137 ns | 7,258,210/s | 1.002 |
+| request/reply correlate | 10,000 | 350 ns | 2,849,814/s | 8.000 |
+| inbox contention | 20,000 | 284 ns | 3,520,506/s | 0.500 |
+
+The v3.0.0 API cohesion work carries no performance cost: every number is
+at or slightly better than the v2.3.0 baseline below. The legacy
+thread-per-timer benchmark row is gone with the legacy Timer itself.
+
 ## Baseline (v2.3.0)
 
 Captured on 2026-07-15 with Zig 0.16.0 on Darwin arm64 using:
