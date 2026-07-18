@@ -451,6 +451,7 @@ pub const Supervisor = struct {
             if (std.mem.eql(u8, child.spec.id, id)) {
                 child.stop() catch {};
                 try child.start();
+                child.stats.restart_count +|= 1;
                 return;
             }
         }
@@ -518,7 +519,16 @@ pub const Supervisor = struct {
             // Check all children while holding the lock
             for (self.children.items) |*child| {
                 const child_state = child.getState();
-                if (child_state == .failed and child.spec.restart_type != .temporary) {
+                // Erlang restart semantics: permanent children restart on any
+                // termination, transient only on abnormal failure, temporary
+                // never. Deliberate stops are not observed here because
+                // shutdown paths stop monitoring first.
+                const should_restart = switch (child.spec.restart_type) {
+                    .permanent => child_state == .failed or child_state == .stopped,
+                    .transient => child_state == .failed,
+                    .temporary => false,
+                };
+                if (should_restart) {
                     // Handle failure according to restart strategy
                     const current_time = compat.milliTimestamp();
                     self.stats.last_failure_time = current_time;
@@ -546,12 +556,14 @@ pub const Supervisor = struct {
                         .one_for_one => {
                             child.stop() catch {};
                             try child.start();
+                            child.stats.restart_count +|= 1;
                             self.stats.total_restarts +|= 1;
                         },
                         .one_for_all => {
                             for (self.children.items) |*sibling| {
                                 sibling.stop() catch {};
                                 try sibling.start();
+                                sibling.stats.restart_count +|= 1;
                             }
                             self.stats.total_restarts +|= 1;
                         },
@@ -564,6 +576,7 @@ pub const Supervisor = struct {
                                 if (found_failed) {
                                     sibling.stop() catch {};
                                     try sibling.start();
+                                    sibling.stats.restart_count +|= 1;
                                 }
                             }
                             self.stats.total_restarts +|= 1;
@@ -794,6 +807,8 @@ test "supervisor max restarts" {
         supervisor.deinit();
     }
 
+    // Transient: restarted only on failure, so the forced failures below are
+    // the only restarts counted even though the worker completes quickly.
     try supervisor.addChild(.{
         .id = "test_restart",
         .start_fn = struct {
@@ -801,7 +816,7 @@ test "supervisor max restarts" {
                 compat.sleep(50 * std.time.ns_per_ms);
             }
         }.testFn,
-        .restart_type = .permanent,
+        .restart_type = .transient,
         .shutdown_timeout_ms = 100,
     });
 
@@ -908,4 +923,58 @@ test "supervisor snapshot captures children and state" {
 
     WorkerGate.stop.store(true, .release);
     try supervisor.shutdown(5000);
+}
+
+test "permanent children restart after normal completion, transient do not" {
+    const allocator = std.testing.allocator;
+    var supervisor = Supervisor.init(allocator, .{
+        .strategy = .one_for_one,
+        .max_restarts = 1_000,
+        .max_seconds = 3600,
+    });
+    defer {
+        supervisor.stopMonitoring();
+        supervisor.deinit();
+    }
+
+    const QuickWorker = struct {
+        fn run() void {
+            compat.sleep(5 * std.time.ns_per_ms);
+        }
+    };
+
+    try supervisor.addChild(.{
+        .id = "permanent-worker",
+        .start_fn = QuickWorker.run,
+        .restart_type = .permanent,
+        .shutdown_timeout_ms = 100,
+    });
+    try supervisor.addChild(.{
+        .id = "transient-worker",
+        .start_fn = QuickWorker.run,
+        .restart_type = .transient,
+        .shutdown_timeout_ms = 100,
+    });
+
+    try supervisor.start();
+    try supervisor.startMonitoring();
+
+    // Both workers complete within ~5ms; the monitor should keep restarting
+    // the permanent one and leave the transient one stopped.
+    var waited_ms: u32 = 0;
+    while (supervisor.stats.total_restarts < 2 and waited_ms < 3_000) : (waited_ms += 25) {
+        compat.sleep(25 * std.time.ns_per_ms);
+    }
+    supervisor.stopMonitoring();
+
+    var snap = try supervisor.snapshot(allocator);
+    defer snap.deinit();
+    try std.testing.expect(snap.total_restarts >= 2);
+    for (snap.children) |child| {
+        if (std.mem.eql(u8, child.id, "permanent-worker")) {
+            try std.testing.expect(child.restart_count >= 2);
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), child.restart_count);
+        }
+    }
 }
