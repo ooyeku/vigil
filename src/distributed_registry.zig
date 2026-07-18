@@ -503,10 +503,14 @@ pub const DistributedRegistry = struct {
                 if (exchange.reply_buffer) |buffer| {
                     if (Protocol.readLine(stream, buffer)) |line| {
                         node.consecutive_failures = 0;
+                        node.is_alive = true;
+                        node.last_seen_ms = compat.monotonicMilliTimestamp();
                         return line;
                     }
                 } else if (Protocol.drainReplies(stream, exchange.expected_replies)) {
                     node.consecutive_failures = 0;
+                    node.is_alive = true;
+                    node.last_seen_ms = compat.monotonicMilliTimestamp();
                     return "";
                 }
             }

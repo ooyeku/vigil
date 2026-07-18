@@ -24,6 +24,11 @@ const demos = [_]Demo{
     .{ .name = "dead-letter-replay", .summary = "dead-letter inspection and replay", .run = runDeadLetterReplay },
     .{ .name = "introspection", .summary = "runtime introspection endpoint", .run = runIntrospection },
     .{ .name = "checkpoint", .summary = "checkpointed state machine", .run = runCheckpoint },
+    .{ .name = "worker-pool", .summary = "high-throughput worker pool with batch receives", .run = runWorkerPool },
+    .{ .name = "metrics-collector", .summary = "telemetry counters collected from runtime events", .run = runMetricsCollector },
+    .{ .name = "distributed-registry", .summary = "two-node name resolution over loopback TCP", .run = runDistributedRegistry },
+    .{ .name = "pubsub-pipeline", .summary = "pub/sub notification pipeline with batch publish", .run = runPubSubPipeline },
+    .{ .name = "graceful-drain", .summary = "drain in-flight work before shutdown", .run = runGracefulDrain },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -455,4 +460,246 @@ test "demo table stays consistent" {
         try std.testing.expect(demo.name.len > 0);
         try std.testing.expect(demo.summary.len > 0);
     }
+}
+
+/// High-throughput worker pool: a throughput-profile inbox feeding worker
+/// threads that drain with batch receives, routed through a process group.
+fn runWorkerPool(allocator: std.mem.Allocator) !void {
+    std.debug.print("\n--- worker pool: throughput profile + recvBatch ---\n", .{});
+
+    const worker_count = 4;
+    const job_count: u64 = 100_000;
+
+    var rt = try vigil.runtime(allocator, .{});
+    defer rt.deinit();
+
+    var group = try vigil.ProcessGroup.init(allocator, "pool");
+    defer group.deinit();
+
+    var inboxes: [worker_count]*vigil.Inbox = undefined;
+    for (&inboxes, 0..) |*slot, i| {
+        slot.* = try rt.inboxWithProfile(.throughput, 4096);
+        var name_buf: [16]u8 = undefined;
+        try group.add(try std.fmt.bufPrint(&name_buf, "w{d}", .{i}), slot.*);
+    }
+    defer for (inboxes) |ib| ib.close();
+
+    const Worker = struct {
+        inbox: *vigil.Inbox,
+        processed: u64 = 0,
+
+        fn run(self: *@This()) void {
+            var buffer: [64]vigil.Message = undefined;
+            while (true) {
+                const got = self.inbox.recvBatch(&buffer) catch return;
+                if (got == 0) {
+                    const msg = self.inbox.recvTimeout(50) catch return orelse return;
+                    msg.deinit();
+                    self.processed += 1;
+                    continue;
+                }
+                for (buffer[0..got]) |m| m.deinit();
+                self.processed += got;
+            }
+        }
+    };
+
+    var workers: [worker_count]Worker = undefined;
+    var threads: [worker_count]std.Thread = undefined;
+    for (&workers, &threads, inboxes) |*w, *t, ib| {
+        w.* = .{ .inbox = ib };
+        t.* = try std.Thread.spawn(.{}, Worker.run, .{w});
+    }
+
+    const start_ms = vigil.compat.monotonicMilliTimestamp();
+    var dispatched: u64 = 0;
+    while (dispatched < job_count) : (dispatched += 1) {
+        group.roundRobin("job") catch continue;
+    }
+    for (threads) |t| t.join();
+    const elapsed = vigil.compat.monotonicMilliTimestamp() - start_ms;
+
+    var processed: u64 = 0;
+    for (workers) |w| processed += w.processed;
+    std.debug.print("dispatched {d} jobs to {d} workers in {d}ms ({d}/s), processed {d}\n", .{
+        job_count,
+        worker_count,
+        elapsed,
+        if (elapsed > 0) job_count * 1000 / @as(u64, @intCast(elapsed)) else job_count,
+        processed,
+    });
+}
+
+var collector_counts = [_]u32{0} ** 3;
+
+fn collectDeadLetter(_: vigil.telemetry.Event) void {
+    collector_counts[0] += 1;
+}
+fn collectReplay(_: vigil.telemetry.Event) void {
+    collector_counts[1] += 1;
+}
+fn collectDiscard(_: vigil.telemetry.Event) void {
+    collector_counts[2] += 1;
+}
+
+/// Metrics collector: subscribe counters to runtime telemetry and render a
+/// scrape-style report, the shape you would export to a metrics endpoint.
+fn runMetricsCollector(allocator: std.mem.Allocator) !void {
+    std.debug.print("\n--- metrics collector: counters from telemetry ---\n", .{});
+    collector_counts = [_]u32{0} ** 3;
+
+    var rt = try vigil.runtime(allocator, .{});
+    defer rt.deinit();
+    try rt.telemetry_emitter.on(.message_dead_lettered, collectDeadLetter);
+    try rt.telemetry_emitter.on(.message_replayed, collectReplay);
+    try rt.telemetry_emitter.on(.message_discarded, collectDiscard);
+
+    var ib = try rt.inbox(.{ .capacity = 8, .max_delivery_attempts = 3, .default_ttl_ms = null });
+    defer ib.close();
+
+    // Generate some lifecycle traffic.
+    try ib.send("event-1");
+    try ib.send("event-2");
+    const first = try ib.recv();
+    const notice = try ib.deadLetter(first, .delivery_failed);
+    _ = try ib.replayDeadLetter(notice.id);
+    const second = try ib.recv();
+    const renotice = try ib.deadLetter(second, .delivery_failed);
+    _ = try ib.discardDeadLetter(renotice.id);
+
+    const mailbox_metrics = ib.metrics();
+    const flow = ib.flowMetrics();
+    std.debug.print("vigil_messages_received {d}\n", .{mailbox_metrics.messages_received});
+    std.debug.print("vigil_messages_dead_lettered_total {d}\n", .{collector_counts[0]});
+    std.debug.print("vigil_messages_replayed_total {d}\n", .{collector_counts[1]});
+    std.debug.print("vigil_messages_discarded_total {d}\n", .{collector_counts[2]});
+    std.debug.print("vigil_flow_accepted_total {d}\n", .{flow.accepted});
+}
+
+/// Distributed registry: two nodes in one process resolving names over real
+/// loopback TCP with persistent connections.
+fn runDistributedRegistry(allocator: std.mem.Allocator) !void {
+    std.debug.print("\n--- distributed registry: two-node resolution ---\n", .{});
+
+    var node_a = try vigil.DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{},
+        .listen_port = 39461,
+        .sync_interval_ms = 20,
+    });
+    defer node_a.deinit();
+    var mailbox = vigil.ProcessMailbox.init(allocator, .{ .capacity = 4 });
+    defer mailbox.deinit();
+    try node_a.register("payments_service", &mailbox, .global);
+    try node_a.startSync();
+    defer node_a.stopSync();
+
+    var node_b = try vigil.DistributedRegistry.init(allocator, .{
+        .cluster_nodes = &.{"127.0.0.1:39461"},
+        .listen_port = 39462,
+        .sync_interval_ms = 20,
+    });
+    defer node_b.deinit();
+
+    var found: ?vigil.RemoteProcessInfo = null;
+    var waited: u32 = 0;
+    while (found == null and waited < 3_000) : (waited += 20) {
+        found = node_b.queryPeers("payments_service");
+        if (found == null) vigil.compat.sleep(20 * std.time.ns_per_ms);
+    }
+
+    if (found) |info| {
+        std.debug.print("node B resolved payments_service at {s}:{d}\n", .{ info.node_address, info.node_port });
+    } else {
+        std.debug.print("resolution failed (port busy?)\n", .{});
+        return;
+    }
+
+    var state = try node_b.snapshot(allocator);
+    defer state.deinit();
+    std.debug.print("peer alive={} reconnects={d} queries={d} cache_hits={d}\n", .{
+        state.peers[0].is_alive,
+        state.peers[0].reconnects,
+        state.peer_queries,
+        state.cache_hits,
+    });
+}
+
+/// Pub/sub notification pipeline: one producer fanning out to specialized
+/// consumers by topic pattern, using batch publish.
+fn runPubSubPipeline(allocator: std.mem.Allocator) !void {
+    std.debug.print("\n--- pub/sub pipeline: pattern fanout + batch publish ---\n", .{});
+
+    var rt = try vigil.runtime(allocator, .{});
+    defer rt.deinit();
+    var broker = vigil.PubSubBroker.init(allocator);
+    defer broker.deinit();
+    broker.setTelemetryEmitter(&rt.telemetry_emitter);
+
+    var email_inbox = try rt.inbox(.{ .capacity = 128, .default_ttl_ms = null });
+    defer email_inbox.close();
+    var audit_inbox = try rt.inbox(.{ .capacity = 128, .default_ttl_ms = null });
+    defer audit_inbox.close();
+
+    var email = vigil.Subscriber.init(allocator, email_inbox);
+    defer email.deinit();
+    try email.subscribe(&.{"user.signup"});
+    var audit = vigil.Subscriber.init(allocator, audit_inbox);
+    defer audit.deinit();
+    try audit.subscribe(&.{"user.#"});
+    try broker.subscribe(&email);
+    try broker.subscribe(&audit);
+
+    // A signup burst goes out in one matching pass per subscriber.
+    const burst = [_][]const u8{ "alice", "bob", "carol" };
+    _ = try broker.publishBatch("user.signup", &burst);
+    _ = try broker.publish("user.deleted", "mallory");
+
+    std.debug.print("email queue: {d} (signups only)\n", .{try email_inbox.queueDepth()});
+    std.debug.print("audit queue: {d} (all user events)\n", .{try audit_inbox.queueDepth()});
+
+    var snap = try broker.snapshot(allocator);
+    defer snap.deinit();
+    std.debug.print("broker: {d} published, {d} delivered, {d} failed\n", .{
+        snap.total_publishes,
+        snap.total_delivered,
+        snap.total_failed,
+    });
+}
+
+/// Graceful drain: stop accepting, let a consumer finish queued work, run
+/// shutdown hooks, and report whether everything drained in time.
+fn runGracefulDrain(allocator: std.mem.Allocator) !void {
+    std.debug.print("\n--- graceful drain: finish in-flight work, then stop ---\n", .{});
+
+    var rt = try vigil.runtime(allocator, .{});
+    defer rt.deinit();
+    _ = try rt.timers();
+
+    var ib = try rt.inbox(.{ .capacity = 32, .default_ttl_ms = null });
+    defer ib.close();
+    try rt.register("drain.work", ib.mailbox);
+    for (0..10) |_| try ib.send("in-flight-job");
+
+    const Consumer = struct {
+        fn run(target: *vigil.Inbox) void {
+            var handled: u32 = 0;
+            while (handled < 10) {
+                const msg = target.recvTimeout(200) catch return orelse return;
+                msg.deinit();
+                handled += 1;
+                vigil.compat.sleep(5 * std.time.ns_per_ms);
+            }
+        }
+    };
+    const consumer = try std.Thread.spawn(.{}, Consumer.run, .{ib});
+
+    std.debug.print("draining with 10 jobs queued...\n", .{});
+    const drained = try rt.drain(2_000);
+    consumer.join();
+
+    std.debug.print("drained={} accepting={} timers_running={}\n", .{
+        drained,
+        rt.isRunning(),
+        rt.timer_svc.?.snapshot().running,
+    });
 }
