@@ -1,4 +1,14 @@
-# Vigil API Reference v2.3.0
+# Vigil API Reference v3.0.0
+
+Task-oriented guides:
+
+- [Migration from 2.x](migration-3.0.md)
+- [Performance tuning](performance-tuning.md)
+- [Reliability patterns](reliability-patterns.md)
+- [Introspection and debugging](debugging.md)
+- [Distributed systems](distributed.md)
+- [Checkpointing and recovery](checkpointing.md)
+- [Roadmap](roadmap.md)
 
 A process supervision and inter-process communication library for Zig, inspired by Erlang/OTP.
 
