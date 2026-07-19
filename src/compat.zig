@@ -324,6 +324,7 @@ pub fn timestamp() i64 {
 /// surface available.
 pub const sockets = struct {
     const posix = std.posix;
+    const is_windows = @import("builtin").os.tag == .windows;
 
     pub const SocketError = error{SocketFailed};
     pub const ConnectError = error{ConnectFailed};
@@ -331,45 +332,172 @@ pub const sockets = struct {
     pub const ListenError = error{ListenFailed};
     pub const AcceptError = error{AcceptFailed} || posix.UnexpectedError;
 
-    pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
-        // Darwin has no kernel-level SOCK_CLOEXEC; Zig defines it as an
-        // artificial flag that its own wrappers emulate. Strip it before the
-        // raw call and apply FD_CLOEXEC afterwards, otherwise socket()
-        // fails with EINVAL on macOS.
-        const wants_cloexec = (sock_type & posix.SOCK.CLOEXEC) != 0;
-        const raw_type = if (@import("builtin").os.tag.isDarwin())
-            sock_type & ~@as(u32, posix.SOCK.CLOEXEC)
-        else
-            sock_type;
+    /// Close-on-exec socket-type flag. Windows has no SOCK_CLOEXEC (handle
+    /// inheritance is opt-in there), so the flag is 0 and a no-op.
+    pub const sock_cloexec: u32 = if (is_windows) 0 else posix.SOCK.CLOEXEC;
 
-        const rc = std.c.socket(domain, raw_type, protocol);
-        if (rc < 0) return error.SocketFailed;
-        if (@import("builtin").os.tag.isDarwin() and wants_cloexec) {
-            _ = std.c.fcntl(rc, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+    /// Winsock backend. Zig 0.16 reduced `std.os.windows.ws2_32` to type
+    /// definitions (the function bindings moved behind `std.Io`), so the
+    /// handful of calls this shim needs are declared here. `extern "ws2_32"`
+    /// links the import library automatically.
+    const ws2 = struct {
+        pub extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+        pub extern "ws2_32" fn socket(af: c_int, sock_type: c_int, protocol: c_int) callconv(.winapi) posix.socket_t;
+        pub extern "ws2_32" fn connect(s: posix.socket_t, name: *const posix.sockaddr, namelen: c_int) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn bind(s: posix.socket_t, name: *const posix.sockaddr, namelen: c_int) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn listen(s: posix.socket_t, backlog: c_int) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn accept(s: posix.socket_t, addr: ?*posix.sockaddr, addrlen: ?*c_int) callconv(.winapi) posix.socket_t;
+        pub extern "ws2_32" fn closesocket(s: posix.socket_t) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn shutdown(s: posix.socket_t, how: c_int) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn setsockopt(s: posix.socket_t, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn send(s: posix.socket_t, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+        pub extern "ws2_32" fn recv(s: posix.socket_t, buf: [*]u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
+
+        pub const INVALID_SOCKET: posix.socket_t = @ptrFromInt(std.math.maxInt(usize));
+        pub const WSAETIMEDOUT: c_int = 10060;
+        pub const WSAEWOULDBLOCK: c_int = 10035;
+        pub const SD_BOTH: c_int = 2;
+    };
+
+    /// Winsock requires WSAStartup before the first socket call. State:
+    /// 0 = not started, 1 = in progress, 2 = done.
+    var wsa_state = std.atomic.Value(u8).init(0);
+
+    fn ensureWsaStartup() void {
+        while (true) {
+            switch (wsa_state.load(.acquire)) {
+                2 => return,
+                0 => {
+                    if (wsa_state.cmpxchgWeak(0, 1, .acq_rel, .acquire) == null) {
+                        // Out-param sized to cover both the 32- and 64-bit
+                        // WSADATA layouts; the contents are not consulted.
+                        var data: [512]u8 align(16) = undefined;
+                        _ = ws2.WSAStartup(0x0202, &data);
+                        wsa_state.store(2, .release);
+                        return;
+                    }
+                },
+                else => sleep(1 * std.time.ns_per_ms),
+            }
         }
-        return rc;
+    }
+
+    pub fn socket(domain: u32, sock_type: u32, protocol: u32) SocketError!posix.socket_t {
+        if (is_windows) {
+            ensureWsaStartup();
+            const s = ws2.socket(@intCast(domain), @intCast(sock_type), @intCast(protocol));
+            if (s == ws2.INVALID_SOCKET) return error.SocketFailed;
+            return s;
+        } else {
+            // Darwin has no kernel-level SOCK_CLOEXEC; Zig defines it as an
+            // artificial flag that its own wrappers emulate. Strip it before
+            // the raw call and apply FD_CLOEXEC afterwards, otherwise
+            // socket() fails with EINVAL on macOS.
+            const wants_cloexec = (sock_type & sock_cloexec) != 0;
+            const raw_type = if (@import("builtin").os.tag.isDarwin())
+                sock_type & ~@as(u32, posix.SOCK.CLOEXEC)
+            else
+                sock_type;
+
+            const rc = std.c.socket(domain, raw_type, protocol);
+            if (rc < 0) return error.SocketFailed;
+            if (@import("builtin").os.tag.isDarwin() and wants_cloexec) {
+                _ = std.c.fcntl(rc, posix.F.SETFD, @as(c_int, posix.FD_CLOEXEC));
+            }
+            return rc;
+        }
     }
 
     pub fn connect(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) ConnectError!void {
-        if (std.c.connect(fd, addr, len) != 0) return error.ConnectFailed;
+        if (is_windows) {
+            if (ws2.connect(fd, addr, @intCast(len)) != 0) return error.ConnectFailed;
+        } else {
+            if (std.c.connect(fd, addr, len) != 0) return error.ConnectFailed;
+        }
     }
 
     pub fn bind(fd: posix.socket_t, addr: *const posix.sockaddr, len: posix.socklen_t) BindError!void {
-        if (std.c.bind(fd, addr, len) != 0) return error.BindFailed;
+        if (is_windows) {
+            if (ws2.bind(fd, addr, @intCast(len)) != 0) return error.BindFailed;
+        } else {
+            if (std.c.bind(fd, addr, len) != 0) return error.BindFailed;
+        }
     }
 
     pub fn listen(fd: posix.socket_t, backlog: u31) ListenError!void {
-        if (std.c.listen(fd, backlog) != 0) return error.ListenFailed;
+        if (is_windows) {
+            if (ws2.listen(fd, backlog) != 0) return error.ListenFailed;
+        } else {
+            if (std.c.listen(fd, backlog) != 0) return error.ListenFailed;
+        }
     }
 
     pub fn accept(fd: posix.socket_t, addr: ?*posix.sockaddr, len: ?*posix.socklen_t) AcceptError!posix.socket_t {
-        const rc = std.c.accept(fd, addr, len);
-        if (rc < 0) return error.AcceptFailed;
-        return rc;
+        if (is_windows) {
+            const rc = ws2.accept(fd, addr, @ptrCast(len));
+            if (rc == ws2.INVALID_SOCKET) return error.AcceptFailed;
+            return rc;
+        } else {
+            const rc = std.c.accept(fd, addr, len);
+            if (rc < 0) return error.AcceptFailed;
+            return rc;
+        }
     }
 
     pub fn close(fd: posix.socket_t) void {
-        _ = std.c.close(fd);
+        if (is_windows) {
+            _ = ws2.closesocket(fd);
+        } else {
+            _ = std.c.close(fd);
+        }
+    }
+
+    /// Disable further sends and receives on the socket. Unlike `close`,
+    /// this reliably wakes a thread blocked in `accept()`/`recv()` on
+    /// Linux, where closing an fd does NOT interrupt a syscall already
+    /// sleeping on it (BSD/macOS do wake it, which is why close-to-unblock
+    /// appeared to work there). Call this before joining a listener thread.
+    pub fn shutdown(fd: posix.socket_t) void {
+        if (is_windows) {
+            _ = ws2.shutdown(fd, ws2.SD_BOTH);
+        } else {
+            _ = std.c.shutdown(fd, posix.SHUT.RDWR);
+        }
+    }
+
+    pub const TimeoutDir = enum { send, recv };
+
+    /// Best-effort send/receive timeout. On POSIX the option takes a
+    /// `timeval`; Winsock takes milliseconds as a 32-bit integer. A recv
+    /// timeout on a *listening* socket also bounds `accept()` on Linux,
+    /// which this library leans on as a watchdog for listener teardown.
+    pub fn setTimeoutMs(fd: posix.socket_t, dir: TimeoutDir, ms: u32) void {
+        const optname: u32 = switch (dir) {
+            .send => posix.SO.SNDTIMEO,
+            .recv => posix.SO.RCVTIMEO,
+        };
+        if (is_windows) {
+            const val: u32 = ms;
+            _ = ws2.setsockopt(fd, posix.SOL.SOCKET, @intCast(optname), @ptrCast(&val), @sizeOf(u32));
+        } else {
+            const tv = posix.timeval{
+                .sec = @intCast(ms / std.time.ms_per_s),
+                .usec = @intCast((ms % std.time.ms_per_s) * std.time.us_per_ms),
+            };
+            _ = std.c.setsockopt(fd, posix.SOL.SOCKET, optname, @ptrCast(&tv), @sizeOf(posix.timeval));
+        }
+    }
+
+    /// Best-effort SO_REUSEADDR so restarted listeners can rebind without
+    /// waiting out TIME_WAIT.
+    pub fn setReuseAddr(fd: posix.socket_t) void {
+        const one: c_int = 1;
+        if (is_windows) {
+            _ = ws2.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
+        } else {
+            _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
+        }
     }
 };
 
@@ -433,23 +561,42 @@ pub const net = struct {
         pub const IoError = error{ ReadFailed, WriteFailed, TimedOut };
 
         pub fn write(self: Stream, data: []const u8) IoError!usize {
-            const rc = std.c.write(self.handle, data.ptr, data.len);
-            if (rc < 0) return error.WriteFailed;
-            return @intCast(rc);
+            if (sockets.is_windows) {
+                const len: c_int = @intCast(@min(data.len, std.math.maxInt(c_int)));
+                const rc = sockets.ws2.send(self.handle, data.ptr, len, 0);
+                if (rc < 0) return error.WriteFailed;
+                return @intCast(rc);
+            } else {
+                const rc = std.c.write(self.handle, data.ptr, data.len);
+                if (rc < 0) return error.WriteFailed;
+                return @intCast(rc);
+            }
         }
 
         /// Read available bytes. Returns `error.TimedOut` when a receive
         /// timeout configured with `SO_RCVTIMEO` elapses, so callers can
         /// distinguish an idle connection from a broken one.
         pub fn read(self: Stream, buffer: []u8) IoError!usize {
-            const rc = std.c.read(self.handle, buffer.ptr, buffer.len);
-            if (rc < 0) {
-                return switch (std.posix.errno(rc)) {
-                    .AGAIN => error.TimedOut,
-                    else => error.ReadFailed,
-                };
+            if (sockets.is_windows) {
+                const len: c_int = @intCast(@min(buffer.len, std.math.maxInt(c_int)));
+                const rc = sockets.ws2.recv(self.handle, buffer.ptr, len, 0);
+                if (rc < 0) {
+                    return switch (sockets.ws2.WSAGetLastError()) {
+                        sockets.ws2.WSAETIMEDOUT, sockets.ws2.WSAEWOULDBLOCK => error.TimedOut,
+                        else => error.ReadFailed,
+                    };
+                }
+                return @intCast(rc);
+            } else {
+                const rc = std.c.read(self.handle, buffer.ptr, buffer.len);
+                if (rc < 0) {
+                    return switch (std.posix.errno(rc)) {
+                        .AGAIN => error.TimedOut,
+                        else => error.ReadFailed,
+                    };
+                }
+                return @intCast(rc);
             }
-            return @intCast(rc);
         }
 
         pub fn close(self: Stream) void {

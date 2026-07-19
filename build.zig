@@ -13,6 +13,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/vigil.zig"),
         .target = target,
         .optimize = optimize,
+        // compat.zig routes sockets and time through libc (std.c); on
+        // Linux/Windows that link must be explicit or the module only
+        // builds inside hosts that happen to link libc themselves.
+        .link_libc = true,
     });
     vigil_mod.addOptions("vigil_build_options", build_options);
 

@@ -441,11 +441,10 @@ pub const DistributedRegistry = struct {
 
     fn openPeerSocket(node: *ClusterNode) ?posix.socket_t {
         const addr = net.parseIp4(node.address, node.port) catch return null;
-        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch return null;
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | compat.sockets.sock_cloexec, posix.IPPROTO.TCP) catch return null;
 
-        const timeout = posix.timeval{ .sec = 1, .usec = 0 };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        compat.sockets.setTimeoutMs(fd, .send, 1000);
+        compat.sockets.setTimeoutMs(fd, .recv, 1000);
 
         compat.sockets.connect(fd, &addr.any, addr.getOsSockLen()) catch {
             compat.sockets.close(fd);
@@ -629,8 +628,7 @@ pub const DistributedRegistry = struct {
     /// frames in one write (batched REG sync does exactly that).
     fn handleConnection(self: *DistributedRegistry, fd: posix.socket_t, peer_addr: net.Ip4Address) void {
         const stream = net.Stream{ .handle = fd };
-        const timeout = posix.timeval{ .sec = 1, .usec = 0 };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+        compat.sockets.setTimeoutMs(fd, .recv, 1000);
 
         var buffer: [2048]u8 = undefined;
         var used: usize = 0;
@@ -746,7 +744,7 @@ pub const DistributedRegistry = struct {
 
     /// Stop synchronization and listener threads.
     ///
-    /// This closes the listener socket to unblock `accept()`, joins the
+    /// This shuts down the listener socket to unblock `accept()`, joins the
     /// background and per-connection threads, and drops persistent peer
     /// connections. It is safe to call when sync is not active.
     pub fn stopSync(self: *DistributedRegistry) void {
@@ -761,8 +759,15 @@ pub const DistributedRegistry = struct {
         self.sync_thread = null;
         self.mutex.unlock();
 
-        // Close listener socket to unblock accept().
-        if (listener_fd) |fd| compat.sockets.close(fd);
+        // Unblock the listener's accept(): each platform needs a different
+        // nudge. On Linux, close() never wakes a thread already sleeping in
+        // accept() — only shutdown() does. On macOS/BSD it is the mirror
+        // image: shutdown() on a listening socket fails with ENOTCONN and
+        // wakes nothing, while close() does the job. Do both, in this order.
+        if (listener_fd) |fd| {
+            compat.sockets.shutdown(fd);
+            compat.sockets.close(fd);
+        }
 
         if (listener_thread) |thread| thread.join();
         if (sync_thread) |thread| thread.join();
@@ -794,7 +799,7 @@ pub const DistributedRegistry = struct {
             self.should_sync.store(false, .release);
             return;
         };
-        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
+        const fd = compat.sockets.socket(posix.AF.INET, posix.SOCK.STREAM | compat.sockets.sock_cloexec, posix.IPPROTO.TCP) catch {
             self.should_sync.store(false, .release);
             return;
         };
@@ -812,7 +817,7 @@ pub const DistributedRegistry = struct {
 
         if (!self.should_sync.load(.acquire)) return;
 
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        compat.sockets.setReuseAddr(fd);
         compat.sockets.bind(fd, &addr.any, addr.getOsSockLen()) catch {
             self.should_sync.store(false, .release);
             return;
@@ -821,6 +826,10 @@ pub const DistributedRegistry = struct {
             self.should_sync.store(false, .release);
             return;
         };
+        // Watchdog: a recv timeout on a listening socket bounds accept() on
+        // Linux, so even a missed shutdown() wakeup cannot strand this
+        // thread — it re-checks should_sync at least once a second.
+        compat.sockets.setTimeoutMs(fd, .recv, 1000);
 
         var server = net.Server{
             .stream = .{ .handle = fd },
